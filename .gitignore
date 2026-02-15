@@ -1,0 +1,20 @@
+# Visual Studio / Rider / Cursor
+.vscode/
+.idea/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.vsconfig
+
+# Unreal Engine Generated Files
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+Script/
+
+# OS Files
+.DS_Store
+Thumbs.db
