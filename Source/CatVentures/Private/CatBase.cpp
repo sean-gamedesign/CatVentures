@@ -40,6 +40,11 @@ ACatBase::ACatBase()
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
 		CMC->bOrientRotationToMovement = false;
+
+		// Cat-like jump tuning: snappy burst, heavy fall, good air steering
+		CMC->GravityScale    = 2.0f;
+		CMC->JumpZVelocity   = 700.0f;
+		CMC->AirControl      = 0.5f;
 	}
 }
 
@@ -98,6 +103,10 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 		// Look — fires every frame while mouse/stick is active
 		EnhancedInput->BindAction(LookAction, ETriggerEvent::Triggered, this, &ACatBase::Look);
+
+		// Jump — Started triggers Jump(), Completed triggers StopJumping() for variable height
+		EnhancedInput->BindAction(JumpAction, ETriggerEvent::Started,   this, &ACharacter::Jump);
+		EnhancedInput->BindAction(JumpAction, ETriggerEvent::Completed, this, &ACharacter::StopJumping);
 	}
 }
 
