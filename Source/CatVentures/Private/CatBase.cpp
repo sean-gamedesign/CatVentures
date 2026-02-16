@@ -46,6 +46,9 @@ ACatBase::ACatBase()
 		CMC->JumpZVelocity   = 700.0f;
 		CMC->AirControl      = 0.5f;
 	}
+
+	// Variable jump height: hold jump up to 0.3s for full height, tap for a short hop.
+	JumpMaxHoldTime = 0.3f;
 }
 
 void ACatBase::BeginPlay()
