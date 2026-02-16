@@ -23,11 +23,23 @@ ACatBase::ACatBase()
 	FollowCamera->bUsePawnControlRotation = false;
 
 	// ── Rotation settings ──────────────────────────────────────────
-	bUseControllerRotationYaw = false;
+	bUseControllerRotationPitch = false;
+	bUseControllerRotationYaw   = false;
+	bUseControllerRotationRoll  = false;
 
+	// ── Spring arm collision ──────────────────────────────────────
+	CameraBoom->bDoCollisionTest = true;
+	CameraBoom->ProbeSize = 12.0f;
+	CameraBoom->ProbeChannel = ECC_Camera;
+	CameraBoom->bEnableCameraLag = true;
+	CameraBoom->CameraLagSpeed = 10.0f;
+	CameraBoom->bEnableCameraRotationLag = true;
+	CameraBoom->CameraRotationLagSpeed = 8.0f;
+
+	// Tank controls: character yaw is driven explicitly by A/D input, not by CMC.
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
-		CMC->bOrientRotationToMovement = true;
+		CMC->bOrientRotationToMovement = false;
 	}
 }
 
@@ -44,6 +56,12 @@ void ACatBase::BeginPlay()
 			Subsystem->AddMappingContext(DefaultMappingContext, 0);
 		}
 	}
+
+	// Apply camera tuning UPROPERTYs to the SpringArm
+	CameraBoom->bEnableCameraLag         = bEnableCameraLag;
+	CameraBoom->CameraLagSpeed           = CameraLagSpeed;
+	CameraBoom->bEnableCameraRotationLag = bEnableCameraRotationLag;
+	CameraBoom->CameraRotationLagSpeed   = CameraRotationLagSpeed;
 }
 
 void ACatBase::Tick(float DeltaTime)
@@ -56,6 +74,14 @@ void ACatBase::Tick(float DeltaTime)
 	}
 
 	Super::Tick(DeltaTime);
+
+	// ── Pitch Clamping ─────────────────────────────────────────────
+	if (APlayerController* PC = Cast<APlayerController>(Controller))
+	{
+		FRotator ControlRot = PC->GetControlRotation();
+		ControlRot.Pitch = FMath::ClampAngle(ControlRot.Pitch, -PitchClampDown, PitchClampUp);
+		PC->SetControlRotation(ControlRot);
+	}
 }
 
 void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -64,25 +90,44 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 	if (UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(PlayerInputComponent))
 	{
-		// Movement — fires every frame while the key is held
+		// Movement (tank-style) — fires every frame while the key is held
 		EnhancedInput->BindAction(MoveAction, ETriggerEvent::Triggered, this, &ACatBase::Move);
 
 		// Meow — fires once on press, routed through the Server RPC
 		EnhancedInput->BindAction(MeowAction, ETriggerEvent::Started, this, &ACatBase::Server_Meow);
+
+		// Look — fires every frame while mouse/stick is active
+		EnhancedInput->BindAction(LookAction, ETriggerEvent::Triggered, this, &ACatBase::Look);
 	}
 }
+
+// ── Tank-Style Movement ─────────────────────────────────────────────────
 
 void ACatBase::Move(const FInputActionValue& Value)
 {
 	const FVector2D MoveInput = Value.Get<FVector2D>();
 
-	// Derive forward/right directions from the controller's yaw only.
-	const FRotator YawRotation(0.0, Controller->GetControlRotation().Yaw, 0.0);
-	const FVector ForwardDir = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
-	const FVector RightDir   = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+	// X axis = Turn (A/D): yaw-rotate the character directly
+	if (!FMath::IsNearlyZero(MoveInput.X))
+	{
+		const float DeltaYaw = MoveInput.X * TurnRate * GetWorld()->GetDeltaSeconds();
+		AddActorWorldRotation(FRotator(0.0, DeltaYaw, 0.0));
+	}
 
-	AddMovementInput(ForwardDir, MoveInput.Y);
-	AddMovementInput(RightDir,   MoveInput.X);
+	// Y axis = Forward/Back (W/S): move along the character's own forward vector
+	if (!FMath::IsNearlyZero(MoveInput.Y))
+	{
+		AddMovementInput(GetActorForwardVector(), MoveInput.Y);
+	}
+}
+
+void ACatBase::Look(const FInputActionValue& Value)
+{
+	const FVector2D LookInput = Value.Get<FVector2D>();
+
+	// Apply sensitivity and feed into the controller's control rotation.
+	AddControllerYawInput(LookInput.X * LookSensitivity);
+	AddControllerPitchInput(LookInput.Y * LookSensitivity);
 }
 
 // ── Networked Meow ─────────────────────────────────────────────────────

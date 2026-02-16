@@ -40,7 +40,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Cat")
 	FOnMeowDelegate OnMeow;
 
-	// ── Camera ─────────────────────────────────────────────────────
+	// ── Camera ─────────────────────────────────────────────────────────
 
 	/** Spring arm that holds the follow camera behind the cat. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
@@ -49,6 +49,42 @@ public:
 	/** Third-person follow camera. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
 	TObjectPtr<UCameraComponent> FollowCamera;
+
+	// ── Camera Tuning ──────────────────────────────────────────────
+
+	/** Sensitivity multiplier applied to mouse/stick look input. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.1", ClampMax = "10.0"))
+	float LookSensitivity = 1.0f;
+
+	/** Pitch clamp (degrees) — how far the camera can look up. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", ClampMax = "89.0"))
+	float PitchClampUp = 60.0f;
+
+	/** Pitch clamp (degrees) — how far the camera can look down. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", ClampMax = "89.0"))
+	float PitchClampDown = 70.0f;
+
+	/** Enable positional camera lag on the spring arm. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
+	bool bEnableCameraLag = true;
+
+	/** Speed of positional camera lag (higher = snappier). Only used when bEnableCameraLag is true. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", EditCondition = "bEnableCameraLag"))
+	float CameraLagSpeed = 10.0f;
+
+	/** Enable rotational camera lag on the spring arm. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
+	bool bEnableCameraRotationLag = true;
+
+	/** Speed of rotational camera lag (higher = snappier). Only used when bEnableCameraRotationLag is true. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", EditCondition = "bEnableCameraRotationLag"))
+	float CameraRotationLagSpeed = 8.0f;
+
+	// ── Tank Controls ──────────────────────────────────────────────
+
+	/** Yaw turn speed in degrees/second when A/D are held. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "30.0", ClampMax = "720.0"))
+	float TurnRate = 180.0f;
 
 protected:
 	//~ Begin AActor Interface
@@ -72,10 +108,16 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> MeowAction;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> LookAction;
+
 	// ── Input Handlers ──────────────────────────────────────────────
 
-	/** Called every frame while MoveAction is triggered (Axis2D). */
+	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
 	void Move(const FInputActionValue& Value);
+
+	/** Processes IA_Look (Axis2D) — applies yaw/pitch to the controller rotation. */
+	void Look(const FInputActionValue& Value);
 
 	// ── Networked Meow ──────────────────────────────────────────────
 
