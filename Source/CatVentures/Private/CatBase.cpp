@@ -7,12 +7,14 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "GameFramework/PlayerController.h"
+#include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
 
 ACatBase::ACatBase()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	// ── Camera rig ─────────────────────────────────────────────────
+	// ── Camera rig ─────────────────────────────────────────────
 	CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
 	CameraBoom->SetupAttachment(RootComponent);
 	CameraBoom->TargetArmLength = 400.0f;
@@ -22,7 +24,7 @@ ACatBase::ACatBase()
 	FollowCamera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
 	FollowCamera->bUsePawnControlRotation = false;
 
-	// ── Rotation settings ──────────────────────────────────────────
+	// ── Rotation settings ────────────────────────────────────────
 	bUseControllerRotationPitch = false;
 	bUseControllerRotationYaw   = false;
 	bUseControllerRotationRoll  = false;
@@ -110,6 +112,9 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 		// Jump — Started triggers Jump(), Completed triggers StopJumping() for variable height
 		EnhancedInput->BindAction(JumpAction, ETriggerEvent::Started,   this, &ACharacter::Jump);
 		EnhancedInput->BindAction(JumpAction, ETriggerEvent::Completed, this, &ACharacter::StopJumping);
+
+		// Swat — fires once on press, local prediction + Server RPC
+		EnhancedInput->BindAction(SwatAction, ETriggerEvent::Started, this, &ACatBase::TriggerSwat);
 	}
 }
 
@@ -142,7 +147,7 @@ void ACatBase::Look(const FInputActionValue& Value)
 	AddControllerPitchInput(LookInput.Y * LookSensitivity);
 }
 
-// ── Networked Meow ─────────────────────────────────────────────────────
+// ── Networked Meow ───────────────────────────────────────────────────
 
 void ACatBase::Server_Meow_Implementation()
 {
@@ -154,6 +159,153 @@ void ACatBase::NetMulticast_Meow_Implementation()
 {
 	// Runs on every machine (server + all clients).
 	OnMeow.Broadcast();
+}
+
+// ── The Swat — Local Prediction + Server Authority ─────────────────────
+
+void ACatBase::TriggerSwat()
+{
+	if (bIsSwatting || !SwatMontage)
+	{
+		return;
+	}
+
+	// Local prediction: play immediately on the autonomous proxy.
+	bIsSwatting = true;
+	PlaySwatMontageAndBindEnd();
+
+	// Request the server to validate and multicast.
+	Server_Swat();
+}
+
+void ACatBase::Server_Swat_Implementation()
+{
+	if (bIsSwatting)
+	{
+		return;
+	}
+
+	bIsSwatting = true;
+	Multicast_Swat();
+}
+
+void ACatBase::Multicast_Swat_Implementation()
+{
+	// Skip the instigator — they already predicted locally in TriggerSwat().
+	if (IsLocallyControlled())
+	{
+		return;
+	}
+
+	bIsSwatting = true;
+	PlaySwatMontageAndBindEnd();
+}
+
+void ACatBase::PlaySwatMontageAndBindEnd()
+{
+	const float Duration = PlayAnimMontage(SwatMontage);
+	if (Duration > 0.0f)
+	{
+		if (UAnimInstance* AnimInstance = GetMesh()->GetAnimInstance())
+		{
+			FOnMontageEnded EndDelegate;
+			EndDelegate.BindUObject(this, &ACatBase::OnSwatMontageEnded);
+			AnimInstance->Montage_SetEndDelegate(EndDelegate, SwatMontage);
+		}
+	}
+	else
+	{
+		// Montage failed to play — reset immediately.
+		bIsSwatting = false;
+		UE_LOG(LogTemp, Warning, TEXT("ACatBase::PlaySwatMontageAndBindEnd — Montage failed to play."));
+	}
+}
+
+void ACatBase::OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted)
+{
+	bIsSwatting = false;
+	UE_LOG(LogTemp, Log, TEXT("ACatBase::OnSwatMontageEnded — bInterrupted=%s"),
+		bInterrupted ? TEXT("true") : TEXT("false"));
+}
+
+// ── Swat Trace (called by UAnimNotifyState_SwatTrace) ──────────────────
+
+void ACatBase::BeginSwatTrace(USkeletalMeshComponent* MeshComp, FName SocketName)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	SwatPreviousPawLocation = MeshComp->GetSocketLocation(SocketName);
+	SwatAlreadyHitActors.Empty();
+}
+
+void ACatBase::ProcessSwatTraceTick(USkeletalMeshComponent* MeshComp, FName SocketName, float SweepRadius, float DeltaTime)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	const FVector CurrentPawLocation = MeshComp->GetSocketLocation(SocketName);
+
+	FHitResult HitResult;
+	FCollisionQueryParams QueryParams;
+	QueryParams.AddIgnoredActor(this);
+	QueryParams.bTraceComplex = false;
+
+	const bool bHit = GetWorld()->SweepSingleByChannel(
+		HitResult,
+		SwatPreviousPawLocation,
+		CurrentPawLocation,
+		FQuat::Identity,
+		ECC_PhysicsBody,
+		FCollisionShape::MakeSphere(SweepRadius),
+		QueryParams
+	);
+
+	if (bHit && HitResult.GetActor())
+	{
+		TWeakObjectPtr<AActor> HitActorWeak = HitResult.GetActor();
+		if (!SwatAlreadyHitActors.Contains(HitActorWeak))
+		{
+			SwatAlreadyHitActors.Add(HitActorWeak);
+			HandleSwatHit(HitResult);
+		}
+	}
+
+	SwatPreviousPawLocation = CurrentPawLocation;
+}
+
+void ACatBase::EndSwatTrace()
+{
+	// Only clear the hit set. Do NOT reset bIsSwatting —
+	// that’s handled by OnSwatMontageEnded (interruption-safe).
+	SwatAlreadyHitActors.Empty();
+}
+
+void ACatBase::HandleSwatHit(const FHitResult& HitResult)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UPrimitiveComponent* HitComp = HitResult.GetComponent();
+	AActor* HitActor = HitResult.GetActor();
+
+	if (HitComp && HitComp->IsSimulatingPhysics())
+	{
+		// Impulse direction: forward + slight upward arc for satisfying knockback.
+		const FVector ImpulseDir = (GetActorForwardVector() + FVector(0.0, 0.0, 0.4)).GetSafeNormal();
+		HitComp->AddImpulseAtLocation(ImpulseDir * SwatImpulseStrength, HitResult.ImpactPoint);
+
+		UE_LOG(LogTemp, Log, TEXT("ACatBase::HandleSwatHit — Hit %s at %s"),
+			*HitActor->GetName(), *HitResult.ImpactPoint.ToString());
+	}
+
+	OnSwatHit.Broadcast(HitActor, HitResult.ImpactPoint);
 }
 
 // ── Movement Mode Fix ─────────────────────────────────────────────────

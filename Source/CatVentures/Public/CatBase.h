@@ -11,8 +11,10 @@ class UInputAction;
 struct FInputActionValue;
 class USpringArmComponent;
 class UCameraComponent;
+class UAnimMontage;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
 
 /**
  * Base C++ Character for all Cat pawns.
@@ -23,6 +25,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
  *  - PossessedBy / OnRep_PlayerState force Walking movement mode immediately,
  *    preventing the "frozen client" problem.
  *  - Server_Meow RPC → NetMulticast_Meow → OnMeow broadcast for networked meowing.
+ *  - The Swat: local-predicted montage with server-authoritative active-frame sweep.
  */
 UCLASS()
 class CATVENTURES_API ACatBase : public ACharacter
@@ -86,6 +89,31 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "30.0", ClampMax = "720.0"))
 	float TurnRate = 180.0f;
 
+	// ── Combat — The Swat ──────────────────────────────────────────
+
+	/** Impulse magnitude applied to physics objects hit by the swat. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat", meta = (ClampMin = "0.0"))
+	float SwatImpulseStrength = 800.0f;
+
+	/** Montage to play when the cat swats. Must contain an AnimNotifyState_SwatTrace on the active frames. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
+	TObjectPtr<UAnimMontage> SwatMontage;
+
+	/** Broadcast on authority when the swat hits a physics actor. */
+	UPROPERTY(BlueprintAssignable, Category = "Combat")
+	FOnSwatHitDelegate OnSwatHit;
+
+	// ── Swat Trace Interface (called by UAnimNotifyState_SwatTrace) ──
+
+	/** Called by NotifyBegin — caches initial paw position and clears hit set (authority only). */
+	void BeginSwatTrace(USkeletalMeshComponent* MeshComp, FName SocketName);
+
+	/** Called by NotifyTick — performs sphere sweep from previous to current paw position (authority only). */
+	void ProcessSwatTraceTick(USkeletalMeshComponent* MeshComp, FName SocketName, float SweepRadius, float DeltaTime);
+
+	/** Called by NotifyEnd — clears the hit set. Does NOT reset bIsSwatting (that's handled by OnSwatMontageEnded). */
+	void EndSwatTrace();
+
 protected:
 	//~ Begin AActor Interface
 	virtual void BeginPlay() override;
@@ -114,6 +142,9 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> JumpAction;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> SwatAction;
+
 	// ── Input Handlers ──────────────────────────────────────────────
 
 	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
@@ -121,6 +152,9 @@ protected:
 
 	/** Processes IA_Look (Axis2D) — applies yaw/pitch to the controller rotation. */
 	void Look(const FInputActionValue& Value);
+
+	/** Fires on IA_Swat Started — local prediction + Server RPC. */
+	void TriggerSwat();
 
 	// ── Networked Meow ──────────────────────────────────────────────
 
@@ -132,7 +166,38 @@ protected:
 	UFUNCTION(NetMulticast, Reliable)
 	void NetMulticast_Meow();
 
+	// ── Networked Swat ─────────────────────────────────────────────
+
+	/** Client → Server: request a swat. */
+	UFUNCTION(Server, Reliable)
+	void Server_Swat();
+
+	/** Server → All: play swat montage on all machines (instigator skips — already predicted). */
+	UFUNCTION(NetMulticast, Unreliable)
+	void Multicast_Swat();
+
 private:
 	/** Forces the CharacterMovementComponent into Walking mode if it is currently None. */
 	void ForceWalkingMovementMode();
+
+	// ── Swat State (per-instance — CDO-safe) ───────────────────────
+
+	/** Paw socket location from the previous tick (for sweep start point). */
+	FVector SwatPreviousPawLocation = FVector::ZeroVector;
+
+	/** Actors already hit during this swat (prevents double-hits in one swipe). */
+	TSet<TWeakObjectPtr<AActor>> SwatAlreadyHitActors;
+
+	/** True while a swat montage is playing — blocks re-entry. */
+	bool bIsSwatting = false;
+
+	/** Server-authoritative hit processing: applies impulse + broadcasts OnSwatHit. */
+	void HandleSwatHit(const FHitResult& HitResult);
+
+	/** Shared helper: plays the swat montage and binds FOnMontageEnded for interruption-safe cleanup. */
+	void PlaySwatMontageAndBindEnd();
+
+	/** Montage end callback — fires on both natural completion and interruption. Resets bIsSwatting. */
+	UFUNCTION()
+	void OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted);
 };
