@@ -174,8 +174,19 @@ void ACatBase::TriggerSwat()
 	bIsSwatting = true;
 	PlaySwatMontageAndBindEnd();
 
-	// Request the server to validate and multicast.
-	Server_Swat();
+	// Route based on authority to avoid the listen server sync-call bug:
+	// On the host, Server_Swat() executes synchronously and sees bIsSwatting
+	// already true, so it early-outs before calling Multicast_Swat().
+	if (HasAuthority())
+	{
+		// Listen server host: we ARE the server, multicast directly.
+		Multicast_Swat();
+	}
+	else
+	{
+		// Remote client: send RPC to server for validation.
+		Server_Swat();
+	}
 }
 
 void ACatBase::Server_Swat_Implementation()
@@ -203,15 +214,21 @@ void ACatBase::Multicast_Swat_Implementation()
 
 void ACatBase::PlaySwatMontageAndBindEnd()
 {
-	const float Duration = PlayAnimMontage(SwatMontage);
+	// Use UAnimInstance::Montage_Play directly instead of ACharacter::PlayAnimMontage
+	// to avoid the CMC's RepRootMotion replication conflicting with our Multicast_Swat RPC.
+	UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr;
+	if (!AnimInstance)
+	{
+		bIsSwatting = false;
+		return;
+	}
+
+	const float Duration = AnimInstance->Montage_Play(SwatMontage);
 	if (Duration > 0.0f)
 	{
-		if (UAnimInstance* AnimInstance = GetMesh()->GetAnimInstance())
-		{
-			FOnMontageEnded EndDelegate;
-			EndDelegate.BindUObject(this, &ACatBase::OnSwatMontageEnded);
-			AnimInstance->Montage_SetEndDelegate(EndDelegate, SwatMontage);
-		}
+		FOnMontageEnded EndDelegate;
+		EndDelegate.BindUObject(this, &ACatBase::OnSwatMontageEnded);
+		AnimInstance->Montage_SetEndDelegate(EndDelegate, SwatMontage);
 	}
 	else
 	{
