@@ -99,6 +99,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
 	TObjectPtr<UAnimMontage> SwatMontage;
 
+	// ── Interaction ───────────────────────────────────────────────────
+
+	/** How far forward (cm) the interaction sphere trace reaches. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interaction", meta = (ClampMin = "50.0"))
+	float InteractTraceLength = 200.0f;
+
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
 	FOnSwatHitDelegate OnSwatHit;
@@ -145,6 +151,9 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> SwatAction;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> InteractAction;
+
 	// ── Input Handlers ──────────────────────────────────────────────
 
 	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
@@ -155,6 +164,9 @@ protected:
 
 	/** Fires on IA_Swat Started — local prediction + Server RPC. */
 	void TriggerSwat();
+
+	/** Fires on IA_Interact Started — server-authoritative trace. */
+	void TriggerInteract();
 
 	// ── Networked Meow ──────────────────────────────────────────────
 
@@ -175,6 +187,12 @@ protected:
 	/** Server → All: play swat montage on all machines (instigator skips — already predicted). */
 	UFUNCTION(NetMulticast, Unreliable)
 	void Multicast_Swat();
+
+	// ── Networked Interact ────────────────────────────────────────
+
+	/** Client → Server: request an interaction trace. */
+	UFUNCTION(Server, Reliable)
+	void Server_Interact();
 
 private:
 	/** Forces the CharacterMovementComponent into Walking mode if it is currently None. */
@@ -200,4 +218,7 @@ private:
 	/** Montage end callback — fires on both natural completion and interruption. Resets bIsSwatting. */
 	UFUNCTION()
 	void OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted);
+
+	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
+	void PerformInteractTrace();
 };

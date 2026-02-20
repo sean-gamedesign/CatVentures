@@ -9,6 +9,8 @@
 #include "GameFramework/PlayerController.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
+#include "InteractableInterface.h"
+#include "Kismet/KismetSystemLibrary.h"
 
 ACatBase::ACatBase()
 {
@@ -115,6 +117,9 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 		// Swat — fires once on press, local prediction + Server RPC
 		EnhancedInput->BindAction(SwatAction, ETriggerEvent::Started, this, &ACatBase::TriggerSwat);
+
+		// Interact — fires once on press, server-authoritative trace
+		EnhancedInput->BindAction(InteractAction, ETriggerEvent::Started, this, &ACatBase::TriggerInteract);
 	}
 }
 
@@ -345,5 +350,61 @@ void ACatBase::ForceWalkingMovementMode()
 	if (CMC && CMC->MovementMode == MOVE_None)
 	{
 		CMC->SetMovementMode(MOVE_Walking);
+	}
+}
+
+// ── Interaction System ───────────────────────────────────────────────────
+
+void ACatBase::TriggerInteract()
+{
+	if (HasAuthority())
+	{
+		// Listen server host: we ARE the server, trace directly.
+		PerformInteractTrace();
+	}
+	else
+	{
+		// Remote client: send RPC to server.
+		Server_Interact();
+	}
+}
+
+void ACatBase::Server_Interact_Implementation()
+{
+	PerformInteractTrace();
+}
+
+void ACatBase::PerformInteractTrace()
+{
+	const FVector TraceStart = GetActorLocation();
+	const FVector TraceEnd   = TraceStart + GetActorForwardVector() * InteractTraceLength;
+	const float SphereRadius = 20.0f;
+
+	FHitResult HitResult;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(this);
+
+	const bool bHit = GetWorld()->SweepSingleByChannel(
+		HitResult,
+		TraceStart,
+		TraceEnd,
+		FQuat::Identity,
+		ECC_Visibility,
+		FCollisionShape::MakeSphere(SphereRadius),
+		Params
+	);
+
+	if (!bHit || !HitResult.GetActor())
+	{
+		return;
+	}
+
+	AActor* HitActor = HitResult.GetActor();
+
+	if (HitActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
+	{
+		IInteractableInterface::Execute_Interact(HitActor, this);
+
+		UE_LOG(LogTemp, Log, TEXT("ACatBase::PerformInteractTrace — Interacted with %s"), *HitActor->GetName());
 	}
 }
