@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
+#include "CatAnimationTypes.h"
 #include "CatBase.generated.h"
 
 class UInputMappingContext;
@@ -38,6 +39,9 @@ public:
 	//~ Begin AActor Interface
 	virtual void Tick(float DeltaTime) override;
 	//~ End AActor Interface
+
+	/** Registers replicated properties for the net driver. */
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/** Broadcast on all machines when this cat meows. */
 	UPROPERTY(BlueprintAssignable, Category = "Cat")
@@ -131,6 +135,14 @@ protected:
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	//~ End APawn Interface
 
+	// ── Tick Subsystems ────────────────────────────────────────────
+
+	/** Derives gameplay state (SpeedType, MovementStage, etc.) from the CharacterMovementComponent. Runs on ALL roles. */
+	void UpdateAnimationStates();
+
+	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
+	void UpdateCosmeticInterpolation(float DeltaTime);
+
 	// ── Enhanced Input Assets ────────────────────────────────────────
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
@@ -193,6 +205,180 @@ protected:
 	/** Client → Server: request an interaction trace. */
 	UFUNCTION(Server, Reliable)
 	void Server_Interact();
+
+	// ══════════════════════════════════════════════════════════════════
+	// ── Replicated Gameplay State (server-authoritative) ────────────
+	// ══════════════════════════════════════════════════════════════════
+
+	/** Current locomotion speed tier. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_SpeedType, Category = "Animation State")
+	ECatMoveType SpeedType = ECatMoveType::Idle;
+
+	/** Current special action the cat is performing. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentAction, Category = "Animation State")
+	ECatAction CurrentAction = ECatAction::None;
+
+	/** Camera/input control scheme. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_ControlMode, Category = "Animation State")
+	ECatControlMode ControlMode = ECatControlMode::Looking;
+
+	/** High-level locomotion surface (ground, air, swimming, ragdoll). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_MovementStage, Category = "Animation State")
+	ECatMovementStage MovementStage = ECatMovementStage::OnGround;
+
+	/** Head/body aim mode for look-at blendspaces. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_AimMode, Category = "Animation State")
+	ECatAim AimMode = ECatAim::Aim;
+
+	/** Which blendspace set the AnimBP should use. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_AnimBSMode, Category = "Animation State")
+	ECatAnimBSMode AnimBSMode = ECatAnimBSMode::Looking;
+
+	/** Priority action override (attack, damage, death, etc.). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_BaseAction, Category = "Animation State")
+	ECatBaseAction BaseAction = ECatBaseAction::None;
+
+	/** Idle rest progression state. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_RestState, Category = "Animation State")
+	ECatRest RestState = ECatRest::None;
+
+	/** True while the cat is in crouch mode. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bCrouchMode, Category = "Animation State")
+	bool bCrouchMode = false;
+
+	/** True when the cat has died. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bDied, Category = "Animation State")
+	bool bDied = false;
+
+	// ── OnRep Callbacks ─────────────────────────────────────────────
+
+	UFUNCTION()
+	void OnRep_SpeedType();
+
+	UFUNCTION()
+	void OnRep_CurrentAction();
+
+	UFUNCTION()
+	void OnRep_ControlMode();
+
+	UFUNCTION()
+	void OnRep_MovementStage();
+
+	UFUNCTION()
+	void OnRep_AimMode();
+
+	UFUNCTION()
+	void OnRep_AnimBSMode();
+
+	UFUNCTION()
+	void OnRep_BaseAction();
+
+	UFUNCTION()
+	void OnRep_RestState();
+
+	UFUNCTION()
+	void OnRep_bCrouchMode();
+
+	UFUNCTION()
+	void OnRep_bDied();
+
+	// ══════════════════════════════════════════════════════════════════
+	// ── Local Cosmetic Variables (NOT replicated) ───────────────────
+	// ══════════════════════════════════════════════════════════════════
+	// Computed locally on every machine (including simulated proxies).
+	// Used by the Animation Blueprint for blendspaces and additive layers.
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float Speed = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float SpeedDelay = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float PlayRate = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float PlayRateInterp = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AlphaPlayBreath = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AlphaPlayBreathInterp = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float TimeInRun = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float TimeInRunCache = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimYaw = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimYawInterp = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimYawClamped = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimPitch = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimPitchInterp = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimPitchClamped = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AlphaAim = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AlphaAimInterp = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AlphaLookAt = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float LeanDrink = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float LeanDrinkClamp = 1.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FixedLocationMesh = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FixedLocationCamera = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FixedLocationSwim = 0.0f;
+
+	/** Derived locally from CharacterMovement acceleration — NOT replicated. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bHasMovementInput = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bIsFalling = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bIsOnGround = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bBackwards = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float SpeedMultiplierFinale = 0.75f;
+
+	/** Animation turn rate (renamed from BP "Turn Rate" to avoid collision with TurnRate). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float TurnRateAnim = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float PlayerDontMoveFor = 0.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float DeltaTimeCached = 0.0f;
 
 private:
 	/** Forces the CharacterMovementComponent into Walking mode if it is currently None. */
