@@ -57,7 +57,7 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Camera")
 	TObjectPtr<UCameraComponent> FollowCamera;
 
-	// ── Camera Tuning ──────────────────────────────────────────────
+	// ── Camera Tuning ──────────────────────────────────────────────────
 
 	/** Sensitivity multiplier applied to mouse/stick look input. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.1", ClampMax = "10.0"))
@@ -87,13 +87,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", EditCondition = "bEnableCameraRotationLag"))
 	float CameraRotationLagSpeed = 8.0f;
 
-	// ── Tank Controls ──────────────────────────────────────────────
+	// ── Tank Controls ──────────────────────────────────────────────────
 
 	/** Yaw turn speed in degrees/second when A/D are held. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "30.0", ClampMax = "720.0"))
 	float TurnRate = 180.0f;
 
-	// ── Combat — The Swat ──────────────────────────────────────────
+	// ── Combat — The Swat ──────────────────────────────────────────────
 
 	/** Impulse magnitude applied to physics objects hit by the swat. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat", meta = (ClampMin = "0.0"))
@@ -103,7 +103,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
 	TObjectPtr<UAnimMontage> SwatMontage;
 
-	// ── Interaction ───────────────────────────────────────────────────
+	// ── Interaction ─────────────────────────────────────────────────────
 
 	/** How far forward (cm) the interaction sphere trace reaches. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interaction", meta = (ClampMin = "50.0"))
@@ -135,7 +135,7 @@ protected:
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	//~ End APawn Interface
 
-	// ── Tick Subsystems ────────────────────────────────────────────
+	// ── Tick Subsystems ────────────────────────────────────────────────
 
 	/** Derives gameplay state (SpeedType, MovementStage, etc.) from the CharacterMovementComponent. Runs on ALL roles. */
 	void UpdateAnimationStates();
@@ -143,7 +143,7 @@ protected:
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
 
-	// ── Enhanced Input Assets ────────────────────────────────────────
+	// ── Enhanced Input Assets ────────────────────────────────────────────
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputMappingContext> DefaultMappingContext;
@@ -166,7 +166,7 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> InteractAction;
 
-	// ── Input Handlers ──────────────────────────────────────────────
+	// ── Input Handlers ──────────────────────────────────────────────────
 
 	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
 	void Move(const FInputActionValue& Value);
@@ -180,7 +180,7 @@ protected:
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
 
-	// ── Networked Meow ──────────────────────────────────────────────
+	// ── Networked Meow ──────────────────────────────────────────────────
 
 	/** Client → Server: request a meow. */
 	UFUNCTION(Server, Reliable)
@@ -190,7 +190,7 @@ protected:
 	UFUNCTION(NetMulticast, Reliable)
 	void NetMulticast_Meow();
 
-	// ── Networked Swat ─────────────────────────────────────────────
+	// ── Networked Swat ─────────────────────────────────────────────────
 
 	/** Client → Server: request a swat. */
 	UFUNCTION(Server, Reliable)
@@ -200,14 +200,14 @@ protected:
 	UFUNCTION(NetMulticast, Unreliable)
 	void Multicast_Swat();
 
-	// ── Networked Interact ────────────────────────────────────────
+	// ── Networked Interact ──────────────────────────────────────────────
 
 	/** Client → Server: request an interaction trace. */
 	UFUNCTION(Server, Reliable)
 	void Server_Interact();
 
 	// ══════════════════════════════════════════════════════════════════
-	// ── Replicated Gameplay State (server-authoritative) ────────────
+	// ── Replicated Gameplay State (server-authoritative) ────────────────
 	// ══════════════════════════════════════════════════════════════════
 
 	/** Current locomotion speed tier. */
@@ -250,7 +250,7 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bDied, Category = "Animation State")
 	bool bDied = false;
 
-	// ── OnRep Callbacks ─────────────────────────────────────────────
+	// ── OnRep Callbacks ─────────────────────────────────────────────────
 
 	UFUNCTION()
 	void OnRep_SpeedType();
@@ -283,7 +283,7 @@ protected:
 	void OnRep_bDied();
 
 	// ══════════════════════════════════════════════════════════════════
-	// ── Local Cosmetic Variables (NOT replicated) ───────────────────
+	// ── Local Cosmetic Variables (NOT replicated) ─────────────────────
 	// ══════════════════════════════════════════════════════════════════
 	// Computed locally on every machine (including simulated proxies).
 	// Used by the Animation Blueprint for blendspaces and additive layers.
@@ -374,6 +374,18 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float TurnRateAnim = 0.0f;
 
+	/** True while the cat is performing a turn-in-place (|AimYaw| > 45 while idle on ground). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bGoTurn = false;
+
+	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float LeanAmount = 0.0f;
+
+	/** True while the capsule is being procedurally rotated to commit a turn-in-place. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bIsCommittingTurn = false;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float PlayerDontMoveFor = 0.0f;
 
@@ -384,7 +396,7 @@ private:
 	/** Forces the CharacterMovementComponent into Walking mode if it is currently None. */
 	void ForceWalkingMovementMode();
 
-	// ── Swat State (per-instance — CDO-safe) ───────────────────────
+	// ── Swat State (per-instance — CDO-safe) ───────────────────────────
 
 	/** Paw socket location from the previous tick (for sweep start point). */
 	FVector SwatPreviousPawLocation = FVector::ZeroVector;
@@ -407,4 +419,8 @@ private:
 
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
+
+	// ── Turn Commitment & Lean ──────────────────────────────────────
+	FRotator TargetTurnRotation = FRotator::ZeroRotator;
+	float PreviousYaw = 0.0f;
 };
