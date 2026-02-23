@@ -206,6 +206,16 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_Interact();
 
+	// ── Networked Turn State ───────────────────────────────────────────
+
+	/** Client → Server: edge-trigger for turn on/off. Reliable guarantees ordered delivery. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetTurnActive(bool bNewGoTurn);
+
+	/** Client → Server: continuous blendspace update during active turn. Unreliable is fine — loss just holds last value. */
+	UFUNCTION(Server, Unreliable)
+	void Server_SetTurnRate(float NewTurnRateAnim);
+
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
 	// ══════════════════════════════════════════════════════════════════
@@ -371,11 +381,11 @@ protected:
 	float SpeedMultiplierFinale = 0.75f;
 
 	/** Animation turn rate (renamed from BP "Turn Rate" to avoid collision with TurnRate). */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float TurnRateAnim = 0.0f;
 
 	/** True while the cat is performing a turn-in-place (|AimYaw| > 45 while idle on ground). */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	bool bGoTurn = false;
 
 	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
@@ -385,6 +395,9 @@ protected:
 	/** True while the capsule is being procedurally rotated to commit a turn-in-place. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bIsCommittingTurn = false;
+
+	/** Last TurnRateAnim value sent via Server_SetTurnRate RPC. Used to throttle sends. */
+	float LastSentTurnRateAnim = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float PlayerDontMoveFor = 0.0f;

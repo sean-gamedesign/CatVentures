@@ -97,20 +97,34 @@ void ACatBase::Tick(float DeltaTime)
 	// already-committed actor rotation — eliminates one-frame snap.
 	if (UCharacterMovementComponent* CMC_Mut = GetCharacterMovement())
 	{
-		if (bGoTurn && IsLocallyControlled())
+		// Commit rotation when bGoTurn is active.
+		// Two roles need this:
+		//   1. Local client (IsLocallyControlled) — for instant prediction
+		//   2. Server copy of client pawn (HasAuthority && !IsLocallyControlled) — so the
+		//      authoritative actor rotation matches the turn animation, preventing pop.
+		// Simulated proxies receive the replicated rotation automatically.
+		const bool bIsLocalTurn  = bGoTurn && IsLocallyControlled();
+		const bool bIsServerTurn = bGoTurn && HasAuthority() && !IsLocallyControlled();
+
+		if (bIsLocalTurn || bIsServerTurn)
 		{
 			CMC_Mut->bOrientRotationToMovement = false;
 			bIsCommittingTurn = true;
 
-			// Fresh target every frame — tracks the live camera yaw (full rotator)
+			// Fresh target every frame — tracks the live camera yaw.
+			// GetControlRotation() is valid on both:
+			//   - Client: local PlayerController
+			//   - Server: the owning PlayerController exists server-side,
+			//     ControlRotation is updated via CMC packed movement RPCs.
 			TargetTurnRotation = FRotator(0.0f, GetControlRotation().Yaw, 0.0f);
 			const FRotator CurrentRotation = GetActorRotation();
 			// RInterpTo takes the shortest path across ±180° — prevents 360° death spins
 			const FRotator NewRotation = FMath::RInterpTo(CurrentRotation, TargetTurnRotation, DeltaTime, 5.0f);
 			SetActorRotation(NewRotation);
 
-			UE_LOG(LogTemp, Verbose, TEXT("[%s] CommitTurn -- Cur: %.1f | Tgt: %.1f | New: %.1f"),
-				*GetName(), CurrentRotation.Yaw, TargetTurnRotation.Yaw, NewRotation.Yaw);
+			UE_LOG(LogTemp, Verbose, TEXT("[%s] CommitTurn -- Cur: %.1f | Tgt: %.1f | New: %.1f | Role: %s"),
+				*GetName(), CurrentRotation.Yaw, TargetTurnRotation.Yaw, NewRotation.Yaw,
+				IsLocallyControlled() ? TEXT("Local") : TEXT("Server"));
 		}
 		else if (bIsCommittingTurn)
 		{
@@ -384,6 +398,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME(ACatBase, RestState);
 	DOREPLIFETIME(ACatBase, bCrouchMode);
 	DOREPLIFETIME(ACatBase, bDied);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 }
 
 void ACatBase::PossessedBy(AController* NewController)
@@ -486,31 +502,67 @@ void ACatBase::UpdateAnimationStates()
 		SpeedType = ECatMoveType::Idle;
 	}
 
-	// (f2) AimYaw — signed yaw delta between control rotation and actor rotation
-	AimYaw = FRotator::NormalizeAxis(GetControlRotation().Yaw - GetActorRotation().Yaw);
-	AimYawClamped = FMath::Clamp(AimYaw, -90.0f, 90.0f);
-
-	// (f3) Turn-In-Place detection
-	//  Triggers when idle on the ground and the camera has orbited > 40° away.
-	//  Clears when the yaw delta drops below 10° (hysteresis prevents flicker).
-	if (SpeedType == ECatMoveType::Idle
-		&& MovementStage == ECatMovementStage::OnGround
-		&& FMath::Abs(AimYaw) > 40.0f)
+	// (f2)–(f4): Aim yaw & turn detection — local only.
+	// Simulated proxies and server copies of client pawns have no valid
+	// ControlRotation; these values would be garbage and trigger false
+	// Turn states / ghost rotation.
+	if (IsLocallyControlled())
 	{
-		bGoTurn = true;
-		SpeedType = ECatMoveType::Turn;
+		// (f2) AimYaw — only valid with a local controller
+		AimYaw = FRotator::NormalizeAxis(GetControlRotation().Yaw - GetActorRotation().Yaw);
+		AimYawClamped = FMath::Clamp(AimYaw, -90.0f, 90.0f);
+
+		// (f3) Turn-In-Place detection (hysteresis unchanged)
+		const bool bWasTurning = bGoTurn;
+		if (SpeedType == ECatMoveType::Idle
+			&& MovementStage == ECatMovementStage::OnGround
+			&& FMath::Abs(AimYaw) > 40.0f)
+		{
+			bGoTurn = true;
+			SpeedType = ECatMoveType::Turn;
+		}
+		else if (FMath::Abs(AimYaw) < 10.0f)
+		{
+			bGoTurn = false;
+		}
+
+		// (f4) TurnRateAnim
+		TurnRateAnim = FMath::GetMappedRangeValueClamped(
+			FVector2D(-90.0f, 90.0f), FVector2D(-1.0f, 1.0f), AimYaw);
+
+		// ── Client → Server RPC: send turn state so server can replicate it out ──
+		// Reliable edge-trigger for state; unreliable delta-trigger for blendspace.
+		if (!HasAuthority())
+		{
+			// Reliable edge-trigger: guaranteed ordered delivery for state flips
+			if (bGoTurn != bWasTurning)
+			{
+				Server_SetTurnActive(bGoTurn);
+			}
+
+			// Unreliable delta-trigger: smooth blendspace updates during active turn
+			if (bGoTurn && FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f)
+			{
+				Server_SetTurnRate(TurnRateAnim);
+				LastSentTurnRateAnim = TurnRateAnim;
+			}
+		}
+
+		UE_LOG(LogTemp, Verbose, TEXT("[%s] AimYaw: %.1f | bGoTurn: %d | TurnRateAnim: %.3f"),
+			*GetName(), AimYaw, bGoTurn, TurnRateAnim);
 	}
-	else if (FMath::Abs(AimYaw) < 10.0f)
+	else
 	{
-		bGoTurn = false;
+		// ── Non-local (server copy of client pawn + all simulated proxies) ──
+		// bGoTurn is the authoritative replicated signal. Force SpeedType = Turn
+		// regardless of local velocity noise — proxy Speed can flicker above the
+		// Walk threshold (40 cm/s) due to network micro-corrections, which would
+		// otherwise override the turn state every other frame causing animation pops.
+		if (bGoTurn && MovementStage == ECatMovementStage::OnGround)
+		{
+			SpeedType = ECatMoveType::Turn;
+		}
 	}
-
-	// (f4) TurnRateAnim — drives BS1_Cat_Turn blendspace (-1 = 90°L, +1 = 90°R)
-	TurnRateAnim = FMath::GetMappedRangeValueClamped(
-		FVector2D(-90.0f, 90.0f), FVector2D(-1.0f, 1.0f), AimYaw);
-
-	UE_LOG(LogTemp, Verbose, TEXT("[%s] AimYaw: %.1f | bGoTurn: %d | TurnRateAnim: %.3f"),
-		*GetName(), AimYaw, bGoTurn, TurnRateAnim);
 
 	// (g) Backwards — dot product of velocity dir vs actor forward
 	if (bHasMovementInput && Speed > KINDA_SMALL_NUMBER)
@@ -600,4 +652,19 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		UE_LOG(LogTemp, Verbose, TEXT("[%s] Lean -- Rate: %.1f d/s | Raw: %.3f | Final: %.3f | Gate: %d"),
 			*GetName(), YawRate, RawLean, LeanAmount, bShouldLean);
 	}
+}
+
+// ── Server RPC: Turn Active (Reliable) ────────────────────────────
+void ACatBase::Server_SetTurnActive_Implementation(bool bNewGoTurn)
+{
+	bGoTurn = bNewGoTurn;
+	// SpeedType derivation happens next frame in UpdateAnimationStates() else-branch.
+	// bGoTurn replicates to all proxies via DOREPLIFETIME_CONDITION (COND_SkipOwner).
+}
+
+// ── Server RPC: Turn Rate (Unreliable) ────────────────────────────
+void ACatBase::Server_SetTurnRate_Implementation(float NewTurnRateAnim)
+{
+	TurnRateAnim = NewTurnRateAnim;
+	// Replicates to all proxies via DOREPLIFETIME_CONDITION (COND_SkipOwner).
 }
