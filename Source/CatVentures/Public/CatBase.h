@@ -93,6 +93,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "30.0", ClampMax = "720.0"))
 	float TurnRate = 180.0f;
 
+	// ── Movement Tuning ────────────────────────────────────────────
+
+	/** Max ground speed (cm/s). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "100.0", ClampMax = "2000.0"))
+	float MovementMaxWalkSpeed = 400.0f;
+
+	/** How fast the cat accelerates to max speed (cm/s²). Lower = heavier ramp-up. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "50.0", ClampMax = "4000.0"))
+	float MovementAcceleration = 500.0f;
+
+	/** How fast the cat decelerates when input is released (cm/s²). Lower = longer slide. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "50.0", ClampMax = "4000.0"))
+	float MovementBrakingDeceleration = 500.0f;
+
+	/** Ground friction multiplier. Lower = more slide. Default CMC is 8.0. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "0.0", ClampMax = "16.0"))
+	float MovementGroundFriction = 5.0f;
+
+	/** Friction applied while braking (separate from ground friction). Higher = stronger stop. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "0.0", ClampMax = "4.0"))
+	float MovementBrakingFriction = 0.5f;
+
+	/** Yaw rotation rate (°/s) when moving. Lower = wider turning arcs. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
+	float MovementRotationRateYaw = 360.0f;
+
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
 	/** Impulse magnitude applied to physics objects hit by the swat. */

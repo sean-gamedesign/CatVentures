@@ -46,16 +46,20 @@ ACatBase::ACatBase()
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
 		CMC->bOrientRotationToMovement = true;
-		CMC->RotationRate = FRotator(0.0f, 720.0f, 0.0f);
 
-		// Platforming tuning: snappy accel/decel, heavy gravity, high air control
+		// Movement Tuning — designer-exposed UPROPERTYs for momentum feel
+		CMC->MaxWalkSpeed                = MovementMaxWalkSpeed;
+		CMC->MaxAcceleration             = MovementAcceleration;
+		CMC->BrakingDecelerationWalking  = MovementBrakingDeceleration;
+		CMC->GroundFriction              = MovementGroundFriction;
+		CMC->BrakingFriction             = MovementBrakingFriction;
+		CMC->RotationRate                = FRotator(0.0f, MovementRotationRateYaw, 0.0f);
+
+		// Platforming tuning (not part of momentum pass — keep hardcoded)
 		CMC->GravityScale                = 2.5f;
 		CMC->JumpZVelocity               = 600.0f;
 		CMC->AirControl                  = 0.7f;
 		CMC->FallingLateralFriction      = 3.0f;
-		CMC->MaxWalkSpeed                = 400.0f;
-		CMC->MaxAcceleration             = 2048.0f;
-		CMC->BrakingDecelerationWalking  = 2048.0f;
 	}
 
 	// Variable jump height: hold jump up to 0.3s for full height, tap for a short hop.
@@ -493,7 +497,7 @@ void ACatBase::UpdateAnimationStates()
 	{
 		SpeedType = ECatMoveType::Trot;
 	}
-	else if (NormalizedSpeed >= 0.1f)
+	else if (bHasMovementInput)
 	{
 		SpeedType = ECatMoveType::Walk;
 	}
