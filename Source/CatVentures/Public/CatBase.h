@@ -16,6 +16,8 @@ class UAnimMontage;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnJumpPhaseChanged, ECatJumpPhase, NewPhase);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnCatLanded, float, ImpactIntensity, float, AirTime);
 
 /**
  * Base C++ Character for all Cat pawns.
@@ -119,6 +121,48 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
 	float MovementRotationRateYaw = 360.0f;
 
+	// ── Jump Tuning ───────────────────────────────────────────────────
+
+	/** Initial vertical launch velocity (cm/s). Wired to CMC->JumpZVelocity. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "200.0", ClampMax = "1500.0"))
+	float JumpLaunchVelocity = 700.0f;
+
+	/** Gravity scale while ascending (Vz > ApexVelocityThreshold). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float GravityScaleRising = 2.8f;
+
+	/** Gravity scale near the peak (|Vz| <= ApexVelocityThreshold). Slight hang feel. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float GravityScaleApex = 2.0f;
+
+	/** Gravity scale while falling (Vz < -ApexVelocityThreshold). The key "weight" knob. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
+	float GravityScaleFalling = 4.5f;
+
+	/** |Velocity.Z| (cm/s) below which the character is considered at the apex. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "10.0", ClampMax = "200.0"))
+	float ApexVelocityThreshold = 60.0f;
+
+	/** Air control while jumping. Lower = less mid-air steering, preserving momentum. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float JumpAirControl = 0.3f;
+
+	/** Max hold time (seconds) for variable-height jump. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float JumpMaxHoldTimeTuning = 0.3f;
+
+	/** How long (seconds) the Land phase persists for the landing animation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float LandRecoveryDuration = 0.25f;
+
+	/** |Velocity.Z| at impact that saturates LandImpactIntensity to 1.0. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "200.0", ClampMax = "2000.0"))
+	float HardLandSpeedThreshold = 900.0f;
+
+	/** Minimum seconds after Land phase before another jump is allowed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float JumpCooldown = 0.05f;
+
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
 	/** Impulse magnitude applied to physics objects hit by the swat. */
@@ -138,6 +182,16 @@ public:
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
 	FOnSwatHitDelegate OnSwatHit;
+
+	// ── Jump Delegates ─────────────────────────────────────────────────
+
+	/** Fires on every jump phase transition — AnimBP binds to drive state machine. */
+	UPROPERTY(BlueprintAssignable, Category = "Jump")
+	FOnJumpPhaseChanged OnJumpPhaseChanged;
+
+	/** Fires once on landing with impact data — AnimBP can scale landing animation weight. */
+	UPROPERTY(BlueprintAssignable, Category = "Jump")
+	FOnCatLanded OnCatLanded;
 
 	// ── Swat Trace Interface (called by UAnimNotifyState_SwatTrace) ──
 
@@ -161,10 +215,22 @@ protected:
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	//~ End APawn Interface
 
+	//~ Begin ACharacter Interface
+	virtual void OnJumped_Implementation() override;
+	virtual void Landed(const FHitResult& Hit) override;
+	virtual bool CanJumpInternal_Implementation() const override;
+	//~ End ACharacter Interface
+
 	// ── Tick Subsystems ────────────────────────────────────────────────
 
 	/** Derives gameplay state (SpeedType, MovementStage, etc.) from the CharacterMovementComponent. Runs on ALL roles. */
 	void UpdateAnimationStates();
+
+	/** Applies asymmetric gravity scaling based on vertical velocity direction. Authority + autonomous proxy only. */
+	void UpdateJumpGravity();
+
+	/** Derives JumpPhase from CMC velocity and movement mode. Called from UpdateAnimationStates(). */
+	void UpdateJumpPhase(float DeltaTime);
 
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
@@ -286,6 +352,10 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bDied, Category = "Animation State")
 	bool bDied = false;
 
+	/** Current jump phase for AnimBP state machine transitions. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_JumpPhase, Category = "Animation State")
+	ECatJumpPhase JumpPhase = ECatJumpPhase::None;
+
 	// ── OnRep Callbacks ─────────────────────────────────────────────────
 
 	UFUNCTION()
@@ -317,6 +387,9 @@ protected:
 
 	UFUNCTION()
 	void OnRep_bDied();
+
+	UFUNCTION()
+	void OnRep_JumpPhase();
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Local Cosmetic Variables (NOT replicated) ─────────────────────
@@ -400,6 +473,18 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bIsOnGround = false;
 
+	/** Normalized fall speed [0,1] — 0 = just started falling, 1 = terminal. Drives fall blendspace. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float NormalizedFallSpeed = 0.0f;
+
+	/** Landing impact intensity [0,1] — driven by |Vz| at impact. Drives landing animation weight. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float LandImpactIntensity = 0.0f;
+
+	/** Time spent in air (seconds). Accumulates while airborne, resets on land. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float JumpAirTime = 0.0f;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bBackwards = false;
 
@@ -458,6 +543,20 @@ private:
 
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
+
+	// ── Jump State (per-instance) ──────────────────────────────────────
+
+	/** Gates phase changes and broadcasts OnJumpPhaseChanged on actual transitions. */
+	void SetJumpPhase(ECatJumpPhase NewPhase);
+
+	/** Counts down from LandRecoveryDuration to zero during Land phase. */
+	float LandRecoveryTimer = 0.0f;
+
+	/** Cached launch Vz for NormalizedFallSpeed mapping. */
+	float LaunchVelocityZ = 0.0f;
+
+	/** Cooldown timer — counts down after Land->None before jump is re-allowed. */
+	float JumpCooldownTimer = 0.0f;
 
 	// ── Turn Commitment & Lean ──────────────────────────────────────
 	FRotator TargetTurnRotation = FRotator::ZeroRotator;

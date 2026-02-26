@@ -62,6 +62,19 @@ enum class ECatMovementStage : uint8
 	Ragdoll
 };
 
+// ── Jump Phase ────────────────────────────────────────────────────────────
+
+/** Discrete jump phase — drives the AnimBP jump state machine transitions. */
+UENUM(BlueprintType)
+enum class ECatJumpPhase : uint8
+{
+	None,		// On ground, not jumping
+	Launch,		// Just left ground, ascending          (AnimX: JumpStart)
+	Apex,		// Near peak, |Vz| < threshold          (AnimX: JumpApex)
+	Fall,		// Descending                            (AnimX: JumpFall)
+	Land		// Just touched ground, in recovery      (AnimX: JumpLand)
+};
+
 // ── Aim Mode ──────────────────────────────────────────────────────────────
 
 /** Head/body aim mode for look-at and aiming blendspaces. */

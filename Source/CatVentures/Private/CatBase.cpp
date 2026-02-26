@@ -55,15 +55,13 @@ ACatBase::ACatBase()
 		CMC->BrakingFriction             = MovementBrakingFriction;
 		CMC->RotationRate                = FRotator(0.0f, MovementRotationRateYaw, 0.0f);
 
-		// Platforming tuning (not part of momentum pass — keep hardcoded)
-		CMC->GravityScale                = 2.5f;
-		CMC->JumpZVelocity               = 600.0f;
-		CMC->AirControl                  = 0.7f;
+		CMC->GravityScale                = GravityScaleRising;
+		CMC->JumpZVelocity               = JumpLaunchVelocity;
+		CMC->AirControl                  = JumpAirControl;
 		CMC->FallingLateralFriction      = 3.0f;
 	}
 
-	// Variable jump height: hold jump up to 0.3s for full height, tap for a short hop.
-	JumpMaxHoldTime = 0.3f;
+	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
 }
 
 void ACatBase::BeginPlay()
@@ -85,6 +83,15 @@ void ACatBase::BeginPlay()
 	CameraBoom->CameraLagSpeed           = CameraLagSpeed;
 	CameraBoom->bEnableCameraRotationLag = bEnableCameraRotationLag;
 	CameraBoom->CameraRotationLagSpeed   = CameraRotationLagSpeed;
+
+	// Apply jump tuning UPROPERTYs to the CMC (so per-instance overrides in Details panel take effect)
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->JumpZVelocity  = JumpLaunchVelocity;
+		CMC->AirControl     = JumpAirControl;
+		CMC->GravityScale   = GravityScaleRising;
+	}
+	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
 }
 
 void ACatBase::Tick(float DeltaTime)
@@ -95,6 +102,9 @@ void ACatBase::Tick(float DeltaTime)
 
 	// ── State: runs on ALL roles (server, autonomous, simulated) ──
 	UpdateAnimationStates();
+
+	// ── Jump gravity: authority + autonomous proxy only ────────────────
+	UpdateJumpGravity();
 
 	// ── Turn-In-Place Rotation Commitment ─────────────────────────────
 	// Runs BEFORE cosmetic interp so next frame's AimYaw sees the
@@ -402,6 +412,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME(ACatBase, RestState);
 	DOREPLIFETIME(ACatBase, bCrouchMode);
 	DOREPLIFETIME(ACatBase, bDied);
+	DOREPLIFETIME(ACatBase, JumpPhase);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 }
@@ -440,6 +451,7 @@ void ACatBase::OnRep_BaseAction()     {}
 void ACatBase::OnRep_RestState()      {}
 void ACatBase::OnRep_bCrouchMode()    {}
 void ACatBase::OnRep_bDied()          {}
+void ACatBase::OnRep_JumpPhase()      {}
 
 // ══════════════════════════════════════════════════════════════════════════
 // ── UpdateAnimationStates ───────────────────────────────────────────────
@@ -480,6 +492,9 @@ void ACatBase::UpdateAnimationStates()
 	{
 		MovementStage = ECatMovementStage::InAir;
 	}
+
+	// (e2) Jump phase — tick-driven phase transitions
+	UpdateJumpPhase(DeltaTimeCached);
 
 	// (f) SpeedType — threshold chain on normalized speed
 	const float MaxSpeed = CMC->MaxWalkSpeed;
@@ -671,4 +686,161 @@ void ACatBase::Server_SetTurnRate_Implementation(float NewTurnRateAnim)
 {
 	TurnRateAnim = NewTurnRateAnim;
 	// Replicates to all proxies via DOREPLIFETIME_CONDITION (COND_SkipOwner).
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Jump System ─────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void ACatBase::SetJumpPhase(ECatJumpPhase NewPhase)
+{
+	if (JumpPhase == NewPhase) return;
+
+	JumpPhase = NewPhase;
+	OnJumpPhaseChanged.Broadcast(NewPhase);
+}
+
+void ACatBase::OnJumped_Implementation()
+{
+	SetJumpPhase(ECatJumpPhase::Launch);
+	LaunchVelocityZ = FMath::Abs(GetVelocity().Z);
+	JumpAirTime = 0.0f;
+}
+
+void ACatBase::Landed(const FHitResult& Hit)
+{
+	Super::Landed(Hit);
+
+	const float ImpactZ = FMath::Abs(GetCharacterMovement()->Velocity.Z);
+	LandImpactIntensity = FMath::Clamp(ImpactZ / HardLandSpeedThreshold, 0.0f, 1.0f);
+	LandRecoveryTimer = LandRecoveryDuration;
+
+	SetJumpPhase(ECatJumpPhase::Land);
+	OnCatLanded.Broadcast(LandImpactIntensity, JumpAirTime);
+}
+
+bool ACatBase::CanJumpInternal_Implementation() const
+{
+	if (JumpCooldownTimer > 0.0f) return false;
+	return Super::CanJumpInternal_Implementation();
+}
+
+void ACatBase::UpdateJumpGravity()
+{
+	UCharacterMovementComponent* CMC = GetCharacterMovement();
+	if (!CMC) return;
+
+	// Only authority and autonomous proxy need to drive physics.
+	// Simulated proxies receive replicated position/velocity.
+	if (!HasAuthority() && !IsLocallyControlled()) return;
+
+	if (JumpPhase == ECatJumpPhase::None || JumpPhase == ECatJumpPhase::Land)
+	{
+		CMC->GravityScale = GravityScaleRising;
+		return;
+	}
+
+	const float Vz = GetVelocity().Z;
+
+	if (Vz > ApexVelocityThreshold)
+	{
+		CMC->GravityScale = GravityScaleRising;
+	}
+	else if (FMath::Abs(Vz) <= ApexVelocityThreshold)
+	{
+		CMC->GravityScale = GravityScaleApex;
+	}
+	else
+	{
+		CMC->GravityScale = GravityScaleFalling;
+	}
+}
+
+void ACatBase::UpdateJumpPhase(float DeltaTime)
+{
+	// ── Cooldown countdown ───────────────────────────────────────────
+	if (JumpCooldownTimer > 0.0f)
+	{
+		JumpCooldownTimer -= DeltaTime;
+	}
+
+	// ── Air time accumulation ────────────────────────────────────────
+	if (JumpPhase != ECatJumpPhase::None && JumpPhase != ECatJumpPhase::Land)
+	{
+		JumpAirTime += DeltaTime;
+	}
+
+	const float Vz = GetVelocity().Z;
+
+	switch (JumpPhase)
+	{
+	case ECatJumpPhase::Launch:
+	{
+		// Apex: velocity dropped into the threshold window
+		if (FMath::Abs(Vz) <= ApexVelocityThreshold)
+		{
+			SetJumpPhase(ECatJumpPhase::Apex);
+		}
+		// Short hop: skipped apex window entirely, already falling
+		else if (Vz < -ApexVelocityThreshold)
+		{
+			SetJumpPhase(ECatJumpPhase::Fall);
+		}
+		// Safety: landed on a ledge while still rising
+		if (bIsOnGround && JumpPhase == ECatJumpPhase::Launch)
+		{
+			SetJumpPhase(ECatJumpPhase::None);
+		}
+		break;
+	}
+	case ECatJumpPhase::Apex:
+	{
+		if (Vz < -ApexVelocityThreshold)
+		{
+			SetJumpPhase(ECatJumpPhase::Fall);
+		}
+		// Safety: caught a ledge at apex
+		if (bIsOnGround && JumpPhase == ECatJumpPhase::Apex)
+		{
+			SetJumpPhase(ECatJumpPhase::None);
+		}
+		break;
+	}
+	case ECatJumpPhase::Fall:
+	{
+		// Fall -> Land is handled by Landed() override, not tick.
+		// NormalizedFallSpeed cosmetic update:
+		const float TerminalReference = FMath::Max(LaunchVelocityZ * 1.5f, HardLandSpeedThreshold);
+		NormalizedFallSpeed = FMath::Clamp(FMath::Abs(Vz) / TerminalReference, 0.0f, 1.0f);
+		break;
+	}
+	case ECatJumpPhase::Land:
+	{
+		LandRecoveryTimer -= DeltaTime;
+		// Decay LandImpactIntensity over the recovery window
+		LandImpactIntensity = FMath::Max(LandImpactIntensity - (DeltaTime / FMath::Max(LandRecoveryDuration, 0.01f)), 0.0f);
+
+		if (LandRecoveryTimer <= 0.0f)
+		{
+			LandRecoveryTimer = 0.0f;
+			JumpCooldownTimer = JumpCooldown;
+			NormalizedFallSpeed = 0.0f;
+			SetJumpPhase(ECatJumpPhase::None);
+		}
+		break;
+	}
+	case ECatJumpPhase::None:
+	default:
+	{
+		NormalizedFallSpeed = 0.0f;
+		// Walked off a ledge without jumping — enter Fall directly
+		if (bIsFalling && !bIsOnGround)
+		{
+			LaunchVelocityZ = FMath::Max(FMath::Abs(Vz), 100.0f);
+			JumpAirTime = 0.0f;
+			SetJumpPhase(ECatJumpPhase::Fall);
+		}
+		break;
+	}
+	}
 }
