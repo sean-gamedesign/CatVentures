@@ -451,7 +451,10 @@ void ACatBase::OnRep_BaseAction()     {}
 void ACatBase::OnRep_RestState()      {}
 void ACatBase::OnRep_bCrouchMode()    {}
 void ACatBase::OnRep_bDied()          {}
-void ACatBase::OnRep_JumpPhase()      {}
+void ACatBase::OnRep_JumpPhase()
+{
+	OnJumpPhaseChanged.Broadcast(JumpPhase);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // ── UpdateAnimationStates ───────────────────────────────────────────────

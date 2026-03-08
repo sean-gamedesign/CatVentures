@@ -23,6 +23,8 @@ AInteractableLoot::AInteractableLoot()
 
 void AInteractableLoot::Interact_Implementation(AActor* Interactor)
 {
+	if (!HasAuthority()) return;
+
 	const FString InstigatorName = Interactor ? Interactor->GetName() : TEXT("Unknown");
 
 	UE_LOG(LogTemp, Log, TEXT("AInteractableLoot::Interact — Loot collected by %s!"), *InstigatorName);
