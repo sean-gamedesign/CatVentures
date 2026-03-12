@@ -91,6 +91,7 @@ void ACatBase::BeginPlay()
 		CMC->AirControl     = JumpAirControl;
 		CMC->GravityScale   = GravityScaleRising;
 	}
+	GravityScaleInterp = GravityScaleRising;
 	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
 }
 
@@ -737,26 +738,35 @@ void ACatBase::UpdateJumpGravity()
 	// Simulated proxies receive replicated position/velocity.
 	if (!HasAuthority() && !IsLocallyControlled()) return;
 
+	// On ground phases — snap the interpolator back to Rising so the next
+	// airborne jump starts from the correct baseline, not a stale fall value.
 	if (JumpPhase == ECatJumpPhase::None || JumpPhase == ECatJumpPhase::Land)
 	{
-		CMC->GravityScale = GravityScaleRising;
+		GravityScaleInterp = GravityScaleRising;
+		CMC->GravityScale  = GravityScaleInterp;
 		return;
 	}
 
 	const float Vz = GetVelocity().Z;
+	float TargetGravityScale;
 
 	if (Vz > ApexVelocityThreshold)
 	{
-		CMC->GravityScale = GravityScaleRising;
+		TargetGravityScale = GravityScaleRising;
 	}
 	else if (FMath::Abs(Vz) <= ApexVelocityThreshold)
 	{
-		CMC->GravityScale = GravityScaleApex;
+		TargetGravityScale = GravityScaleApex;
 	}
 	else
 	{
-		CMC->GravityScale = GravityScaleFalling;
+		TargetGravityScale = GravityScaleFalling;
 	}
+
+	// Interpolate toward target — eliminates the single-frame Apex→Fall velocity spike.
+	// DeltaTimeCached is set at the top of Tick() before this function is called.
+	GravityScaleInterp = FMath::FInterpTo(GravityScaleInterp, TargetGravityScale, DeltaTimeCached, GravityScaleInterpSpeed);
+	CMC->GravityScale  = GravityScaleInterp;
 }
 
 void ACatBase::UpdateJumpPhase(float DeltaTime)

@@ -139,6 +139,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
 	float GravityScaleFalling = 4.5f;
 
+	/** How fast GravityScale ramps between phases — eliminates the Apex→Fall velocity spike.
+	 *  Higher = snappier. Lower = slower ramp. Tune live in PIE; recommended range: 10–20. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "50.0"))
+	float GravityScaleInterpSpeed = 15.0f;
+
 	/** |Velocity.Z| (cm/s) below which the character is considered at the apex. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "10.0", ClampMax = "200.0"))
 	float ApexVelocityThreshold = 60.0f;
@@ -557,6 +562,10 @@ private:
 
 	/** Cooldown timer — counts down after Land->None before jump is re-allowed. */
 	float JumpCooldownTimer = 0.0f;
+
+	/** Runtime-smoothed gravity scale — interpolates toward the target each tick to prevent
+	 *  the Apex→Fall velocity spike. Not replicated; purely a physics-smoothing value. */
+	float GravityScaleInterp = 2.8f;
 
 	// ── Turn Commitment & Lean ──────────────────────────────────────
 	FRotator TargetTurnRotation = FRotator::ZeroRotator;
