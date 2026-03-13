@@ -706,6 +706,8 @@ void ACatBase::SetJumpPhase(ECatJumpPhase NewPhase)
 
 void ACatBase::OnJumped_Implementation()
 {
+	bFallPending = false;
+	FallTransitionHoldTimer = 0.0f;
 	SetJumpPhase(ECatJumpPhase::Launch);
 	LaunchVelocityZ = FMath::Abs(GetVelocity().Z);
 	JumpAirTime = 0.0f;
@@ -713,6 +715,8 @@ void ACatBase::OnJumped_Implementation()
 
 void ACatBase::Landed(const FHitResult& Hit)
 {
+	bFallPending = false;
+	FallTransitionHoldTimer = 0.0f;
 	Super::Landed(Hit);
 
 	const float ImpactZ = FMath::Abs(GetCharacterMovement()->Velocity.Z);
@@ -783,25 +787,47 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		JumpAirTime += DeltaTime;
 	}
 
+	// ── Fall transition hold timer — counts down when Fall condition is detected ──
+	// Gives the AnimBP time to finish the uncoil before SetJumpPhase(Fall) fires.
+	if (bFallPending && FallTransitionHoldTimer > 0.0f)
+	{
+		FallTransitionHoldTimer -= DeltaTime;
+	}
+
 	const float Vz = GetVelocity().Z;
 
 	switch (JumpPhase)
 	{
 	case ECatJumpPhase::Launch:
 	{
-		// Apex: velocity dropped into the threshold window
+		// Apex window reached — abort any pending fall and advance normally
 		if (FMath::Abs(Vz) <= ApexVelocityThreshold)
 		{
+			bFallPending = false;
+			FallTransitionHoldTimer = 0.0f;
 			SetJumpPhase(ECatJumpPhase::Apex);
 		}
-		// Short hop: skipped apex window entirely, already falling
+		// Short hop — already past apex, heading down
 		else if (Vz < -ApexVelocityThreshold)
 		{
-			SetJumpPhase(ECatJumpPhase::Fall);
+			if (!bFallPending)
+			{
+				// First frame the fall condition is detected: start the hold timer
+				bFallPending = true;
+				FallTransitionHoldTimer = MinFallTransitionHoldTime;
+			}
+			else if (FallTransitionHoldTimer <= 0.0f)
+			{
+				// Timer expired — safe to commit to Fall
+				bFallPending = false;
+				SetJumpPhase(ECatJumpPhase::Fall);
+			}
 		}
 		// Safety: landed on a ledge while still rising
 		if (bIsOnGround && JumpPhase == ECatJumpPhase::Launch)
 		{
+			bFallPending = false;
+			FallTransitionHoldTimer = 0.0f;
 			SetJumpPhase(ECatJumpPhase::None);
 		}
 		break;
@@ -810,11 +836,22 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	{
 		if (Vz < -ApexVelocityThreshold)
 		{
-			SetJumpPhase(ECatJumpPhase::Fall);
+			if (!bFallPending)
+			{
+				bFallPending = true;
+				FallTransitionHoldTimer = MinFallTransitionHoldTime;
+			}
+			else if (FallTransitionHoldTimer <= 0.0f)
+			{
+				bFallPending = false;
+				SetJumpPhase(ECatJumpPhase::Fall);
+			}
 		}
 		// Safety: caught a ledge at apex
 		if (bIsOnGround && JumpPhase == ECatJumpPhase::Apex)
 		{
+			bFallPending = false;
+			FallTransitionHoldTimer = 0.0f;
 			SetJumpPhase(ECatJumpPhase::None);
 		}
 		break;

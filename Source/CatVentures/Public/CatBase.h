@@ -168,6 +168,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
 	float JumpCooldown = 0.05f;
 
+	/** Minimum seconds in Launch/Apex before the Fall phase is allowed to fire.
+	 *  Ensures the AnimBP always has time to finish the uncoil animation before
+	 *  the Fall state broadcasts, preventing the snap on both short hops and full jumps. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float MinFallTransitionHoldTime = 0.12f;
+
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
 	/** Impulse magnitude applied to physics objects hit by the swat. */
@@ -562,6 +568,13 @@ private:
 
 	/** Cooldown timer — counts down after Land->None before jump is re-allowed. */
 	float JumpCooldownTimer = 0.0f;
+
+	/** Countdown timer that gates SetJumpPhase(Fall). Starts at MinFallTransitionHoldTime
+	 *  when Fall condition is first detected; Fall only fires when this reaches zero. */
+	float FallTransitionHoldTimer = 0.0f;
+
+	/** True when the Fall condition has been detected and we're waiting for FallTransitionHoldTimer. */
+	bool bFallPending = false;
 
 	/** Runtime-smoothed gravity scale — interpolates toward the target each tick to prevent
 	 *  the Apex→Fall velocity spike. Not replicated; purely a physics-smoothing value. */
