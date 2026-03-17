@@ -21,6 +21,10 @@
 		{
 			"Name": "Aura",
 			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemSteam",
+			"Enabled": true
 		}
 	]
 }
