@@ -13,6 +13,8 @@
 #include "Animation/AnimMontage.h"
 #include "InteractableInterface.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
 
 ACatBase::ACatBase()
 {
@@ -27,6 +29,16 @@ ACatBase::ACatBase()
 	FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
 	FollowCamera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
 	FollowCamera->bUsePawnControlRotation = false;
+
+	// ── Physics Bumper ────────────────────────────────────────────
+	PhysicsBumper = CreateDefaultSubobject<UBoxComponent>(TEXT("PhysicsBumper"));
+	PhysicsBumper->SetupAttachment(RootComponent);
+	PhysicsBumper->SetRelativeLocation(FVector(60.0f, 0.0f, 10.0f));
+	PhysicsBumper->SetBoxExtent(FVector(15.0f, 28.0f, 22.0f));
+	PhysicsBumper->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+	PhysicsBumper->SetCollisionResponseToAllChannels(ECR_Ignore);
+	PhysicsBumper->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);
+	PhysicsBumper->SetGenerateOverlapEvents(true);
 
 	// ── Rotation settings ────────────────────────────────────────
 	bUseControllerRotationPitch = false;
@@ -68,6 +80,8 @@ void ACatBase::BeginPlay()
 {
 	Super::BeginPlay();
 
+	PhysicsBumper->OnComponentBeginOverlap.AddDynamic(this, &ACatBase::OnBumperOverlapBegin);
+
 	// Register the default mapping context for the local player only.
 	if (const APlayerController* PC = Cast<APlayerController>(Controller))
 	{
@@ -93,6 +107,30 @@ void ACatBase::BeginPlay()
 	}
 	GravityScaleInterp = GravityScaleRising;
 	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
+}
+
+void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
+    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
+    const FHitResult& SweepResult)
+{
+	if (!HasAuthority()) return;
+	if (!OtherComp || !OtherComp->IsSimulatingPhysics()) return;
+
+	// Stage 1 — CMC floor check (primary, rotation-agnostic).
+	// If the cat is grounded on this exact component, suppress the impulse.
+	if (GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() == OtherComp) return;
+
+	// Stage 2 — Z-bounds fallback (airborne case).
+	// When airborne, CurrentFloor is stale. Suppress if the object's AABB top
+	// is at or below the cat's feet — it's directly underneath, not beside.
+	const float FeetZ   = GetActorLocation().Z - GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+	const float ObjTopZ = OtherComp->Bounds.GetBox().Max.Z;
+	if (ObjTopZ <= FeetZ + UnderFootTolerance) return;
+
+	FVector Vel = GetVelocity();
+	Vel.Z = 0.0f;
+	const FVector ImpulseDir = Vel.SizeSquared() > 1.0f ? Vel.GetSafeNormal() : GetActorForwardVector();
+	OtherComp->AddImpulse(ImpulseDir * BumperPushForce, NAME_None, /*bVelChange=*/false);
 }
 
 void ACatBase::Tick(float DeltaTime)
@@ -346,7 +384,7 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 		if (HitComp->IsSimulatingPhysics())
 		{
 			const FVector ImpulseDir = (HitActor->GetActorLocation() - GetActorLocation()).GetSafeNormal();
-			HitComp->AddImpulse(ImpulseDir * SwatImpulseStrength, NAME_None, true);
+			HitComp->AddImpulse(ImpulseDir * SwatImpulseForce, NAME_None, /*bVelChange=*/false);
 		}
 	}
 

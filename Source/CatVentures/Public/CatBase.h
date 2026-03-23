@@ -13,6 +13,7 @@ struct FInputActionValue;
 class USpringArmComponent;
 class UCameraComponent;
 class UAnimMontage;
+class UBoxComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
@@ -176,9 +177,11 @@ public:
 
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
-	/** Impulse magnitude applied to physics objects hit by the swat. */
+	/** Impulse (kg·cm/s) applied to physics objects hit by the swat.
+	 *  bVelChange = false, so heavier objects resist more.
+	 *  Rule of thumb: value / object_mass_kg = launch speed in cm/s. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat", meta = (ClampMin = "0.0"))
-	float SwatImpulseStrength = 800.0f;
+	float SwatImpulseForce = 5000.0f;
 
 	/** Montage to play when the cat swats. Must contain an AnimNotifyState_SwatTrace on the active frames. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
@@ -189,6 +192,25 @@ public:
 	/** How far forward (cm) the interaction sphere trace reaches. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interaction", meta = (ClampMin = "50.0"))
 	float InteractTraceLength = 200.0f;
+
+	// ── Physics Bumper ───────────────────────────────────────────────────
+
+	/** Forward-facing box that detects and pushes PhysicsBody objects before the capsule would.
+	 *  Resize and reposition in the PrimeCatBase Blueprint viewport. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Physics Bumper")
+	TObjectPtr<UBoxComponent> PhysicsBumper;
+
+	/** Impulse magnitude (N·s) applied to physics objects on bumper contact.
+	 *  bVelChange = false, so heavier objects move less. Start around 50000. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0"))
+	float BumperPushForce = 50000.0f;
+
+	/** How far (cm) above the cat's foot level an object's top can be and still
+	 *  be suppressed as 'underneath' when airborne. Only used as a fallback when
+	 *  the CMC floor check doesn't match (i.e. the cat is not currently grounded
+	 *  on that component). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float UnderFootTolerance = 12.0f;
 
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
@@ -551,6 +573,12 @@ private:
 	/** Montage end callback — fires on both natural completion and interruption. Resets bIsSwatting. */
 	UFUNCTION()
 	void OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted);
+
+	/** Fires when PhysicsBumper overlaps a PhysicsBody. Applies BumperPushForce on authority. */
+	UFUNCTION()
+	void OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
+	    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
+	    const FHitResult& SweepResult);
 
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
