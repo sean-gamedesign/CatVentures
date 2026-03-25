@@ -238,6 +238,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0"))
 	float MaxGrabDistance = 250.0f;
 
+	/** Walk speed (cm/s) while a mouth grab is active. Simulates the effort of dragging weight. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0", ClampMax = "400.0"))
+	float DragWalkSpeed = 150.0f;
+
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
 	FOnSwatHitDelegate OnSwatHit;
@@ -429,7 +433,7 @@ protected:
 	bool bDied = false;
 
 	/** True while a mouth grab is active. Replicated so the AnimBP can drive a jaw-open blend on all machines. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation State")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bIsGrabbing, Category = "Animation State")
 	bool bIsGrabbing = false;
 
 	/** Current jump phase for AnimBP state machine transitions. */
@@ -470,6 +474,9 @@ protected:
 
 	UFUNCTION()
 	void OnRep_JumpPhase();
+
+	UFUNCTION()
+	void OnRep_bIsGrabbing();
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Local Cosmetic Variables (NOT replicated) ─────────────────────
@@ -632,6 +639,12 @@ private:
 
 	/** Updates GrabHandle's target to GrabTargetLocation each tick. Performs auto-release distance check. Authority only. */
 	void UpdateGrab(float DeltaTime);
+
+	/** Sets CMC to drag-movement state: reduced MaxWalkSpeed, bOrientRotationToMovement disabled. */
+	void ApplyDragMovementSettings();
+
+	/** Restores CMC to normal state using MovementMaxWalkSpeed and bOrientRotationToMovement = true. */
+	void RestoreNormalMovementSettings();
 
 	// ── Jump State (per-instance) ──────────────────────────────────────
 

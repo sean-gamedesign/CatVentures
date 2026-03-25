@@ -461,6 +461,10 @@ void ACatBase::PerformInteractTrace()
 
 void ACatBase::TriggerGrab()
 {
+	// Client-side prediction: apply drag settings immediately so there is no
+	// rubber-band stutter waiting for the server round-trip.
+	ApplyDragMovementSettings();
+
 	if (HasAuthority())
 	{
 		Server_Grab_Implementation();
@@ -473,6 +477,9 @@ void ACatBase::TriggerGrab()
 
 void ACatBase::TriggerRelease()
 {
+	// Client-side prediction: restore settings before the RPC so input feels instant.
+	RestoreNormalMovementSettings();
+
 	if (HasAuthority())
 	{
 		Server_ReleaseGrab_Implementation();
@@ -518,6 +525,7 @@ void ACatBase::Server_Grab_Implementation()
 
 	GrabbedComponent = HitComp;
 	bIsGrabbing      = true;
+	ApplyDragMovementSettings();
 }
 
 void ACatBase::Server_ReleaseGrab_Implementation()
@@ -525,6 +533,7 @@ void ACatBase::Server_ReleaseGrab_Implementation()
 	GrabHandle->ReleaseComponent();
 	GrabbedComponent.Reset();
 	bIsGrabbing = false;
+	RestoreNormalMovementSettings();
 }
 
 void ACatBase::UpdateGrab(float DeltaTime)
@@ -536,6 +545,7 @@ void ACatBase::UpdateGrab(float DeltaTime)
 	{
 		GrabHandle->ReleaseComponent();
 		bIsGrabbing = false;
+		RestoreNormalMovementSettings();
 		return;
 	}
 
@@ -553,6 +563,32 @@ void ACatBase::UpdateGrab(float DeltaTime)
 	GrabHandle->SetTargetLocationAndRotation(
 		GrabTargetLocation->GetComponentLocation(),
 		GrabTargetLocation->GetComponentRotation());
+}
+
+void ACatBase::ApplyDragMovementSettings()
+{
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->MaxWalkSpeed              = DragWalkSpeed;
+		CMC->bOrientRotationToMovement = false;
+	}
+}
+
+void ACatBase::RestoreNormalMovementSettings()
+{
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->MaxWalkSpeed              = MovementMaxWalkSpeed;
+		CMC->bOrientRotationToMovement = true;
+	}
+}
+
+void ACatBase::OnRep_bIsGrabbing()
+{
+	if (bIsGrabbing)
+		ApplyDragMovementSettings();
+	else
+		RestoreNormalMovementSettings();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
