@@ -15,6 +15,7 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "PhysicsEngine/PhysicsHandleComponent.h"
 
 ACatBase::ACatBase()
 {
@@ -39,6 +40,17 @@ ACatBase::ACatBase()
 	PhysicsBumper->SetCollisionResponseToAllChannels(ECR_Ignore);
 	PhysicsBumper->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);
 	PhysicsBumper->SetGenerateOverlapEvents(true);
+
+	// ── Mouth Grab ────────────────────────────────────────────────
+	GrabHandle = CreateDefaultSubobject<UPhysicsHandleComponent>(TEXT("GrabHandle"));
+	GrabHandle->LinearStiffness    = 300.0f;  // Low stiffness = heavy drag feel for 100kg objects
+	GrabHandle->LinearDamping      = 50.0f;   // High damping = sluggish, no oscillation
+	GrabHandle->AngularStiffness   = 0.0f;    // Zero = object tumbles freely (realistic mouth grab)
+	GrabHandle->AngularDamping     = 0.0f;
+	GrabHandle->InterpolationSpeed = 50.0f;
+
+	GrabTargetLocation = CreateDefaultSubobject<USceneComponent>(TEXT("GrabTargetLocation"));
+	GrabTargetLocation->SetupAttachment(GetMesh(), TEXT("socket_mouth"));
 
 	// ── Rotation settings ────────────────────────────────────────
 	bUseControllerRotationPitch = false;
@@ -145,6 +157,12 @@ void ACatBase::Tick(float DeltaTime)
 	// ── Jump gravity: authority + autonomous proxy only ────────────────
 	UpdateJumpGravity();
 
+	// ── Mouth Grab: authority only — moves the physics handle target ──
+	if (HasAuthority())
+	{
+		UpdateGrab(DeltaTime);
+	}
+
 	// ── Turn-In-Place Rotation Commitment ─────────────────────────────
 	// Runs BEFORE cosmetic interp so next frame's AimYaw sees the
 	// already-committed actor rotation — eliminates one-frame snap.
@@ -231,6 +249,10 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 		// Interact
 		EnhancedInput->BindAction(InteractAction, ETriggerEvent::Started, this, &ACatBase::TriggerInteract);
+
+		// Mouth Grab — Started = bite, Completed = release
+		EnhancedInput->BindAction(GrabAction, ETriggerEvent::Started,   this, &ACatBase::TriggerGrab);
+		EnhancedInput->BindAction(GrabAction, ETriggerEvent::Completed, this, &ACatBase::TriggerRelease);
 	}
 }
 
@@ -434,6 +456,106 @@ void ACatBase::PerformInteractTrace()
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// ── Mouth Grab ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void ACatBase::TriggerGrab()
+{
+	if (HasAuthority())
+	{
+		Server_Grab_Implementation();
+	}
+	else
+	{
+		Server_Grab();
+	}
+}
+
+void ACatBase::TriggerRelease()
+{
+	if (HasAuthority())
+	{
+		Server_ReleaseGrab_Implementation();
+	}
+	else
+	{
+		Server_ReleaseGrab();
+	}
+}
+
+void ACatBase::Server_Grab_Implementation()
+{
+	if (bIsGrabbing) return;
+
+	const FTransform MouthTransform = GetMesh()->GetSocketTransform(TEXT("socket_mouth"));
+	const FVector    TraceStart     = MouthTransform.GetLocation();
+	const FVector    TraceEnd       = TraceStart + MouthTransform.GetUnitAxis(EAxis::X) * GrabTraceLength;
+
+	FHitResult HitResult;
+	FCollisionQueryParams Params;
+	Params.AddIgnoredActor(this);
+
+	if (!GetWorld()->SweepSingleByChannel(
+		HitResult,
+		TraceStart,
+		TraceEnd,
+		FQuat::Identity,
+		ECC_PhysicsBody,
+		FCollisionShape::MakeSphere(GrabTraceRadius),
+		Params))
+	{
+		return;
+	}
+
+	UPrimitiveComponent* HitComp = HitResult.GetComponent();
+	if (!HitComp || !HitComp->IsSimulatingPhysics()) return;
+
+	GrabHandle->GrabComponentAtLocationWithRotation(
+		HitComp,
+		NAME_None,
+		HitResult.ImpactPoint,
+		HitComp->GetComponentRotation());
+
+	GrabbedComponent = HitComp;
+	bIsGrabbing      = true;
+}
+
+void ACatBase::Server_ReleaseGrab_Implementation()
+{
+	GrabHandle->ReleaseComponent();
+	GrabbedComponent.Reset();
+	bIsGrabbing = false;
+}
+
+void ACatBase::UpdateGrab(float DeltaTime)
+{
+	if (!bIsGrabbing) return;
+
+	// Auto-release if the grabbed actor was destroyed mid-grab
+	if (!GrabbedComponent.IsValid())
+	{
+		GrabHandle->ReleaseComponent();
+		bIsGrabbing = false;
+		return;
+	}
+
+	// Auto-release if the object has drifted too far (e.g. cat jumped over a wall)
+	const float Dist = FVector::Dist(
+		GrabTargetLocation->GetComponentLocation(),
+		GrabbedComponent->GetComponentLocation());
+
+	if (Dist > MaxGrabDistance)
+	{
+		Server_ReleaseGrab_Implementation();
+		return;
+	}
+
+	GrabHandle->SetTargetLocationAndRotation(
+		GrabTargetLocation->GetComponentLocation(),
+		GrabTargetLocation->GetComponentRotation());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // ── Replication Boilerplate ─────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -454,6 +576,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME(ACatBase, JumpPhase);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
+	DOREPLIFETIME(ACatBase, bIsGrabbing);
 }
 
 void ACatBase::PossessedBy(AController* NewController)

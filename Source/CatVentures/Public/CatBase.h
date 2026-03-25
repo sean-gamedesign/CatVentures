@@ -14,6 +14,7 @@ class USpringArmComponent;
 class UCameraComponent;
 class UAnimMontage;
 class UBoxComponent;
+class UPhysicsHandleComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
@@ -212,6 +213,31 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0", ClampMax = "60.0"))
 	float UnderFootTolerance = 12.0f;
 
+	// ── Mouth Grab ───────────────────────────────────────────────────────
+
+	/** Physics handle that constrains the grabbed component toward GrabTargetLocation.
+	 *  Operates on authority only; grabbed object replicates via its own SetIsReplicated. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
+	TObjectPtr<UPhysicsHandleComponent> GrabHandle;
+
+	/** World-space follow point for the grab handle. Attached to socket_mouth so it
+	 *  tracks the jaw automatically as the skeleton animates. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
+	TObjectPtr<USceneComponent> GrabTargetLocation;
+
+	/** Radius (cm) of the mouth sphere trace used to detect grabbable objects. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "5.0"))
+	float GrabTraceRadius = 35.0f;
+
+	/** Reach (cm) of the mouth sphere trace along the socket_mouth X-axis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "10.0"))
+	float GrabTraceLength = 175.0f;
+
+	/** Auto-release distance (cm). If the grabbed object's centre drifts further
+	 *  than this from GrabTargetLocation, the grab is dropped. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0"))
+	float MaxGrabDistance = 250.0f;
+
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
 	FOnSwatHitDelegate OnSwatHit;
@@ -291,6 +317,9 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> InteractAction;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> GrabAction;
+
 	// ── Input Handlers ──────────────────────────────────────────────────
 
 	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
@@ -304,6 +333,12 @@ protected:
 
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
+
+	/** Fires on IA_Grab Started — initiates mouth grab. */
+	void TriggerGrab();
+
+	/** Fires on IA_Grab Completed — releases mouth grab. */
+	void TriggerRelease();
 
 	// ── Networked Meow ──────────────────────────────────────────────────
 
@@ -330,6 +365,14 @@ protected:
 	/** Client → Server: request an interaction trace. */
 	UFUNCTION(Server, Reliable)
 	void Server_Interact();
+
+	/** Client → Server: initiate a mouth grab at the current mouth socket position. */
+	UFUNCTION(Server, Reliable)
+	void Server_Grab();
+
+	/** Client → Server: release the currently grabbed component. */
+	UFUNCTION(Server, Reliable)
+	void Server_ReleaseGrab();
 
 	// ── Networked Turn State ───────────────────────────────────────────
 
@@ -384,6 +427,10 @@ protected:
 	/** True when the cat has died. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bDied, Category = "Animation State")
 	bool bDied = false;
+
+	/** True while a mouth grab is active. Replicated so the AnimBP can drive a jaw-open blend on all machines. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation State")
+	bool bIsGrabbing = false;
 
 	/** Current jump phase for AnimBP state machine transitions. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_JumpPhase, Category = "Animation State")
@@ -583,6 +630,9 @@ private:
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
 
+	/** Updates GrabHandle's target to GrabTargetLocation each tick. Performs auto-release distance check. Authority only. */
+	void UpdateGrab(float DeltaTime);
+
 	// ── Jump State (per-instance) ──────────────────────────────────────
 
 	/** Gates phase changes and broadcasts OnJumpPhaseChanged on actual transitions. */
@@ -607,6 +657,11 @@ private:
 	/** Runtime-smoothed gravity scale — interpolates toward the target each tick to prevent
 	 *  the Apex→Fall velocity spike. Not replicated; purely a physics-smoothing value. */
 	float GravityScaleInterp = 2.8f;
+
+	// ── Mouth Grab State ────────────────────────────────────────────
+
+	/** The physics component currently held. Valid only on authority while bIsGrabbing. */
+	TWeakObjectPtr<UPrimitiveComponent> GrabbedComponent;
 
 	// ── Turn Commitment & Lean ──────────────────────────────────────
 	FRotator TargetTurnRotation = FRotator::ZeroRotator;
