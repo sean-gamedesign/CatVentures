@@ -199,7 +199,12 @@ void ACatBase::Tick(float DeltaTime)
 		}
 		else if (bIsCommittingTurn)
 		{
-			CMC_Mut->bOrientRotationToMovement = true;
+			// Only restore auto-rotation if a grab is not active — grab holds its own
+			// lock on bOrientRotationToMovement and restores it on release.
+			if (!bIsGrabbing)
+			{
+				CMC_Mut->bOrientRotationToMovement = true;
+			}
 			bIsCommittingTurn = false;
 
 			UE_LOG(LogTemp, Verbose, TEXT("[%s] CommitTurn -- Finished, restored bOrientRotationToMovement"),
