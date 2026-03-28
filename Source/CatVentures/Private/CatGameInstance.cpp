@@ -68,7 +68,8 @@ void UCatGameInstance::HostSession(int32 MaxPlayers, bool bIsLAN)
 	Settings.bShouldAdvertise      = true;
 	Settings.bUseLobbiesIfAvailable = true;  // Steam AppID 480: lobbies, not game servers
 	Settings.bAllowJoinInProgress  = false;
-	Settings.bAllowInvites         = true;
+	Settings.bAllowInvites          = true;
+	Settings.bAllowJoinViaPresence  = true;   // enables overlay "Join Game" button
 
 	CreateSessionCompleteDelegateHandle =
 		SessionInterface->AddOnCreateSessionCompleteDelegate_Handle(CreateSessionCompleteDelegate);
