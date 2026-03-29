@@ -27,6 +27,9 @@ class CATVENTURES_API ASeesawToy : public AActor
 public:
 	ASeesawToy();
 
+protected:
+	virtual void BeginPlay() override;
+
 	// ── Components ──────────────────────────────────────────────────────
 
 	/** Static world anchor. Neither mesh is the root so both can be repositioned freely. */

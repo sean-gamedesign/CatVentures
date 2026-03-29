@@ -25,9 +25,10 @@ ASeesawToy::ASeesawToy()
 	// ── Plank (simulated) ─────────────────────────────────────────────
 	PlankMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("PlankMesh"));
 	PlankMesh->SetupAttachment(RootComponent);
-	PlankMesh->SetSimulatePhysics(true);
+	// SetSimulatePhysics and SetMassOverrideInKg are deferred to BeginPlay —
+	// both access FBodyInstance::GetSimplePhysicalMaterial which requires GEngine,
+	// and GEngine is not available during CDO construction in a Shipping build.
 	PlankMesh->SetIsReplicated(true);
-	PlankMesh->SetMassOverrideInKg(NAME_None, PlankMassKg, /*bOverrideMass=*/true);
 	PlankMesh->SetCollisionProfileName(TEXT("PhysicsActor"));
 
 	// ── Constraint (hinge at fulcrum) ─────────────────────────────────
@@ -52,4 +53,13 @@ ASeesawToy::ASeesawToy()
 	// Component references are stored here; the Chaos constraint body is created
 	// later during OnRegister() when physics bodies are available.
 	PlankConstraint->SetConstrainedComponents(BaseMesh, NAME_None, PlankMesh, NAME_None);
+}
+
+void ASeesawToy::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Deferred from constructor — requires GEngine (unavailable during CDO construction).
+	PlankMesh->SetSimulatePhysics(true);
+	PlankMesh->SetMassOverrideInKg(NAME_None, PlankMassKg, /*bOverrideMass=*/true);
 }
