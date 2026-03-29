@@ -51,7 +51,11 @@ void ACatPlayerController::ToggleMenu()
 			bShowMouseCursor = true;
 			// UIOnly: blocks all pawn input while the menu is up.
 			// Do NOT use SetPause(true) — it halts the server tick and breaks multiplayer.
-			SetInputMode(FInputModeUIOnly());
+			// SetWidgetToFocus ensures PauseMenuWidget receives Slate key events (e.g. Escape).
+			FInputModeUIOnly InputMode;
+			InputMode.SetWidgetToFocus(PauseMenuInstance->TakeWidget());
+			InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+			SetInputMode(InputMode);
 		}
 	}
 }

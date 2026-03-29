@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
+#include "PauseMenuWidget.h"
 #include "CatPlayerController.generated.h"
 
 class UInputAction;
@@ -18,6 +19,9 @@ public:
 	/** Widget class for the pause menu. Assign WBP_PauseMenu in the Blueprint subclass. */
 	UPROPERTY(EditAnywhere, Category = "UI")
 	TSubclassOf<UUserWidget> PauseMenuClass;
+
+	/** Opens or closes the pause menu. Called by IA_ToggleMenu binding and by UPauseMenuWidget on Escape. */
+	void ToggleMenu();
 
 protected:
 	virtual void SetupInputComponent() override;
@@ -37,6 +41,4 @@ private:
 	UPROPERTY(EditAnywhere, Category = "Input")
 	TObjectPtr<UInputAction> ToggleMenuAction;
 
-	/** Opens or closes the pause menu. */
-	void ToggleMenu();
 };
