@@ -22,6 +22,12 @@ public:
 protected:
 	virtual void SetupInputComponent() override;
 
+	/** Server-side: resets input mode when the pawn is possessed (covers listen-server host). */
+	virtual void OnPossess(APawn* InPawn) override;
+
+	/** Client-side: resets input mode once the server confirms possession via ClientRestart. */
+	virtual void AcknowledgePossession(APawn* P) override;
+
 private:
 	/** Instantiated widget — UPROPERTY keeps it GC-safe while off-screen. */
 	UPROPERTY()

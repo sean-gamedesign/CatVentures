@@ -630,6 +630,16 @@ void ACatBase::OnRep_PlayerState()
 {
 	Super::OnRep_PlayerState();
 	ForceWalkingMovementMode();
+
+	// Re-add mapping context — BeginPlay may have run before PlayerState replicated.
+	if (const APlayerController* PC = Cast<APlayerController>(Controller))
+	{
+		if (UEnhancedInputLocalPlayerSubsystem* Subsystem =
+			ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer()))
+		{
+			Subsystem->AddMappingContext(DefaultMappingContext, 0);
+		}
+	}
 }
 
 void ACatBase::ForceWalkingMovementMode()

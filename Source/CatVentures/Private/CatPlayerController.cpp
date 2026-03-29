@@ -14,6 +14,20 @@ void ACatPlayerController::SetupInputComponent()
 	}
 }
 
+void ACatPlayerController::OnPossess(APawn* InPawn)
+{
+	Super::OnPossess(InPawn);
+	bShowMouseCursor = false;
+	SetInputMode(FInputModeGameOnly());
+}
+
+void ACatPlayerController::AcknowledgePossession(APawn* P)
+{
+	Super::AcknowledgePossession(P);
+	bShowMouseCursor = false;
+	SetInputMode(FInputModeGameOnly());
+}
+
 void ACatPlayerController::ToggleMenu()
 {
 	if (PauseMenuInstance && PauseMenuInstance->IsInViewport())
