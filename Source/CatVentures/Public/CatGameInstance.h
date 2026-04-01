@@ -82,9 +82,10 @@ private:
 	// ── Native OSS delegates ──────────────────────────────────────────────
 	// Constructed once in Init(). Registered immediately before each async OSS
 	// call and cleared inside the completion callback to prevent duplicate fires.
-	FOnCreateSessionCompleteDelegate CreateSessionCompleteDelegate;
-	FOnFindSessionsCompleteDelegate  FindSessionsCompleteDelegate;
-	FOnJoinSessionCompleteDelegate   JoinSessionCompleteDelegate;
+	FOnCreateSessionCompleteDelegate      CreateSessionCompleteDelegate;
+	FOnFindSessionsCompleteDelegate       FindSessionsCompleteDelegate;
+	FOnJoinSessionCompleteDelegate        JoinSessionCompleteDelegate;
+	FOnSessionUserInviteAcceptedDelegate  SessionUserInviteAcceptedDelegate;
 
 	FDelegateHandle CreateSessionCompleteDelegateHandle;
 	FDelegateHandle FindSessionsCompleteDelegateHandle;
@@ -94,4 +95,6 @@ private:
 	void HandleCreateSessionComplete(FName SessionName, bool bWasSuccessful);
 	void HandleFindSessionsComplete(bool bWasSuccessful);
 	void HandleJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result);
+	void HandleSessionUserInviteAccepted(const bool bWasSuccessful, const int32 ControllerId,
+		FUniqueNetIdPtr UserId, const FOnlineSessionSearchResult& InviteResult);
 };

@@ -3,6 +3,7 @@
 #include "CatGameInstance.h"
 #include "OnlineSubsystem.h"
 #include "OnlineSessionSettings.h"
+#include "GameFramework/PlayerController.h"
 
 // ── Session name shared across all methods ────────────────────────────────
 static const FName SESSION_NAME = FName("CatVenturesSession");
@@ -38,6 +39,12 @@ void UCatGameInstance::Init()
 	JoinSessionCompleteDelegate = FOnJoinSessionCompleteDelegate::CreateUObject(
 		this, &UCatGameInstance::HandleJoinSessionComplete);
 
+	// Persistent delegate — fired by OSS Steam when the user clicks "Join Game" in the overlay.
+	// Registered once; never removed (matches UE5 convention for this callback).
+	SessionUserInviteAcceptedDelegate = FOnSessionUserInviteAcceptedDelegate::CreateUObject(
+		this, &UCatGameInstance::HandleSessionUserInviteAccepted);
+	SessionInterface->AddOnSessionUserInviteAcceptedDelegate_Handle(SessionUserInviteAcceptedDelegate);
+
 	UE_LOG(LogTemp, Log, TEXT("UCatGameInstance::Init — OSS: %s. SessionInterface ready."),
 		*OSS->GetSubsystemName().ToString());
 }
@@ -67,7 +74,7 @@ void UCatGameInstance::HostSession(int32 MaxPlayers, bool bIsLAN)
 	Settings.bUsesPresence         = true;   // Required for Steam lobby P2P discovery
 	Settings.bShouldAdvertise      = true;
 	Settings.bUseLobbiesIfAvailable = true;  // Steam AppID 480: lobbies, not game servers
-	Settings.bAllowJoinInProgress  = false;
+	Settings.bAllowJoinInProgress  = true;
 	Settings.bAllowInvites          = true;
 	Settings.bAllowJoinViaPresence  = true;   // enables overlay "Join Game" button
 
@@ -109,8 +116,9 @@ void UCatGameInstance::FindSessions(int32 MaxResults, bool bIsLAN)
 	SessionSearch = MakeShared<FOnlineSessionSearch>();
 	SessionSearch->MaxSearchResults = MaxResults;
 	SessionSearch->bIsLanQuery      = bIsLAN;
-	// SEARCH_PRESENCE = true is required for Steam lobby discovery
-	SessionSearch->QuerySettings.Set(FName("PRESENCE"), true, EOnlineComparisonOp::Equals);
+	// SEARCH_PRESENCE is the OSS Steam key that routes to RequestLobbyList (Steam lobby path).
+	// The literal "PRESENCE" does not match and bypasses lobby discovery entirely.
+	SessionSearch->QuerySettings.Set(FName(TEXT("SEARCH_PRESENCE")), true, EOnlineComparisonOp::Equals);
 
 	FindSessionsCompleteDelegateHandle =
 		SessionInterface->AddOnFindSessionsCompleteDelegate_Handle(FindSessionsCompleteDelegate);
@@ -199,5 +207,29 @@ void UCatGameInstance::HandleJoinSessionComplete(FName SessionName, EOnJoinSessi
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("HandleJoinSessionComplete — Success. URL: %s"), *ConnectString);
+
+	if (APlayerController* PC = GetFirstLocalPlayerController())
+	{
+		PC->ClientTravel(ConnectString, ETravelType::TRAVEL_Absolute);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("HandleJoinSessionComplete — No local PlayerController for ClientTravel."));
+	}
+
 	OnJoinSessionResult.Broadcast(true, ConnectString);
+}
+
+void UCatGameInstance::HandleSessionUserInviteAccepted(
+	const bool bWasSuccessful,
+	const int32 ControllerId,
+	FUniqueNetIdPtr UserId,
+	const FOnlineSessionSearchResult& InviteResult)
+{
+	UE_LOG(LogTemp, Log, TEXT("HandleSessionUserInviteAccepted — Success: %d"), bWasSuccessful);
+	if (!bWasSuccessful) return;
+
+	FBlueprintSessionResult BPResult;
+	BPResult.OnlineResult = InviteResult;
+	JoinFoundSession(BPResult);
 }
