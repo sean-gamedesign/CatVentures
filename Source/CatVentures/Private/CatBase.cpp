@@ -13,6 +13,7 @@
 #include "Animation/AnimMontage.h"
 #include "InteractableInterface.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "GeometryCollection/GeometryCollectionComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsHandleComponent.h"
@@ -39,6 +40,7 @@ ACatBase::ACatBase()
 	PhysicsBumper->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 	PhysicsBumper->SetCollisionResponseToAllChannels(ECR_Ignore);
 	PhysicsBumper->SetCollisionResponseToChannel(ECC_PhysicsBody, ECR_Overlap);
+	PhysicsBumper->SetCollisionResponseToChannel(ECC_Destructible, ECR_Overlap);
 	PhysicsBumper->SetGenerateOverlapEvents(true);
 
 	// ── Mouth Grab ────────────────────────────────────────────────
@@ -125,24 +127,78 @@ void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
     UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
     const FHitResult& SweepResult)
 {
-	if (!HasAuthority()) return;
-	if (!OtherComp || !OtherComp->IsSimulatingPhysics()) return;
+	// DEBUG — confirm the overlap delegate is firing at all.
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Yellow,
+		FString::Printf(TEXT("Bumper: overlap fired with %s"),
+			OtherActor ? *OtherActor->GetName() : TEXT("NULL")));
+
+	if (!HasAuthority())
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Red,
+			TEXT("Bumper: skipped — no authority"));
+		return;
+	}
+	if (!OtherActor || !OtherComp) return;
 
 	// Stage 1 — CMC floor check (primary, rotation-agnostic).
-	// If the cat is grounded on this exact component, suppress the impulse.
-	if (GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() == OtherComp) return;
+	if (GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() == OtherComp)
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Orange,
+			TEXT("Bumper: skipped — floor check"));
+		return;
+	}
 
 	// Stage 2 — Z-bounds fallback (airborne case).
-	// When airborne, CurrentFloor is stale. Suppress if the object's AABB top
-	// is at or below the cat's feet — it's directly underneath, not beside.
 	const float FeetZ   = GetActorLocation().Z - GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 	const float ObjTopZ = OtherComp->Bounds.GetBox().Max.Z;
-	if (ObjTopZ <= FeetZ + UnderFootTolerance) return;
+	if (ObjTopZ <= FeetZ + UnderFootTolerance)
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Orange,
+			FString::Printf(TEXT("Bumper: skipped — Z-bounds (ObjTop=%.1f FeetZ=%.1f)"),
+				ObjTopZ, FeetZ));
+		return;
+	}
 
-	FVector Vel = GetVelocity();
-	Vel.Z = 0.0f;
-	const FVector ImpulseDir = Vel.SizeSquared() > 1.0f ? Vel.GetSafeNormal() : GetActorForwardVector();
-	OtherComp->AddImpulse(ImpulseDir * BumperPushForce, NAME_None, /*bVelChange=*/false);
+	// Use the bumper's actual world position as the damage/impulse origin,
+	// not the actor root — the root sits 60 cm behind the bumper face.
+	const FVector BumperOrigin = PhysicsBumper->GetComponentLocation();
+
+	// Path A — rigid body (Static Mesh with physics): apply directional push impulse.
+	if (OtherComp->IsSimulatingPhysics())
+	{
+		FVector Vel = GetVelocity();
+		Vel.Z = 0.0f;
+		const FVector ImpulseDir = Vel.SizeSquared() > 1.0f ? Vel.GetSafeNormal() : GetActorForwardVector();
+		OtherComp->AddImpulse(ImpulseDir * BumperPushForce, NAME_None, /*bVelChange=*/false);
+	}
+
+	// Path B — Geometry Collection fracture via direct component strain API.
+	//
+	// Cast the overlapped component to UGeometryCollectionComponent. If it succeeds
+	// we are touching a GC actor and use the two-step direct fracture path:
+	//   1. ApplyKinematicField — wakes any sleeping solver particles in radius so
+	//      the solver is actively evaluating bonds this frame.
+	//   2. ApplyExternalStrain — injects strain directly into the cluster bond graph
+	//      at ItemIndex 0 (root cluster), propagating through PropagationDepth levels.
+	//      When accumulated strain exceeds the asset's Damage Threshold the bond breaks
+	//      and OnChaosBreakEvent fires. This bypasses the actor TakeDamage pipeline
+	//      entirely and hits the Chaos solver directly.
+	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(OtherComp))
+	{
+		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Green,
+			FString::Printf(TEXT("Bumper: GC strain at %s r=%.0f strain=%.0f"),
+				*BumperOrigin.ToString(), BumperDamageRadius, BumperChaosImpulse));
+
+		GCC->ApplyKinematicField(BumperDamageRadius, BumperOrigin);
+		GCC->ApplyExternalStrain(
+			/*ItemIndex=*/         0,
+			/*Location=*/          BumperOrigin,
+			/*Radius=*/            BumperDamageRadius,
+			/*PropagationDepth=*/  5,
+			/*PropagationFactor=*/ 1.0f,
+			/*Strain=*/            BumperChaosImpulse
+		);
+	}
 }
 
 void ACatBase::Tick(float DeltaTime)

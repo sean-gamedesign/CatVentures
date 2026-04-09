@@ -213,6 +213,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0", ClampMax = "60.0"))
 	float UnderFootTolerance = 12.0f;
 
+	/** Strain injected directly into the Chaos cluster-bond graph via
+	 *  UGeometryCollectionComponent::ApplyExternalStrain. When this value exceeds the GC
+	 *  asset's Damage Threshold (set in Clustering → Damage Threshold) the bond breaks and
+	 *  OnChaosBreakEvent fires. Default 10 000 is 20× a threshold of 500 — tunable per-instance
+	 *  in PrimeCatBase without a rebuild. Has no effect on standard Static Mesh Actors. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0"))
+	float BumperChaosImpulse = 10000.0f;
+
+	/** Radius (cm) of the radial impulse sphere emitted at the bumper contact point. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "1.0"))
+	float BumperDamageRadius = 200.0f;
+
 	// ── Mouth Grab ───────────────────────────────────────────────────────
 
 	/** Physics handle that constrains the grabbed component toward GrabTargetLocation.
