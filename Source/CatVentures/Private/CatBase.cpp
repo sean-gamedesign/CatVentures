@@ -127,37 +127,19 @@ void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
     UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
     const FHitResult& SweepResult)
 {
-	// DEBUG — confirm the overlap delegate is firing at all.
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Yellow,
-		FString::Printf(TEXT("Bumper: overlap fired with %s"),
-			OtherActor ? *OtherActor->GetName() : TEXT("NULL")));
-
-	if (!HasAuthority())
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Red,
-			TEXT("Bumper: skipped — no authority"));
-		return;
-	}
+	if (!HasAuthority()) return;
 	if (!OtherActor || !OtherComp) return;
 
 	// Stage 1 — CMC floor check (primary, rotation-agnostic).
-	if (GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() == OtherComp)
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Orange,
-			TEXT("Bumper: skipped — floor check"));
-		return;
-	}
+	// If the cat is grounded on this exact component, suppress the interaction.
+	if (GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() == OtherComp) return;
 
 	// Stage 2 — Z-bounds fallback (airborne case).
+	// When airborne, CurrentFloor is stale. Suppress if the object's AABB top
+	// is at or below the cat's feet — it's directly underneath, not beside.
 	const float FeetZ   = GetActorLocation().Z - GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 	const float ObjTopZ = OtherComp->Bounds.GetBox().Max.Z;
-	if (ObjTopZ <= FeetZ + UnderFootTolerance)
-	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Orange,
-			FString::Printf(TEXT("Bumper: skipped — Z-bounds (ObjTop=%.1f FeetZ=%.1f)"),
-				ObjTopZ, FeetZ));
-		return;
-	}
+	if (ObjTopZ <= FeetZ + UnderFootTolerance) return;
 
 	// Use the bumper's actual world position as the damage/impulse origin,
 	// not the actor root — the root sits 60 cm behind the bumper face.
@@ -185,10 +167,6 @@ void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
 	//      entirely and hits the Chaos solver directly.
 	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(OtherComp))
 	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Green,
-			FString::Printf(TEXT("Bumper: GC strain at %s r=%.0f strain=%.0f"),
-				*BumperOrigin.ToString(), BumperDamageRadius, BumperChaosImpulse));
-
 		GCC->ApplyKinematicField(BumperDamageRadius, BumperOrigin);
 		GCC->ApplyExternalStrain(
 			/*ItemIndex=*/         0,
