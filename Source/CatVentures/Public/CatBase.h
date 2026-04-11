@@ -14,7 +14,8 @@ class USpringArmComponent;
 class UCameraComponent;
 class UAnimMontage;
 class UBoxComponent;
-class UPhysicsHandleComponent;
+class UPhysicsConstraintComponent;
+class UGeometryCollectionComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
@@ -227,10 +228,10 @@ public:
 
 	// ── Mouth Grab ───────────────────────────────────────────────────────
 
-	/** Physics handle that constrains the grabbed component toward GrabTargetLocation.
-	 *  Operates on authority only; grabbed object replicates via its own SetIsReplicated. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
-	TObjectPtr<UPhysicsHandleComponent> GrabHandle;
+	/** Dynamically created physics constraint linking the mouth socket anchor to the
+	 *  grabbed body. Created on grab, destroyed on release. nullptr when idle. */
+	UPROPERTY()
+	TObjectPtr<UPhysicsConstraintComponent> GrabConstraint;
 
 	/** World-space follow point for the grab handle. Attached to socket_mouth so it
 	 *  tracks the jaw automatically as the skeleton animates. */
@@ -253,6 +254,24 @@ public:
 	/** Walk speed (cm/s) while a mouth grab is active. Simulates the effort of dragging weight. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0", ClampMax = "400.0"))
 	float DragWalkSpeed = 150.0f;
+
+	/** Linear slack (cm) — how far the grabbed object can drift from the mouth anchor
+	 *  before the constraint limits kick in. Lower = tighter tow cable. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "1.0", ClampMax = "200.0"))
+	float GrabLinearLimit = 30.0f;
+
+	/** Drive spring stiffness — how hard the constraint pulls the object toward the anchor.
+	 *  Higher = snappier tracking. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "100.0"))
+	float GrabConstraintStiffness = 5000.0f;
+
+	/** Drive damping — resists oscillation around the target. Higher = less bounce. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "0.0"))
+	float GrabConstraintDamping = 500.0f;
+
+	/** Maximum force (N) the drive can exert. Caps the pull on very heavy objects. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "0.0"))
+	float GrabConstraintMaxForce = 100000.0f;
 
 	/** Broadcast on authority when the swat hits a physics actor. */
 	UPROPERTY(BlueprintAssignable, Category = "Combat")
@@ -389,6 +408,22 @@ protected:
 	/** Client → Server: release the currently grabbed component. */
 	UFUNCTION(Server, Reliable)
 	void Server_ReleaseGrab();
+
+	// ── Networked Physics Bumper (GC Fracture) ────────────────────────────
+
+	/** Locally-controlled client → Server: validate a GC bumper hit and multicast strain. */
+	UFUNCTION(Server, Reliable)
+	void Server_BumperHitGC(AActor* GCActor, FVector Origin);
+
+	/** Server → All: apply Chaos strain on every machine's local physics solver. */
+	UFUNCTION(NetMulticast, Unreliable)
+	void Multicast_BumperHitGC(AActor* GCActor, FVector Origin, float Radius, float Strain);
+
+	/** Deterministic GC fracture — wakes the Chaos solver and injects overwhelming strain
+	 *  to guarantee immediate cluster-bond breakage. Call from Blueprints on high-speed
+	 *  impact events. Hardcoded radius/strain values bypass the asset's Damage Threshold. */
+	UFUNCTION(BlueprintCallable, Category = "Chaos")
+	static void ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation);
 
 	// ── Networked Turn State ───────────────────────────────────────────
 
@@ -649,7 +684,7 @@ private:
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
 
-	/** Updates GrabHandle's target to GrabTargetLocation each tick. Performs auto-release distance check. Authority only. */
+	/** Checks auto-release conditions (destroyed or drifted too far). Authority only. */
 	void UpdateGrab(float DeltaTime);
 
 	/** Sets CMC to drag-movement state: reduced MaxWalkSpeed, bOrientRotationToMovement disabled. */
