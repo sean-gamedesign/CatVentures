@@ -409,6 +409,14 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_ReleaseGrab();
 
+	/** Server → All: create the physics constraint on every machine's local Chaos solver. */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_Grab(UPrimitiveComponent* GrabbedComp, FName BoneName);
+
+	/** Server → All: destroy the constraint and re-enable strain on every machine. */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_ReleaseGrab();
+
 	// ── Networked Physics Bumper (GC Fracture) ────────────────────────────
 
 	/** Locally-controlled client → Server: validate a GC bumper hit and multicast strain. */

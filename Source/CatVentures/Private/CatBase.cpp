@@ -18,6 +18,7 @@
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 #include "DrawDebugHelpers.h"
+#include "Kismet/GameplayStatics.h"
 
 ACatBase::ACatBase()
 {
@@ -445,12 +446,17 @@ void ACatBase::ProcessSwatTraceTick(USkeletalMeshComponent* MeshComp, FName Sock
 	FCollisionQueryParams Params;
 	Params.AddIgnoredActor(this);
 
-	if (GetWorld()->SweepSingleByChannel(
+	FCollisionObjectQueryParams ObjParams;
+	ObjParams.AddObjectTypesToQuery(ECC_Pawn);
+	ObjParams.AddObjectTypesToQuery(ECC_PhysicsBody);
+	ObjParams.AddObjectTypesToQuery(ECC_Destructible);
+
+	if (GetWorld()->SweepSingleByObjectType(
 		HitResult,
 		SwatPreviousPawLocation,
 		CurrentPawLocation,
 		FQuat::Identity,
-		ECC_Pawn,
+		ObjParams,
 		FCollisionShape::MakeSphere(SweepRadius),
 		Params))
 	{
@@ -476,15 +482,36 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 	AActor* HitActor = HitResult.GetActor();
 	if (!HitActor) return;
 
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Cyan,
+		FString::Printf(TEXT("Swat HIT: '%s' comp='%s'"),
+			*HitActor->GetName(), *HitResult.GetComponent()->GetName()));
+
+	const FVector ImpulseDir = (HitActor->GetActorLocation() - GetActorLocation()).GetSafeNormal();
+
 	// Apply impulse to physics objects
 	if (UPrimitiveComponent* HitComp = HitResult.GetComponent())
 	{
 		if (HitComp->IsSimulatingPhysics())
 		{
-			const FVector ImpulseDir = (HitActor->GetActorLocation() - GetActorLocation()).GetSafeNormal();
 			HitComp->AddImpulse(ImpulseDir * SwatImpulseForce, NAME_None, /*bVelChange=*/false);
 		}
 	}
+
+	// Send 1 point of damage with the swat direction. The receiver (e.g. BPC_ChaosItem)
+	// decides how to respond — the Cat has no knowledge of GC or destruction logic.
+	const float DamageDealt = UGameplayStatics::ApplyPointDamage(
+		HitActor,
+		1.0f,
+		ImpulseDir,
+		HitResult,
+		GetController(),
+		this,
+		UDamageType::StaticClass()
+	);
+
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Yellow,
+		FString::Printf(TEXT("Swat DAMAGE sent: %.1f returned, CanBeDamaged=%d"),
+			DamageDealt, HitActor->CanBeDamaged()));
 
 	OnSwatHit.Broadcast(HitActor, HitResult.ImpactPoint);
 }
@@ -579,7 +606,6 @@ void ACatBase::Server_Grab_Implementation()
 	Params.AddIgnoredActor(this);
 
 	// Sweep against physics bodies (SM), destructibles (GC), and world dynamic actors.
-	// ECC_WorldDynamic covers GC actors that may be configured outside the Destructible profile.
 	FCollisionObjectQueryParams ObjParams;
 	ObjParams.AddObjectTypesToQuery(ECC_PhysicsBody);
 	ObjParams.AddObjectTypesToQuery(ECC_Destructible);
@@ -594,8 +620,7 @@ void ACatBase::Server_Grab_Implementation()
 		FCollisionShape::MakeSphere(GrabTraceRadius),
 		Params);
 
-	// Debug: draw the sweep volume regardless of result so we can verify reach in PIE.
-	// Green sphere at hit point on success; red line to TraceEnd on miss.
+	// Debug: draw the sweep volume regardless of result.
 	if (bHit)
 	{
 		DrawDebugSphere(GetWorld(), HitResult.ImpactPoint, GrabTraceRadius, 12, FColor::Green, false, 3.0f);
@@ -615,9 +640,8 @@ void ACatBase::Server_Grab_Implementation()
 		return;
 	}
 
-	// For Geometry Collections: wake the Chaos solver BEFORE the IsSimulatingPhysics()
-	// check. Sleeping GC particles return false until the solver is active — the wake
-	// call transitions them to simulating so the guard passes correctly.
+	// For Geometry Collections: wake the Chaos solver on the SERVER before the
+	// IsSimulatingPhysics() check. The multicast will wake on all other machines.
 	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(HitComp))
 	{
 		GCC->ApplyKinematicField(GrabTraceRadius * 2.0f, HitResult.ImpactPoint);
@@ -630,7 +654,28 @@ void ACatBase::Server_Grab_Implementation()
 		return;
 	}
 
-	// Create the constraint dynamically — only exists during a grab.
+	// Determine the bone to constrain. GC → root cluster (NAME_None) to avoid
+	// crashing on individual cluster particles that lack rigid body handles.
+	FName ConstraintBone = HitResult.BoneName;
+	if (HitComp->IsA<UGeometryCollectionComponent>())
+	{
+		ConstraintBone = NAME_None;
+	}
+
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
+		FString::Printf(TEXT("Grab: OK — multicast constraint on '%s' bone '%s'"),
+			*HitComp->GetOwner()->GetName(), *ConstraintBone.ToString()));
+
+	// Server validated the trace — now multicast so ALL machines create their own
+	// local constraint and modify their own Chaos solver state.
+	Multicast_Grab(HitComp, ConstraintBone);
+}
+
+void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, FName BoneName)
+{
+	if (!GrabbedComp) return;
+
+	// Create the constraint dynamically on this machine's physics solver.
 	GrabConstraint = NewObject<UPhysicsConstraintComponent>(this, TEXT("GrabConstraint"));
 	GrabConstraint->SetupAttachment(GrabTargetLocation);
 	GrabConstraint->RegisterComponent();
@@ -651,59 +696,42 @@ void ACatBase::Server_Grab_Implementation()
 	// Disable collision between constrained bodies to prevent jitter.
 	GrabConstraint->SetDisableCollision(true);
 
-	// Snap the constraint to the grab target offset so the initial rest frame
-	// is calculated from the correct world position (80 cm ahead of socket_mouth).
+	// Snap the constraint to the grab target offset (80 cm ahead of socket_mouth).
 	GrabConstraint->SetWorldLocation(GrabTargetLocation->GetComponentLocation());
 
-	// For Geometry Collections, constrain to the root cluster (NAME_None) instead of
-	// a specific bone. Individual GC particles inside a cluster don't have their own
-	// rigid body handles — constraining to one crashes with "Pair != nullptr" in
-	// Chaos Map.h.inl. NAME_None targets the root body which always exists.
-	FName ConstraintBone = HitResult.BoneName;
-	if (HitComp->IsA<UGeometryCollectionComponent>())
-	{
-		ConstraintBone = NAME_None;
-	}
+	// Wake the target body on THIS machine's solver before binding the constraint.
+	GrabbedComp->WakeRigidBody(BoneName);
 
-	// Wake the target body BEFORE creating the constraint — ensures the Chaos solver
-	// has an active particle handle for SetConstrainedComponents to bind to.
-	HitComp->WakeRigidBody(ConstraintBone);
+	// Anchor to this machine's local capsule physics body → grabbed component.
+	GrabConstraint->SetConstrainedComponents(GetCapsuleComponent(), NAME_None, GrabbedComp, BoneName);
 
-	// Anchor to the capsule's physics body (the only real physics body on the cat).
-	// The constraint component itself stays attached to GrabTargetLocation so its
-	// visual pivot tracks the mouth, while the physics tether runs from the capsule
-	// root to the grabbed body.
-	GrabConstraint->SetConstrainedComponents(GetCapsuleComponent(), NAME_None, HitComp, ConstraintBone);
-
-	// Suppress collision-based strain while dragging. The constraint's drive force
-	// fighting floor friction generates continuous strain spikes that shatter the GC
-	// regardless of damage threshold. ApplyExternalStrain (ForceShatterGC) still works
-	// — it bypasses the collision strain path.
-	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(HitComp))
+	// Suppress collision-based strain on THIS machine's Chaos solver while dragging.
+	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComp))
 	{
 		GCC->SetEnableDamageFromCollision(false);
 	}
 
-	GrabbedComponent = HitComp;
+	GrabbedComponent = GrabbedComp;
 	bIsGrabbing      = true;
 	ApplyDragMovementSettings();
-
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
-		FString::Printf(TEXT("Grab: OK — constraint on '%s' bone '%s'"),
-			*HitComp->GetOwner()->GetName(), *ConstraintBone.ToString()));
 }
 
 void ACatBase::Server_ReleaseGrab_Implementation()
 {
+	Multicast_ReleaseGrab();
+}
+
+void ACatBase::Multicast_ReleaseGrab_Implementation()
+{
+	// Re-enable collision strain on THIS machine's Chaos solver.
+	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()))
+	{
+		GCC->SetEnableDamageFromCollision(true);
+	}
 	if (GrabConstraint)
 	{
 		GrabConstraint->DestroyComponent();
 		GrabConstraint = nullptr;
-	}
-	// Re-enable collision strain so the released object can be broken normally.
-	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()))
-	{
-		GCC->SetEnableDamageFromCollision(true);
 	}
 	GrabbedComponent.Reset();
 	bIsGrabbing = false;
@@ -714,7 +742,9 @@ void ACatBase::UpdateGrab(float DeltaTime)
 {
 	if (!bIsGrabbing) return;
 
-	// Auto-release if the grabbed actor was destroyed mid-grab
+	// Local cleanup: if the grabbed actor was destroyed on this machine, tear down
+	// the local constraint immediately. No multicast needed — each machine detects
+	// destruction independently.
 	if (!GrabbedComponent.IsValid())
 	{
 		if (GrabConstraint)
@@ -727,20 +757,20 @@ void ACatBase::UpdateGrab(float DeltaTime)
 		return;
 	}
 
-	// Auto-release if the object has drifted too far (e.g. cat jumped over a wall)
-	const float Dist = FVector::Dist(
-		GrabTargetLocation->GetComponentLocation(),
-		GrabbedComponent->GetComponentLocation());
-
-	if (Dist > MaxGrabDistance)
+	// Server-authoritative auto-release: if the object drifted too far, the server
+	// multicasts the release to all machines.
+	if (HasAuthority())
 	{
-		Server_ReleaseGrab_Implementation();
-		return;
-	}
+		const float Dist = FVector::Dist(
+			GrabTargetLocation->GetComponentLocation(),
+			GrabbedComponent->GetComponentLocation());
 
-	// No manual target update needed — GrabConstraint is attached to GrabTargetLocation,
-	// so the Chaos solver's constraint anchor follows the mouth socket automatically via
-	// UPhysicsConstraintComponent::OnUpdateTransform.
+		if (Dist > MaxGrabDistance)
+		{
+			Multicast_ReleaseGrab();
+			return;
+		}
+	}
 }
 
 void ACatBase::ApplyDragMovementSettings()
