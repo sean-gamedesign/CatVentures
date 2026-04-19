@@ -330,9 +330,10 @@ protected:
 	void UpdateCosmeticInterpolation(float DeltaTime);
 
 	// ── Enhanced Input Assets ────────────────────────────────────────────
-
+public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputMappingContext> DefaultMappingContext;
+protected:
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> MoveAction;

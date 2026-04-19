@@ -10,7 +10,7 @@ public class CatVentures : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "OnlineSubsystem", "OnlineSubsystemUtils", "UMG", "Slate", "SlateCore", "GeometryCollectionEngine" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] {  });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos" });
 
 		DynamicallyLoadedModuleNames.Add("OnlineSubsystemSteam");
 
