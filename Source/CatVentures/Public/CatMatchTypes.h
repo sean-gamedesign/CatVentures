@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/DataTable.h"
 #include "CatMatchTypes.generated.h"
 
 /** Phases of the match-end sequence. Replicated via ACatGameState. */
@@ -46,4 +47,34 @@ struct FCatPlayerScore
 
 	UPROPERTY(BlueprintReadOnly)
 	int32 ItemsDestroyed = 0;
+};
+
+/** DataTable row describing what happens when a given prop type is destroyed.
+ *  The table asset is assigned on ACatGameMode; each BPC_ChaosItem references
+ *  a row by FName key. */
+USTRUCT(BlueprintType)
+struct FChaosRewardData : public FTableRowBase
+{
+	GENERATED_BODY()
+
+	/** Score added to the Chaos Meter when a prop with this row key is destroyed. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, meta = (ClampMin = "0.0"))
+	float ChaosValue = 10.0f;
+
+	/** UI-facing name (e.g., "Porcelain Vase") shown in destruction toasts + scoreboard. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly)
+	FText DisplayName;
+
+	/** Optional audio stinger override. If unset, the default break sound plays.
+	 *  Soft pointer so unreferenced sounds aren't loaded with the table. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly)
+	TSoftObjectPtr<class USoundBase> MeowStinger;
+
+	/** Optional "Meow Time" reward window in seconds. 0 = no stinger window. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, meta = (ClampMin = "0.0"))
+	float MeowTimeDuration = 0.0f;
+
+	/** Optional scoreboard icon. Soft pointer for the same reason as MeowStinger. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly)
+	TSoftObjectPtr<class UTexture2D> Icon;
 };

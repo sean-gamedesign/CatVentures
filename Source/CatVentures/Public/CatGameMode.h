@@ -7,6 +7,8 @@
 #include "CatMatchTypes.h"
 #include "CatGameMode.generated.h"
 
+class UDataTable;
+
 UCLASS()
 class CATVENTURES_API ACatGameMode : public AGameModeBase
 {
@@ -16,11 +18,22 @@ public:
 	// ── Score Reporting ─────────────────────────────────────────────
 
 	/** Called by BPC_ChaosItem (Blueprint) when a GC actor is destroyed.
-	 *  Accumulates score, records the item, and triggers match-end if threshold is reached. */
+	 *  ChaosRewardKey names a row in ChaosRewardTable; the GameMode resolves the score,
+	 *  display name, and stinger authoritatively. Triggers match-end if threshold is reached. */
 	UFUNCTION(BlueprintCallable, Category = "Match")
-	void ReportItemDestroyed(AActor* Item, FVector Location, float Value, const FString& ItemName);
+	void ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey);
 
 	// ── Tuning ──────────────────────────────────────────────────────
+
+	/** DataTable of FChaosRewardData rows — one per breakable prop type.
+	 *  Assign DT_ChaosRewards on BP_CatGameMode. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Match|Tuning",
+	          meta = (RequiredAssetDataTags = "RowStructure=/Script/CatVentures.ChaosRewardData"))
+	TObjectPtr<UDataTable> ChaosRewardTable;
+
+	/** Fallback score applied when a prop's key is None or missing from the table. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
+	float DefaultChaosValue = 5.0f;
 
 	/** Total chaos score required to end the match. Pushed to GameState for HUD display. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "1.0"))

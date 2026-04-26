@@ -3,6 +3,7 @@
 #include "CatGameMode.h"
 #include "CatGameState.h"
 #include "CatPlayerController.h"
+#include "Engine/DataTable.h"
 #include "Kismet/GameplayStatics.h"
 
 void ACatGameMode::BeginPlay()
@@ -18,9 +19,23 @@ void ACatGameMode::BeginPlay()
 
 // ── Score Reporting ─────────────────────────────────────────────────
 
-void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, float Value, const FString& ItemName)
+void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey)
 {
 	if (CurrentPhase != ECatMatchPhase::Playing) return;
+
+	// Resolve the reward row — missing row falls back to DefaultChaosValue.
+	float Value = DefaultChaosValue;
+	FString ItemName = ChaosRewardKey.ToString();
+
+	if (ChaosRewardTable && !ChaosRewardKey.IsNone())
+	{
+		if (const FChaosRewardData* Row = ChaosRewardTable->FindRow<FChaosRewardData>(
+				ChaosRewardKey, TEXT("ReportItemDestroyed")))
+		{
+			Value = Row->ChaosValue;
+			if (!Row->DisplayName.IsEmpty()) ItemName = Row->DisplayName.ToString();
+		}
+	}
 
 	// Record the destruction.
 	FDestroyedItemRecord Record;
