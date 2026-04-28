@@ -30,3 +30,8 @@ void ACatGameState::OnRep_TopDestroyedLocations()
 {
 	// Phase 3 camera setup can bind to OnMatchPhaseChanged or poll this directly.
 }
+
+void ACatGameState::Multicast_TriggerMeowTimeSpectacle_Implementation()
+{
+	ReceiveMeowTimeTriggered();
+}

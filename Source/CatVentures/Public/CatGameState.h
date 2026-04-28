@@ -49,6 +49,21 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Match")
 	FOnMatchPhaseChanged OnMatchPhaseChanged;
 
+	// ── Meow Time RPC ───────────────────────────────────────────────
+
+	/** Server-fired multicast. Reaches every client (including the listen-server host) and forwards
+	 *  to the ReceiveMeowTimeTriggered Blueprint event so BP can spawn the UMG + play the stinger.
+	 *  Called from ACatGameMode::BeginMatchEnd at the moment match-end slow-mo kicks in. */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_TriggerMeowTimeSpectacle();
+
+	/** Implement on BP_CatGameState. Spawn the Meow Time UMG widget and play the audio stinger here.
+	 *  Fires on every machine simultaneously via the multicast above.
+	 *  Note: kept as a SEPARATE UFUNCTION from the multicast — stacking NetMulticast and
+	 *  BlueprintImplementableEvent on one macro produces broken UHT reflection. */
+	UFUNCTION(BlueprintImplementableEvent, Category = "Match")
+	void ReceiveMeowTimeTriggered();
+
 	// ── Helpers ─────────────────────────────────────────────────────
 
 	/** Returns ChaosScore / ChaosThreshold, clamped [0, 1]. */

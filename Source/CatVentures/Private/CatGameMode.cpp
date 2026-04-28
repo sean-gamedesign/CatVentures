@@ -81,6 +81,7 @@ void ACatGameMode::BeginMatchEnd()
 	{
 		GS->FinalBreakLocation = FinalBreakLocation;
 		GS->MatchPhase = ECatMatchPhase::Warning;
+		GS->Multicast_TriggerMeowTimeSpectacle();
 	}
 
 	// Notify every PlayerController via Client RPC.

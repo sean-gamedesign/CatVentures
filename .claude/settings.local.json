@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls \"C:\\\\Users\\\\funke\\\\.claude\\\\projects\\\\c--Projects-CatVentures\\\\memory\"\" 2>/dev/null || echo \"Directory not found or empty \")"
+      "Bash(ls \"C:\\\\Users\\\\funke\\\\.claude\\\\projects\\\\c--Projects-CatVentures\\\\memory\"\" 2>/dev/null || echo \"Directory not found or empty \")",
+      "Bash(git stash *)"
     ]
   }
 }
