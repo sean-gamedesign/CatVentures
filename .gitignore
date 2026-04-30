@@ -15,6 +15,12 @@ Saved/
 Build/
 Script/
 
+# Vibe Coding 2.0 sandbox — third-party plugin source not tracked on this branch
+Plugins/VibeUE/
+
+# MCP server config — contains the local VibeUE API key, never commit
+.mcp.json
+
 # OS Files
 .DS_Store
 Thumbs.db

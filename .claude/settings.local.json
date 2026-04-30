@@ -1,7 +1,31 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls \"C:\\\\Users\\\\funke\\\\.claude\\\\projects\\\\c--Projects-CatVentures\\\\memory\"\" 2>/dev/null || echo \"Directory not found or empty \")"
+      "Bash(ls \"C:\\\\Users\\\\funke\\\\.claude\\\\projects\\\\c--Projects-CatVentures\\\\memory\"\" 2>/dev/null || echo \"Directory not found or empty \")",
+      "Bash(git stash *)",
+      "Bash(git checkout *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.vibeue.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(git clone *)",
+      "Bash(./BuildPlugin.bat)",
+      "Read(//c/Users/funke/.claude/projects//**)",
+      "Read(//c/Users/funke/.claude//**)",
+      "Bash(claude mcp *)",
+      "Bash(curl -s -i -m 5 http://127.0.0.1:8088/mcp)",
+      "Bash(echo \"---EXIT---$?\")",
+      "PowerShell(Get-Process *)",
+      "Bash(curl -s -i -m 5 -X POST http://127.0.0.1:8088/mcp -H \"Content-Type: application/json\" -H \"Accept: application/json, text/event-stream\" -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"phase1-probe\",\"version\":\"0.1\"}}}')",
+      "Bash(sed 's/^data: //')",
+      "Read(//tmp/**)",
+      "mcp__VibeUE__manage_asset",
+      "mcp__VibeUE__execute_python_code",
+      "Bash(git add *)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "VibeUE"
+  ]
 }
