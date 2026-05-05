@@ -43,6 +43,13 @@ public:
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match")
 	TArray<FCatPlayerScore> PlayerScores;
 
+	/** Weighted-centroid of the densest cluster of destroyed props.
+	 *  Computed by GameMode at Phase 3 entry; clients use it as the orbit pivot
+	 *  for the Aftermath panning camera. Also passed via the phase RPC for
+	 *  immediate read-availability — this field is the durable copy. */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match")
+	FVector AftermathHotspot = FVector::ZeroVector;
+
 	// ── Delegates ───────────────────────────────────────────────────
 
 	/** Broadcast locally when MatchPhase replicates — UI widgets bind to this. */
@@ -54,6 +61,12 @@ public:
 	/** Returns ChaosScore / ChaosThreshold, clamped [0, 1]. */
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	float GetChaosPercent() const;
+
+	/** True iff at least one player exists and every ACatPlayerState in PlayerArray
+	 *  has bWantsRematch == true. Host's "Play Again" button polls or binds this
+	 *  to gate ServerTravel — prevents the host accidentally yanking unready players. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Match")
+	bool AllPlayersReadyForRematch() const;
 
 protected:
 	UFUNCTION()

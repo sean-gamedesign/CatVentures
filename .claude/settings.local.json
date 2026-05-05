@@ -21,7 +21,14 @@
       "Read(//tmp/**)",
       "mcp__VibeUE__manage_asset",
       "mcp__VibeUE__execute_python_code",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "mcp__VibeUE__manage_skills",
+      "PowerShell(Get-Content *)",
+      "mcp__VibeUE__discover_python_class",
+      "Bash(\"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CatVenturesEditor Win64 Development \"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\" -WaitMutex -FromMsBuild)",
+      "mcp__VibeUE__read_logs",
+      "Bash(powershell -Command \"Start-Sleep -Seconds 20\")",
+      "Bash(powershell *)"
     ]
   },
   "enableAllProjectMcpServers": true,

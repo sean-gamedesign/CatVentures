@@ -15,6 +15,8 @@ class CATVENTURES_API ACatGameMode : public AGameModeBase
 	GENERATED_BODY()
 
 public:
+	ACatGameMode();
+
 	// ── Score Reporting ─────────────────────────────────────────────
 
 	/** Called by BPC_ChaosItem (Blueprint) when a GC actor is destroyed.
@@ -51,9 +53,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.1"))
 	float FadeDuration = 2.0f;
 
+	/** Real-time hold (wall-clock seconds) AFTER slow-mo ends but BEFORE the fade RPC fires.
+	 *  Lets the destruction physics settle at full speed so players actually see the aftermath
+	 *  before the screen darkens. Tuned per-feel; designers usually want 1.5–3.0s. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
+	float PostCinematicHoldDuration = 2.0f;
+
 	/** Time dilation applied during Phases 1, 2, and Fade. 0.2 = 5× slow-mo. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.01", ClampMax = "1.0"))
 	float SlowMoDilation = 0.2f;
+
+	/** Spatial-bucket size (unreal units) for the chaos hotspot density calc.
+	 *  All destroyed-prop locations are bucketed into cells of this size; the cell
+	 *  with the highest summed Value wins, and its weighted centroid becomes the
+	 *  Aftermath orbit pivot. Larger = looser clustering, smaller = tighter. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "100.0"))
+	float AftermathCellSize = 800.0f;
 
 protected:
 	virtual void BeginPlay() override;
@@ -64,10 +79,23 @@ private:
 	void BeginMatchEnd();
 	void TransitionToFinalCut();
 	void TransitionToFade();
+	/** Fired after PostCinematicHoldDuration elapses inside the Fade phase.
+	 *  Sends the Fade RPC (which triggers PCM StartCameraFade on each client) and
+	 *  schedules TransitionToAftermath. Splitting this from TransitionToFade is what
+	 *  gives players the "real-time settle" window the designer asked for. */
+	void BeginActualFade();
 	void TransitionToAftermath();
 
-	/** Sends Client_OnMatchPhaseChanged to every connected PlayerController. */
-	void NotifyAllControllersPhaseChanged(ECatMatchPhase NewPhase, AActor* TargetActor);
+	/** Sends Client_OnMatchPhaseChanged to every connected PlayerController.
+	 *  PhaseLocation is repurposed per phase: FinalBreakLocation for Warning/FinalCut/Fade,
+	 *  AftermathHotspot for Aftermath. The RPC carries the value alongside the GameState
+	 *  field, eliminating the property-replication-vs-RPC race on phase entry. */
+	void NotifyAllControllersPhaseChanged(ECatMatchPhase NewPhase, FVector PhaseLocation, AActor* TargetActor);
+
+	/** Bucket-histograms DestroyedItems and returns the weighted centroid of the
+	 *  highest-value cluster. Called once per match at Aftermath entry.
+	 *  Returns FinalBreakLocation as a sane fallback if the destruction list is empty. */
+	FVector ComputeChaosHotspot() const;
 
 	// ── State ───────────────────────────────────────────────────────
 

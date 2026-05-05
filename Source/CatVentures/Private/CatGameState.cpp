@@ -1,6 +1,7 @@
 // CatGameState.cpp
 
 #include "CatGameState.h"
+#include "CatPlayerState.h"
 #include "Net/UnrealNetwork.h"
 
 void ACatGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -13,6 +14,19 @@ void ACatGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLif
 	DOREPLIFETIME(ACatGameState, FinalBreakLocation);
 	DOREPLIFETIME(ACatGameState, TopDestroyedLocations);
 	DOREPLIFETIME(ACatGameState, PlayerScores);
+	DOREPLIFETIME(ACatGameState, AftermathHotspot);
+}
+
+bool ACatGameState::AllPlayersReadyForRematch() const
+{
+	if (PlayerArray.Num() == 0) return false;
+
+	for (const TObjectPtr<APlayerState>& PS : PlayerArray)
+	{
+		const ACatPlayerState* CatPS = Cast<ACatPlayerState>(PS);
+		if (!CatPS || !CatPS->bWantsRematch) return false;
+	}
+	return true;
 }
 
 float ACatGameState::GetChaosPercent() const
