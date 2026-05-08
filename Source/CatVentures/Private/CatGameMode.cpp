@@ -28,6 +28,36 @@ void ACatGameMode::BeginPlay()
 	}
 }
 
+// ── Pawn Spawn ──────────────────────────────────────────────────────
+//
+// AGameModeBase::SpawnDefaultPawnAtTransform_Implementation leaves
+// SpawnCollisionHandlingOverride at Undefined, which falls back to the pawn CDO's
+// setting. With a single PlayerStart and two joining players, that path can produce
+// a pawn that spawns encroached on the existing host's pawn, leaving the joiner
+// without a usable view target — the "JOIN TRUE → black screen" symptom. Forcing
+// AdjustIfPossibleButAlwaysSpawn lets the engine nudge the pawn out of overlap when
+// possible, while still guaranteeing a pawn comes back from the spawn call.
+
+APawn* ACatGameMode::SpawnDefaultPawnAtTransform_Implementation(AController* NewPlayer, const FTransform& SpawnTransform)
+{
+	FActorSpawnParameters SpawnInfo;
+	SpawnInfo.Instigator = GetInstigator();
+	SpawnInfo.ObjectFlags |= RF_Transient;
+	SpawnInfo.bDeferConstruction = false;
+	SpawnInfo.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+	UClass* PawnClass = GetDefaultPawnClassForController(NewPlayer);
+	APawn* ResultPawn = GetWorld()->SpawnActor<APawn>(PawnClass, SpawnTransform, SpawnInfo);
+
+	if (!ResultPawn)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("ACatGameMode::SpawnDefaultPawnAtTransform — SpawnActor returned null. PawnClass=%s"),
+			PawnClass ? *PawnClass->GetName() : TEXT("<null>"));
+	}
+	return ResultPawn;
+}
+
 // ── Score Reporting ─────────────────────────────────────────────────
 
 void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey)

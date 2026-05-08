@@ -21,6 +21,11 @@ Plugins/VibeUE/
 # MCP server config — contains the local VibeUE API key, never commit
 .mcp.json
 
+# SteamPipe build artifacts (BuildCookRun + steamcmd scratch dirs)
+ArchivedBuilds/
+BuildOutput/
+Saved/StagedBuilds/
+
 # OS Files
 .DS_Store
 Thumbs.db

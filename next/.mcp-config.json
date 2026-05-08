@@ -1,0 +1,16 @@
+{
+	"unreal_inspector":
+	{
+		"command": "C:/Program Files/Epic Games/UE_5.7/Engine/Plugins/Marketplace/Aura/PortablePython/Windows/python.exe",
+		"args": [
+			"C:/Program Files/Epic Games/UE_5.7/Engine/Plugins/Marketplace/Aura/MCP/unreal_inspector.py"
+		]
+	},
+	"unreal_editor":
+	{
+		"command": "C:/Program Files/Epic Games/UE_5.7/Engine/Plugins/Marketplace/Aura/PortablePython/Windows/python.exe",
+		"args": [
+			"C:/Program Files/Epic Games/UE_5.7/Engine/Plugins/Marketplace/Aura/MCP/unreal_editor.py"
+		]
+	}
+}

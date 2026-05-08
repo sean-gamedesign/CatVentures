@@ -73,6 +73,10 @@ public:
 protected:
 	virtual void BeginPlay() override;
 
+	/** Override AGameModeBase to force AdjustIfPossibleButAlwaysSpawn on the pawn spawn.
+	 *  Prevents the "black screen on join" failure when multiple players share a PlayerStart. */
+	virtual APawn* SpawnDefaultPawnAtTransform_Implementation(AController* NewPlayer, const FTransform& SpawnTransform) override;
+
 private:
 	// ── Phase Transitions ───────────────────────────────────────────
 

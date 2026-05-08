@@ -1,0 +1,15 @@
+"appbuild"
+{
+	"appid"        "4567540"
+	"desc"         "CatVentures Development Build"
+	"buildoutput"  "..\BuildOutput\"
+	"contentroot"  "..\ArchivedBuilds\Windows\"
+	"setlive"      ""
+	"preview"      "0"
+	"local"        ""
+
+	"depots"
+	{
+		"4567541" "depot_build_4567541.vdf"
+	}
+}

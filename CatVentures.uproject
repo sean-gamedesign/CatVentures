@@ -20,7 +20,7 @@
 		},
 		{
 			"Name": "Aura",
-			"Enabled": true
+			"Enabled": false
 		},
 		{
 			"Name": "OnlineSubsystemSteam",

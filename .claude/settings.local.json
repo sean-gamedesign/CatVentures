@@ -28,7 +28,12 @@
       "Bash(\"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CatVenturesEditor Win64 Development \"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\" -WaitMutex -FromMsBuild)",
       "mcp__VibeUE__read_logs",
       "Bash(powershell -Command \"Start-Sleep -Seconds 20\")",
-      "Bash(powershell *)"
+      "Bash(powershell *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell($content = [System.IO.File]::ReadAllBytes\\(\"C:\\\\Projects\\\\CatVentures\\\\Content\\\\Blueprints\\\\WBP\\\\WBP_MainMenu.uasset\"\\); $text = [System.Text.Encoding]::Unicode.GetString\\($content\\) + [System.Text.Encoding]::ASCII.GetString\\($content\\); $patterns = \"JOIN|listen|TestMap|Map_|HostSession|JoinSession|FindSession|OpenLevel|ServerTravel|ClientTravel|HOST|JoinFound|TRUE\"; [regex]::Matches\\($text, \"[\\\\x20-\\\\x7E]{6,200}\"\\) | Where-Object { $_.Value -match $patterns } | Select-Object -ExpandProperty Value | Sort-Object -Unique)",
+      "PowerShell($content = [System.IO.File]::ReadAllBytes\\(\"C:\\\\Projects\\\\CatVentures\\\\Content\\\\Blueprints\\\\WBP\\\\WBP_ServerRow.uasset\"\\); $text = [System.Text.Encoding]::Unicode.GetString\\($content\\) + [System.Text.Encoding]::ASCII.GetString\\($content\\); $patterns = \"JOIN|listen|TestMap|Map_|HostSession|JoinSession|FindSession|OpenLevel|ServerTravel|ClientTravel|HOST|JoinFound|TRUE\"; [regex]::Matches\\($text, \"[\\\\x20-\\\\x7E]{6,200}\"\\) | Where-Object { $_.Value -match $patterns } | Select-Object -ExpandProperty Value | Sort-Object -Unique)",
+      "PowerShell($content = [System.IO.File]::ReadAllBytes\\(\"C:\\\\Projects\\\\CatVentures\\\\Content\\\\Blueprints\\\\WBP\\\\WBP_MainMenu.uasset\"\\); $text = [System.Text.Encoding]::Unicode.GetString\\($content\\) + \" ::: \" + [System.Text.Encoding]::ASCII.GetString\\($content\\); [regex]::Matches\\($text, \"[\\\\x20-\\\\x7E]{4,300}\"\\) | Where-Object { $_.Value -match \"OpenLevel|Browse|ServerTravel|TestMap|listen|HostSession|FindSession|JoinFound|GetResolvedConnect|ClientTravel|MaxPlayers|JoinFoundSession|HandleHost|HandleJoin|Host Toybox|REJECTED|JOIN\" } | Select-Object -ExpandProperty Value | Sort-Object -Unique | ForEach-Object { Write-Output \"  >> $_\" })",
+      "Bash(\"C:/Program Files/Epic Games/UE_5.7/Engine/Build/BatchFiles/Build.bat\" CatVenturesEditor Win64 Development \"C:/Projects/CatVentures/CatVentures.uproject\" -WaitMutex)"
     ]
   },
   "enableAllProjectMcpServers": true,
