@@ -11,7 +11,7 @@ CatVentures is an Unreal Engine 5.7 multiplayer third-person cat game. There is 
 The current movement/camera feel is designer-approved and locked:
 
 - **Camera-relative movement**: `Move()` projects input onto the camera's yaw plane; the character orients toward movement via `bOrientRotationToMovement`. (Tank controls existed in an earlier iteration and were deliberately replaced — do not reintroduce them.)
-- **Walk speed 600 cm/s** (`MovementMaxWalkSpeed` on PrimeCatBase), with the current acceleration/friction/braking/turn-in-place/lean tuning.
+- **Walk speed 400 cm/s** (`MovementMaxWalkSpeed` override on PrimeCatBase; the C++ default is 600 but the approved feel is 400 — the constructor-baking bug meant playtesting always happened at 400, so 400 was locked in deliberately on 2026-06-09). It is the only tuning value PrimeCatBase overrides; acceleration/friction/braking/turn-in-place/lean all ship at C++ defaults.
 - **Do not change** movement, camera, or input behavior — including "fixes" that alter feel — without explicit designer sign-off.
 
 All movement tuning UPROPERTYs are re-applied to the CMC in `ACatBase::BeginPlay` (the constructor bakes C++ defaults into the CMC *before* Blueprint serialization, so BeginPlay re-application is what makes PrimeCatBase overrides work — keep new tuning knobs on that list).
@@ -176,7 +176,7 @@ The Blueprint and asset layer is edited live through the **VibeUE MCP server**, 
 
 ## Key Blueprint Assets (Content/)
 
-- **`PrimeCatBase`** (`/Game/PrimeCatBase`) — Blueprint child of `ACatBase`. Assigns all input assets (IMC_Cat, IA_*), SwatMontage (AM_Cat_Swat), and tuning defaults. `MovementMaxWalkSpeed = 600` here is the locked feel.
+- **`PrimeCatBase`** (`/Game/PrimeCatBase`) — Blueprint child of `ACatBase`. Assigns all input assets (IMC_Cat, IA_*), SwatMontage (AM_Cat_Swat), and tuning defaults. `MovementMaxWalkSpeed = 400` here is the locked feel (overrides the 600 C++ default).
 - **`GM_CatVentures`** (`/Game/Core`) — the single GameMode BP (see *Match Flow*).
 - **`ABP_Cat_V2`** — Animation Blueprint. Polls the 12-variable ABP consumption surface from the owning `ACatBase` (see *Networking Model*) and binds `OnMeow`.
 - **`BPC_ChaosItem`** — ActorComponent on breakable props (`BP_Destructible_Base`). Carries `ChaosRewardKey`, owns the swat-count/impact shatter logic, reports destruction (see *Destruction*).

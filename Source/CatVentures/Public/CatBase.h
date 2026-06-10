@@ -101,7 +101,7 @@ public:
 	// Blueprint overrides take effect. These values define the LOCKED control
 	// feel — do not retune without designer sign-off.
 
-	/** Max ground speed (cm/s). 600 is the shipped feel (PrimeCatBase). */
+	/** Max ground speed (cm/s). PrimeCatBase overrides this to 400 — the locked, designer-approved feel. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "100.0", ClampMax = "2000.0"))
 	float MovementMaxWalkSpeed = 600.0f;
 
