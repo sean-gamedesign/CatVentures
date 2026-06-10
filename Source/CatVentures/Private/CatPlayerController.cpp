@@ -1,6 +1,7 @@
 // CatPlayerController.cpp
 
 #include "CatPlayerController.h"
+#include "CatVenturesLog.h"
 #include "CatBase.h"
 #include "CatGameState.h"
 #include "CatPlayerState.h"
@@ -136,12 +137,6 @@ void ACatPlayerController::HandlePhase_Warning()
 		}
 	}
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow,
-			TEXT("Phase 1: THE WARNING — slow-mo active, movement stripped"));
-	}
-
 	// Hand off to Blueprint — spawn the Meow Time UMG and play the audio stinger.
 	OnMeowTimeTriggered();
 }
@@ -150,12 +145,6 @@ void ACatPlayerController::HandlePhase_FinalCut(FVector BreakLocation, AActor* T
 {
 	// Hand off to Blueprint — it spawns the camera and calls SetViewTargetWithBlend.
 	OnCinematicTakeover(BreakLocation, TargetActor);
-
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Cyan,
-			FString::Printf(TEXT("Phase 2: THE FINAL CUT — camera target: %s"), *BreakLocation.ToString()));
-	}
 }
 
 void ACatPlayerController::HandlePhase_Fade()
@@ -174,11 +163,6 @@ void ACatPlayerController::HandlePhase_Fade()
 			/*bHoldWhenFinished*/ true);
 	}
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Magenta,
-			TEXT("Phase 2b: FADE — fading to black via PlayerCameraManager"));
-	}
 }
 
 void ACatPlayerController::HandlePhase_Aftermath(FVector Hotspot)
@@ -193,6 +177,8 @@ void ACatPlayerController::HandlePhase_Aftermath(FVector Hotspot)
 	// from the world origin.
 	AftermathOrbitPivot   = Hotspot;
 	AftermathOrbitElapsed = 0.0f;
+	LastOrbitTickTime     = -1.0;
+	OrbitLogTickCounter   = 0;
 
 	// Director state: we're entering shot 0 of a fresh sequence. bIsCutting=true gates
 	// ShotTimer until the entry fade-in completes, so the first prop gets a full
@@ -208,7 +194,7 @@ void ACatPlayerController::HandlePhase_Aftermath(FVector Hotspot)
 	// no state-change can re-snap the view target back to the controlled pawn.
 	bAutoManageActiveCameraTarget = false;
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] CLIENT HandlePhase_Aftermath  RPC.Hotspot=(%.1f, %.1f, %.1f)  Cached=(%.1f, %.1f, %.1f)  ActiveDebris=%d  LeadIndex=%d"),
 		Hotspot.X, Hotspot.Y, Hotspot.Z,
 		CachedAftermathHotspot.X, CachedAftermathHotspot.Y, CachedAftermathHotspot.Z,
@@ -245,12 +231,6 @@ void ACatPlayerController::HandlePhase_Aftermath(FVector Hotspot)
 	GetWorldTimerManager().SetTimer(ScoreboardRevealTimerHandle, this,
 		&ACatPlayerController::ShowScoreboardDeferred,
 		TotalEntryTransition + AftermathHoldDuration, false);
-
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green,
-			FString::Printf(TEXT("Phase 3: AFTERMATH — entry fade, lead idx=%d"), CurrentTargetIndex));
-	}
 }
 
 void ACatPlayerController::ShowScoreboardDeferred()
@@ -264,78 +244,19 @@ void ACatPlayerController::ShowScoreboardDeferred()
 	OnShowScoreboard();
 }
 
-ACameraActor* ACatPlayerController::SpawnAftermathCamera(FVector Hotspot)
-{
-	UWorld* World = GetWorld();
-	if (!World) return nullptr;
-
-	// Initial pose — angle 0 of the orbit. TickAftermathOrbit will drive it from here.
-	const FVector InitialOffset(AftermathOrbitRadius, 0.f, AftermathOrbitHeight);
-	const FVector CamLocation = Hotspot + InitialOffset;
-	const FRotator CamRotation = UKismetMathLibrary::FindLookAtRotation(CamLocation, Hotspot);
-
-	FActorSpawnParameters Params;
-	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	Params.Owner = this;
-
-	AftermathCameraActor = World->SpawnActor<ACameraActor>(
-		ACameraActor::StaticClass(), CamLocation, CamRotation, Params);
-
-	if (AftermathCameraActor)
-	{
-		// Belt-and-braces: guarantee the camera lives in world space.
-		AftermathCameraActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-
-		// CRITICAL: force the lens off pawn-control-rotation. If this flag is true, the
-		// CameraComponent overrides whatever we Set on the actor with the controller's
-		// control rotation every frame — making the orbit math invisible from the player's POV.
-		if (UCameraComponent* Lens = AftermathCameraActor->GetCameraComponent())
-		{
-			Lens->bUsePawnControlRotation = false;
-			Lens->SetRelativeRotation(FRotator::ZeroRotator);
-		}
-
-		// Force-teleport to the intended pose in case SpawnActor's initial transform was clobbered.
-		AftermathCameraActor->SetActorLocationAndRotation(
-			CamLocation, CamRotation, /*bSweep*/ false, /*OutSweepHitResult*/ nullptr,
-			ETeleportType::TeleportPhysics);
-
-		const FVector  ActualLoc = AftermathCameraActor->GetActorLocation();
-		const FRotator ActualRot = AftermathCameraActor->GetActorRotation();
-		UE_LOG(LogTemp, Warning,
-			TEXT("[CatMatch] SpawnAftermathCamera  Hotspot=(%.1f, %.1f, %.1f)  Intended Loc=(%.1f, %.1f, %.1f) Rot=(P=%.1f, Y=%.1f, R=%.1f)  Actual Loc=(%.1f, %.1f, %.1f) Rot=(P=%.1f, Y=%.1f, R=%.1f)  Attached=%s"),
-			Hotspot.X, Hotspot.Y, Hotspot.Z,
-			CamLocation.X, CamLocation.Y, CamLocation.Z,
-			CamRotation.Pitch, CamRotation.Yaw, CamRotation.Roll,
-			ActualLoc.X, ActualLoc.Y, ActualLoc.Z,
-			ActualRot.Pitch, ActualRot.Yaw, ActualRot.Roll,
-			AftermathCameraActor->GetAttachParentActor() ? *AftermathCameraActor->GetAttachParentActor()->GetName() : TEXT("<none>"));
-
-		// Layer 2: stop the PC from auto-snapping the view target back to the controlled pawn
-		// during state changes (end-of-match in particular). Without this, our view target set
-		// can be silently reverted before the next frame.
-		bAutoManageActiveCameraTarget = false;
-
-		// Instant cut — screen is black, no need to blend.
-		SetViewTargetWithBlend(AftermathCameraActor, 0.f);
-
-		// Layer 1: prove whether PCM accepted the view target right after we set it.
-		const AActor* VT = PlayerCameraManager ? PlayerCameraManager->GetViewTarget() : nullptr;
-		UE_LOG(LogTemp, Warning,
-			TEXT("[CatMatch] PostSetView  VT=%s  Pawn=%s  Camera=%s"),
-			VT       ? *VT->GetName()                          : TEXT("<null>"),
-			GetPawn()? *GetPawn()->GetName()                   : TEXT("<null>"),
-			AftermathCameraActor ? *AftermathCameraActor->GetName() : TEXT("<null>"));
-	}
-
-	return AftermathCameraActor;
-}
-
 void ACatPlayerController::TickAftermathOrbit()
 {
 	if (!AftermathCameraActor) return;
 
-	const float DeltaTime = 1.0f / 60.0f;
+	// Real elapsed time, not an assumed 1/60: below 60 fps the old fixed step made
+	// the orbit and shot timers run slow. Multiple catch-up fires in one frame get
+	// dt == 0 and advance nothing.
+	const double Now = GetWorld()->GetTimeSeconds();
+	const float DeltaTime = (LastOrbitTickTime >= 0.0)
+		? FMath::Clamp(static_cast<float>(Now - LastOrbitTickTime), 0.0f, 0.25f)
+		: (1.0f / 60.0f);
+	LastOrbitTickTime = Now;
+
 	AftermathOrbitElapsed += DeltaTime;
 
 	// ShotTimer only advances during clear-viewing time — paused while a fade-to-black
@@ -376,7 +297,7 @@ void ACatPlayerController::TickAftermathOrbit()
 	// First-tick diagnostic — confirms we seeded the pivot from the RPC value.
 	if (AftermathOrbitElapsed <= DeltaTime + KINDA_SMALL_NUMBER)
 	{
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogCatVentures, Log,
 			TEXT("[CatMatch] TickAftermathOrbit FIRST TICK  Cached=(%.1f, %.1f, %.1f)  Target=(%.1f, %.1f, %.1f)  Pivot=(%.1f, %.1f, %.1f)  ActiveDebris=%d  CurrentIndex=%d"),
 			CachedAftermathHotspot.X, CachedAftermathHotspot.Y, CachedAftermathHotspot.Z,
 			TargetPivot.X, TargetPivot.Y, TargetPivot.Z,
@@ -413,22 +334,17 @@ void ACatPlayerController::TickAftermathOrbit()
 
 	// Throttled drift check — once per second, log intended vs actual for location, rotation,
 	// AND the current view target so we can confirm the keep-alive is winning.
-	static int32 TickCounter = 0;
-	if ((++TickCounter % 60) == 1)
+	if ((++OrbitLogTickCounter % 60) == 1)
 	{
 		const FVector  ActualLoc = AftermathCameraActor->GetActorLocation();
-		const FRotator ActualRot = AftermathCameraActor->GetActorRotation();
 		const AActor*  VT        = PlayerCameraManager ? PlayerCameraManager->GetViewTarget() : nullptr;
-		const bool     bMatch    = (VT == AftermathCameraActor);
-		UE_LOG(LogTemp, Warning,
-			TEXT("[CatMatch] OrbitTick  Shot=%d/%d  ShotT=%.1f/%.1f  Pivot=(%.1f, %.1f, %.1f)  Target=(%.1f, %.1f, %.1f)  CamLoc=(%.1f, %.1f, %.1f) Rot=(P=%.1f, Y=%.1f, R=%.1f)  VT=%s  Match=%d"),
+		UE_LOG(LogCatVentures, Verbose,
+			TEXT("[CatMatch] OrbitTick  Shot=%d/%d  ShotT=%.1f/%.1f  Pivot=(%.1f, %.1f, %.1f)  CamLoc=(%.1f, %.1f, %.1f)  VTMatch=%d"),
 			CurrentTargetIndex, ActiveDebrisActors.Num(),
 			ShotTimer, AftermathShotIntervalSec,
 			AftermathOrbitPivot.X, AftermathOrbitPivot.Y, AftermathOrbitPivot.Z,
-			TargetPivot.X, TargetPivot.Y, TargetPivot.Z,
 			ActualLoc.X, ActualLoc.Y, ActualLoc.Z,
-			ActualRot.Pitch, ActualRot.Yaw, ActualRot.Roll,
-			VT ? *VT->GetName() : TEXT("<null>"), bMatch ? 1 : 0);
+			(VT == AftermathCameraActor) ? 1 : 0);
 	}
 }
 
@@ -507,63 +423,9 @@ void ACatPlayerController::RegisterDebrisActor(AActor* DebrisActor)
 
 	ActiveDebrisActors.Emplace(DebrisActor);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] RegisterDebrisActor  Actor=%s  TotalActive=%d"),
 		*DebrisActor->GetName(), ActiveDebrisActors.Num());
-}
-
-FVector ACatPlayerController::ComputeLiveDebrisCentroid() const
-{
-	// Two parallel sums:
-	//   ActiveSum tracks per-actor centroids of *fast-moving* chunks only.
-	//   AllSum    tracks per-actor centroids of every broken chunk (settled + flying).
-	// We prefer ActiveSum so the camera focuses on the action; we fall back to AllSum
-	// once everything settles, and finally to CachedAftermathHotspot if even that's empty.
-	FVector ActiveSum = FVector::ZeroVector;  int32 ActiveCount = 0;
-	FVector AllSum    = FVector::ZeroVector;  int32 AllCount    = 0;
-
-	for (const TWeakObjectPtr<AActor>& Ptr : ActiveDebrisActors)
-	{
-		AActor* A = Ptr.Get();
-		if (!A) continue;
-
-		// Simple centroid (broken chunks regardless of velocity) — used for the abyss
-		// filter and as the fall-back centroid when nothing's moving.
-		const FVector SimpleCentroid = GetChaosTargetLocation(A);
-
-		// Abyss filter — skip actors whose chunk centroid has fallen through the floor.
-		if (SimpleCentroid.Z < AftermathDebrisFloorZ) continue;
-
-		AllSum += SimpleCentroid;
-		++AllCount;
-
-		// Velocity-filtered pass: only chunks moving faster than AftermathChunkActiveSpeed.
-		int32 ChunksActive = 0;
-		const FVector ActiveCentroid = GetChaosActiveChunkCentroid(A, ChunksActive);
-		if (ChunksActive > 0)
-		{
-			ActiveSum += ActiveCentroid;
-			++ActiveCount;
-		}
-	}
-
-	FVector Centroid;
-	if (ActiveCount > 0)
-	{
-		Centroid = ActiveSum / static_cast<float>(ActiveCount);   // chase the action
-	}
-	else if (AllCount > 0)
-	{
-		Centroid = AllSum / static_cast<float>(AllCount);         // settle on the pile
-	}
-	else
-	{
-		return CachedAftermathHotspot;                            // nothing in scope
-	}
-
-	// Final clamp — never let the returned pivot dip below AftermathPivotMinZ.
-	Centroid.Z = FMath::Max(Centroid.Z, AftermathPivotMinZ);
-	return Centroid;
 }
 
 // ── Director-cut helpers ────────────────────────────────────────────
@@ -601,7 +463,7 @@ void ACatPlayerController::StartCutFadeOut()
 	GetWorldTimerManager().SetTimer(CutSwapTimerHandle, this,
 		&ACatPlayerController::PerformCutSwap, FMath::Max(AftermathFadeOutDuration, 0.001f), false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] CutFadeOut  Idx=%d  ShotT=%.2f  FadeOut=%.2fs"),
 		CurrentTargetIndex, ShotTimer, AftermathFadeOutDuration);
 }
@@ -655,7 +517,7 @@ void ACatPlayerController::SwapToCurrentTargetCameraAndFadeIn()
 				NewTarget          = CandidateActor;
 				NewPivot           = CandidatePivot;
 				NewActiveCount     = CandidateCount;
-				UE_LOG(LogTemp, Warning,
+				UE_LOG(LogCatVentures, Log,
 					TEXT("[CatMatch] Director Skip-Ghost  Advanced to idx=%d  ActiveCount=%d  Pivot=(%.1f, %.1f, %.1f)"),
 					CurrentTargetIndex, CandidateCount, NewPivot.X, NewPivot.Y, NewPivot.Z);
 				break;
@@ -677,7 +539,7 @@ void ACatPlayerController::SwapToCurrentTargetCameraAndFadeIn()
 	{
 		const float OrigZ = NewPivot.Z;
 		NewPivot = CachedAftermathHotspot;
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogCatVentures, Log,
 			TEXT("[CatMatch] Abyss Pivot Detected! Clamping Z from %f to %f (fallback to CachedAftermathHotspot)"),
 			OrigZ, NewPivot.Z);
 	}
@@ -685,7 +547,7 @@ void ACatPlayerController::SwapToCurrentTargetCameraAndFadeIn()
 	{
 		const float OrigZ = NewPivot.Z;
 		NewPivot.Z = AftermathPivotMinZ;
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogCatVentures, Log,
 			TEXT("[CatMatch] Abyss Pivot Detected! Clamping Z from %f to %f"),
 			OrigZ, NewPivot.Z);
 	}
@@ -743,7 +605,7 @@ void ACatPlayerController::SwapToCurrentTargetCameraAndFadeIn()
 	GetWorldTimerManager().SetTimer(CutFinishTimerHandle, this,
 		&ACatPlayerController::FinishCut, FMath::Max(AftermathFadeInDuration, 0.001f), false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] CutSwap  Idx=%d/%d  Target=%s  NewPivot=(%.1f, %.1f, %.1f)  FadeIn=%.2fs"),
 		CurrentTargetIndex, ActiveDebrisActors.Num(),
 		NewTarget ? *NewTarget->GetName() : TEXT("<null>"),
@@ -781,7 +643,7 @@ int32 ACatPlayerController::ResolveLeadChunkIndex() const
 		}
 	}
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] LeadChunkIndex=%d  ActiveCount=%d  Dist=%.1f  ActiveDebris=%d"),
 		BestIdx, BestCount, FMath::Sqrt(FMath::Max(BestDistSq, 0.f)), ActiveDebrisActors.Num());
 

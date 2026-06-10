@@ -1,6 +1,7 @@
 // CatBase.cpp
 
 #include "CatBase.h"
+#include "CatVenturesLog.h"
 #include "CatAnimationTypes.h"
 #include "Net/UnrealNetwork.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -17,7 +18,6 @@
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
-#include "DrawDebugHelpers.h"
 #include "Kismet/GameplayStatics.h"
 
 ACatBase::ACatBase()
@@ -112,9 +112,18 @@ void ACatBase::BeginPlay()
 	CameraBoom->bEnableCameraRotationLag = bEnableCameraRotationLag;
 	CameraBoom->CameraRotationLagSpeed   = CameraRotationLagSpeed;
 
-	// Apply jump tuning UPROPERTYs to the CMC (so per-instance overrides in Details panel take effect)
+	// Apply movement + jump tuning UPROPERTYs to the CMC. The constructor bakes the
+	// C++ defaults into the CMC subobject BEFORE Blueprint property serialization, so
+	// per-instance overrides on PrimeCatBase only take effect if re-applied here.
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
+		CMC->MaxWalkSpeed               = MovementMaxWalkSpeed;
+		CMC->MaxAcceleration            = MovementAcceleration;
+		CMC->BrakingDecelerationWalking = MovementBrakingDeceleration;
+		CMC->GroundFriction             = MovementGroundFriction;
+		CMC->BrakingFriction            = MovementBrakingFriction;
+		CMC->RotationRate               = FRotator(0.0f, MovementRotationRateYaw, 0.0f);
+
 		CMC->JumpZVelocity  = JumpLaunchVelocity;
 		CMC->AirControl     = JumpAirControl;
 		CMC->GravityScale   = GravityScaleRising;
@@ -166,7 +175,7 @@ void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
 		if (HasAuthority())
 		{
 			// Listen server host's own cat — authority, call multicast directly.
-			Multicast_BumperHitGC(OtherActor, BumperOrigin, BumperDamageRadius, BumperChaosImpulse);
+			Multicast_BumperHitGC(OtherActor, BumperOrigin);
 		}
 		else
 		{
@@ -181,14 +190,14 @@ void ACatBase::Server_BumperHitGC_Implementation(AActor* GCActor, FVector Origin
 	if (!GCActor) return;
 
 	// Range check using the server's authoritative pawn position.
-	// 300 cm = bumper reach (60) + damage radius (200) + prediction jitter buffer (40).
+	// 300 cm = bumper reach (60) + shatter radius slack + prediction jitter buffer.
 	constexpr float MaxReachCm = 300.0f;
 	if (FVector::Dist(GetActorLocation(), GCActor->GetActorLocation()) > MaxReachCm) return;
 
-	Multicast_BumperHitGC(GCActor, Origin, BumperDamageRadius, BumperChaosImpulse);
+	Multicast_BumperHitGC(GCActor, Origin);
 }
 
-void ACatBase::Multicast_BumperHitGC_Implementation(AActor* GCActor, FVector Origin, float Radius, float Strain)
+void ACatBase::Multicast_BumperHitGC_Implementation(AActor* GCActor, FVector Origin)
 {
 	if (!GCActor) return;
 	UGeometryCollectionComponent* GCC = GCActor->FindComponentByClass<UGeometryCollectionComponent>();
@@ -265,7 +274,7 @@ void ACatBase::Tick(float DeltaTime)
 			const FRotator NewRotation = FMath::RInterpTo(CurrentRotation, TargetTurnRotation, DeltaTime, 5.0f);
 			SetActorRotation(NewRotation);
 
-			UE_LOG(LogTemp, Verbose, TEXT("[%s] CommitTurn -- Cur: %.1f | Tgt: %.1f | New: %.1f | Role: %s"),
+			UE_LOG(LogCatVentures, Verbose, TEXT("[%s] CommitTurn -- Cur: %.1f | Tgt: %.1f | New: %.1f | Role: %s"),
 				*GetName(), CurrentRotation.Yaw, TargetTurnRotation.Yaw, NewRotation.Yaw,
 				IsLocallyControlled() ? TEXT("Local") : TEXT("Server"));
 		}
@@ -279,7 +288,7 @@ void ACatBase::Tick(float DeltaTime)
 			}
 			bIsCommittingTurn = false;
 
-			UE_LOG(LogTemp, Verbose, TEXT("[%s] CommitTurn -- Finished, restored bOrientRotationToMovement"),
+			UE_LOG(LogCatVentures, Verbose, TEXT("[%s] CommitTurn -- Finished, restored bOrientRotationToMovement"),
 				*GetName());
 		}
 	}
@@ -395,6 +404,11 @@ void ACatBase::TriggerSwat()
 
 void ACatBase::Server_Swat_Implementation()
 {
+	// Deliberately NO bIsSwatting guard here: the server's montage ends slightly
+	// later than the client's (RPC latency), so a guard would eat legitimate
+	// rapid re-swats at the montage boundary. Worst case without it is a montage
+	// restart — cosmetic, and the trace window is bounded by the montage anyway.
+
 	// Multicast to all *other* machines (the instigator already predicted)
 	Multicast_Swat();
 }
@@ -482,10 +496,6 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 	AActor* HitActor = HitResult.GetActor();
 	if (!HitActor) return;
 
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Cyan,
-		FString::Printf(TEXT("Swat HIT: '%s' comp='%s'"),
-			*HitActor->GetName(), *HitResult.GetComponent()->GetName()));
-
 	const FVector ImpulseDir = (HitActor->GetActorLocation() - GetActorLocation()).GetSafeNormal();
 
 	// Apply impulse to physics objects
@@ -499,7 +509,7 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 
 	// Send 1 point of damage with the swat direction. The receiver (e.g. BPC_ChaosItem)
 	// decides how to respond — the Cat has no knowledge of GC or destruction logic.
-	const float DamageDealt = UGameplayStatics::ApplyPointDamage(
+	UGameplayStatics::ApplyPointDamage(
 		HitActor,
 		1.0f,
 		ImpulseDir,
@@ -508,10 +518,6 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 		this,
 		UDamageType::StaticClass()
 	);
-
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Yellow,
-		FString::Printf(TEXT("Swat DAMAGE sent: %.1f returned, CanBeDamaged=%d"),
-			DamageDealt, HitActor->CanBeDamaged()));
 
 	OnSwatHit.Broadcast(HitActor, HitResult.ImpactPoint);
 }
@@ -620,23 +626,16 @@ void ACatBase::Server_Grab_Implementation()
 		FCollisionShape::MakeSphere(GrabTraceRadius),
 		Params);
 
-	// Debug: draw the sweep volume regardless of result.
-	if (bHit)
+	if (!bHit)
 	{
-		DrawDebugSphere(GetWorld(), HitResult.ImpactPoint, GrabTraceRadius, 12, FColor::Green, false, 3.0f);
-	}
-	else
-	{
-		DrawDebugLine(GetWorld(), TraceStart, TraceEnd, FColor::Red, false, 3.0f, 0, 1.5f);
-		DrawDebugSphere(GetWorld(), TraceEnd, GrabTraceRadius, 12, FColor::Red, false, 3.0f);
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red, TEXT("Grab: MISS — nothing in reach"));
+		Client_GrabFailed();
 		return;
 	}
 
 	UPrimitiveComponent* HitComp = HitResult.GetComponent();
 	if (!HitComp)
 	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Red, TEXT("Grab: MISS — null component"));
+		Client_GrabFailed();
 		return;
 	}
 
@@ -649,8 +648,9 @@ void ACatBase::Server_Grab_Implementation()
 
 	if (!HitComp->IsSimulatingPhysics())
 	{
-		if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Orange,
-			FString::Printf(TEXT("Grab: FAILED — '%s' not simulating physics"), *HitComp->GetOwner()->GetName()));
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Grab failed — '%s' not simulating physics"),
+			*GetName(), *GetNameSafe(HitComp->GetOwner()));
+		Client_GrabFailed();
 		return;
 	}
 
@@ -662,13 +662,20 @@ void ACatBase::Server_Grab_Implementation()
 		ConstraintBone = NAME_None;
 	}
 
-	if (GEngine) GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
-		FString::Printf(TEXT("Grab: OK — multicast constraint on '%s' bone '%s'"),
-			*HitComp->GetOwner()->GetName(), *ConstraintBone.ToString()));
-
 	// Server validated the trace — now multicast so ALL machines create their own
 	// local constraint and modify their own Chaos solver state.
 	Multicast_Grab(HitComp, ConstraintBone);
+}
+
+void ACatBase::Client_GrabFailed_Implementation()
+{
+	// Roll back the drag-settings prediction from TriggerGrab. Without this, a
+	// missed grab left the player at DragWalkSpeed with rotation locked until
+	// they released the button.
+	if (!bIsGrabbing)
+	{
+		RestoreNormalMovementSettings();
+	}
 }
 
 void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, FName BoneName)
@@ -676,7 +683,9 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 	if (!GrabbedComp) return;
 
 	// Create the constraint dynamically on this machine's physics solver.
-	GrabConstraint = NewObject<UPhysicsConstraintComponent>(this, TEXT("GrabConstraint"));
+	// No explicit name: a fixed name can collide with a previous, still-pending-kill
+	// constraint during a fast release→re-grab.
+	GrabConstraint = NewObject<UPhysicsConstraintComponent>(this);
 	GrabConstraint->SetupAttachment(GrabTargetLocation);
 	GrabConstraint->RegisterComponent();
 
@@ -718,6 +727,7 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 
 void ACatBase::Server_ReleaseGrab_Implementation()
 {
+	if (!bIsGrabbing) return;
 	Multicast_ReleaseGrab();
 }
 
@@ -808,15 +818,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(ACatBase, SpeedType);
-	DOREPLIFETIME(ACatBase, CurrentAction);
-	DOREPLIFETIME(ACatBase, ControlMode);
 	DOREPLIFETIME(ACatBase, MovementStage);
-	DOREPLIFETIME(ACatBase, AimMode);
-	DOREPLIFETIME(ACatBase, AnimBSMode);
-	DOREPLIFETIME(ACatBase, BaseAction);
-	DOREPLIFETIME(ACatBase, RestState);
-	DOREPLIFETIME(ACatBase, bCrouchMode);
-	DOREPLIFETIME(ACatBase, bDied);
 	DOREPLIFETIME(ACatBase, JumpPhase);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
@@ -858,15 +860,7 @@ void ACatBase::ForceWalkingMovementMode()
 
 // ── OnRep Stubs ─────────────────────────────────────────────────────────
 void ACatBase::OnRep_SpeedType()      {}
-void ACatBase::OnRep_CurrentAction()  {}
-void ACatBase::OnRep_ControlMode()    {}
 void ACatBase::OnRep_MovementStage()  {}
-void ACatBase::OnRep_AimMode()        {}
-void ACatBase::OnRep_AnimBSMode()     {}
-void ACatBase::OnRep_BaseAction()     {}
-void ACatBase::OnRep_RestState()      {}
-void ACatBase::OnRep_bCrouchMode()    {}
-void ACatBase::OnRep_bDied()          {}
 void ACatBase::OnRep_JumpPhase()
 {
 	OnJumpPhaseChanged.Broadcast(JumpPhase);
@@ -919,11 +913,7 @@ void ACatBase::UpdateAnimationStates()
 	const float MaxSpeed = CMC->MaxWalkSpeed;
 	const float NormalizedSpeed = (MaxSpeed > KINDA_SMALL_NUMBER) ? (Speed / MaxSpeed) : 0.0f;
 
-	if (bCrouchMode)
-	{
-		SpeedType = ECatMoveType::Crouch;
-	}
-	else if (NormalizedSpeed >= 0.8f)
+	if (NormalizedSpeed >= 0.8f)
 	{
 		SpeedType = ECatMoveType::Run;
 	}
@@ -946,9 +936,12 @@ void ACatBase::UpdateAnimationStates()
 	// Turn states / ghost rotation.
 	if (IsLocallyControlled())
 	{
-		// (f2) AimYaw — only valid with a local controller
+		// (f2) AimYaw / AimPitch — only valid with a local controller
 		AimYaw = FRotator::NormalizeAxis(GetControlRotation().Yaw - GetActorRotation().Yaw);
 		AimYawClamped = FMath::Clamp(AimYaw, -90.0f, 90.0f);
+
+		AimPitch = FRotator::NormalizeAxis(GetControlRotation().Pitch);
+		AimPitchClamped = FMath::Clamp(AimPitch, -90.0f, 90.0f);
 
 		// (f3) Turn-In-Place detection (hysteresis unchanged)
 		const bool bWasTurning = bGoTurn;
@@ -986,7 +979,7 @@ void ACatBase::UpdateAnimationStates()
 			}
 		}
 
-		UE_LOG(LogTemp, Verbose, TEXT("[%s] AimYaw: %.1f | bGoTurn: %d | TurnRateAnim: %.3f"),
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AimYaw: %.1f | bGoTurn: %d | TurnRateAnim: %.3f"),
 			*GetName(), AimYaw, bGoTurn, TurnRateAnim);
 	}
 	else
@@ -1002,21 +995,7 @@ void ACatBase::UpdateAnimationStates()
 		}
 	}
 
-	// (g) Backwards — dot product of velocity dir vs actor forward
-	if (bHasMovementInput && Speed > KINDA_SMALL_NUMBER)
-	{
-		const float Dot = FVector::DotProduct(Velocity2D.GetSafeNormal(), GetActorForwardVector());
-		bBackwards = Dot < -0.1f;
-	}
-	else
-	{
-		bBackwards = false;
-	}
-
-	// (h) SpeedMultiplierFinale
-	SpeedMultiplierFinale = bBackwards ? 0.5f : 0.75f;
-
-	UE_LOG(LogTemp, Verbose, TEXT("[%s] Tick — Speed: %.1f | NormSpeed: %.2f | SpeedType: %d | HasInput: %d | OnGround: %d"),
+	UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Tick — Speed: %.1f | NormSpeed: %.2f | SpeedType: %d | HasInput: %d | OnGround: %d"),
 		*GetName(), Speed, NormalizedSpeed, (int32)SpeedType, bHasMovementInput, bIsOnGround);
 }
 
@@ -1040,8 +1019,7 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		TimeInRun = 0.0f;
 	}
 
-	TimeInRunCache = TimeInRun;
-	AlphaPlayBreath = (TimeInRunCache > 1.0f) ? 1.0f : 0.0f;
+	AlphaPlayBreath = (TimeInRun > 1.0f) ? 1.0f : 0.0f;
 	AlphaPlayBreathInterp = FMath::FInterpTo(AlphaPlayBreathInterp, AlphaPlayBreath, DeltaTime, 4.0f);
 
 	// ── (B) Aim Interp ────────────────────────────────────────────────
@@ -1059,12 +1037,7 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		FVector2D(0.0f, 1.0f), FVector2D(5.0f, 0.5f), OutputYAbs);
 	PlayRateInterp = FMath::FInterpTo(PlayRateInterp, PlayRate, DeltaTime, PlayRateInterpSpeed);
 
-	// ── (D) Mesh Z-offset ─────────────────────────────────────────────
-	FixedLocationMesh = FMath::FInterpTo(FixedLocationMesh, 0.0f, DeltaTime, 5.0f);
-	FixedLocationSwim = FMath::FInterpTo(FixedLocationSwim, 0.0f, DeltaTime, 2.0f);
-	FixedLocationCamera = FMath::FInterpTo(FixedLocationCamera, 0.0f, DeltaTime, 5.0f);
-
-	// ── (E) Locomotion Lean ──────────────────────────────────────────
+	// ── (D) Locomotion Lean ──────────────────────────────────────────
 	// Signed yaw RATE (deg/sec) mapped to [-1, 1]. Positive = turning right.
 	// Drive a Modify Bone Roll in the ABP — NOT the incline additive.
 	// Zero during Turn/Idle to avoid fighting the turn-in-place animation.
@@ -1087,7 +1060,7 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		LeanAmount = FMath::FInterpTo(LeanAmount, TargetLean, DeltaTime, LeanInterpSpeed);
 		PreviousYaw = CurrentYaw;
 
-		UE_LOG(LogTemp, Verbose, TEXT("[%s] Lean -- Rate: %.1f d/s | Raw: %.3f | Final: %.3f | Gate: %d"),
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Lean -- Rate: %.1f d/s | Raw: %.3f | Final: %.3f | Gate: %d"),
 			*GetName(), YawRate, RawLean, LeanAmount, bShouldLean);
 	}
 }

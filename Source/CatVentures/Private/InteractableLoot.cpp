@@ -1,6 +1,7 @@
 // InteractableLoot.cpp
 
 #include "InteractableLoot.h"
+#include "CatVenturesLog.h"
 #include "Engine/Engine.h"
 
 AInteractableLoot::AInteractableLoot()
@@ -27,13 +28,8 @@ void AInteractableLoot::Interact_Implementation(AActor* Interactor)
 
 	const FString InstigatorName = Interactor ? Interactor->GetName() : TEXT("Unknown");
 
-	UE_LOG(LogTemp, Log, TEXT("AInteractableLoot::Interact — Loot collected by %s!"), *InstigatorName);
+	UE_LOG(LogCatVentures, Log, TEXT("AInteractableLoot::Interact — Loot collected by %s!"), *InstigatorName);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Green,
-			FString::Printf(TEXT("Loot collected by %s!"), *InstigatorName));
-	}
 
 	Destroy();
 }

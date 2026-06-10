@@ -60,12 +60,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	ACameraActor* SpawnCinematicTrackerCamera(float BlendTime = 0.0f);
 
-	/** Spawns the Aftermath orbit camera at the chaos hotspot, instant-cuts the view target
-	 *  to it (we're under fade-to-black), and starts the orbit motion timer. Returns the
-	 *  spawned actor so Blueprint can introspect it if needed. */
-	UFUNCTION(BlueprintCallable, Category = "Match")
-	ACameraActor* SpawnAftermathCamera(FVector Hotspot);
-
 	// ── Scoreboard Population ───────────────────────────────────────
 
 	/** Static BP-callable: clears Container and creates one row per FCatPlayerScore in the
@@ -155,11 +149,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.5"))
 	float AftermathShotIntervalSec = 8.0f;
 
-	/** PCM blend duration when cutting between shots. (Currently unused — dip-to-black
-	 *  replaces the live-blend transition.) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
-	float AftermathShotBlendTimeSec = 1.0f;
-
 	/** Wall-clock seconds the screen takes to fade to black before a cut. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
 	float AftermathFadeOutDuration = 0.4f;
@@ -216,6 +205,14 @@ private:
 	FTimerHandle AftermathOrbitTimerHandle;
 	FTimerHandle ScoreboardRevealTimerHandle;
 	float AftermathOrbitElapsed = 0.0f;
+
+	/** World time of the previous orbit tick — real elapsed time replaces the old
+	 *  fixed 1/60 assumption so the orbit doesn't slow down below 60 fps. */
+	double LastOrbitTickTime = -1.0;
+
+	/** Throttles the once-per-second orbit drift log. Member (not function-static)
+	 *  so PIE multi-client instances don't share one counter. */
+	int32 OrbitLogTickCounter = 0;
 
 	// ── Director-cut state ──────────────────────────────────────────
 
@@ -283,10 +280,6 @@ private:
 	/** Per-client list of actors whose chaos has broken locally. Weak refs so destroyed
 	 *  actors are skipped automatically. Cleared in EndPlay. */
 	TArray<TWeakObjectPtr<AActor>> ActiveDebrisActors;
-
-	/** Averages GetChaosTargetLocation across every valid entry in ActiveDebrisActors.
-	 *  Falls back to CachedAftermathHotspot when the list is empty. */
-	FVector ComputeLiveDebrisCentroid() const;
 
 protected:
 	// ── Blueprint Implementable Events ──────────────────────────────

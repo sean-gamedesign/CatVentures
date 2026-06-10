@@ -25,9 +25,13 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnCatLanded, float, ImpactIntensit
 /**
  * Base C++ Character for all Cat pawns.
  *
+ * CONTROLS ARE FINAL: camera-relative movement (Move()) with orient-to-movement
+ * rotation and the current tuning values are the shipped feel. Do not change
+ * movement, camera, or input behavior without explicit designer sign-off.
+ *
  * Multiplayer features:
- *  - Hard Tick Gate: Tick() early-returns on non-locally-controlled instances
- *    so Blueprint tick logic only runs where it matters.
+ *  - Tick() runs on ALL roles: replicated state is derived on the server, while
+ *    cosmetic animation variables are computed locally on every machine.
  *  - PossessedBy / OnRep_PlayerState force Walking movement mode immediately,
  *    preventing the "frozen client" problem.
  *  - Server_Meow RPC → NetMulticast_Meow → OnMeow broadcast for networked meowing.
@@ -92,17 +96,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", EditCondition = "bEnableCameraRotationLag"))
 	float CameraRotationLagSpeed = 8.0f;
 
-	// ── Tank Controls ──────────────────────────────────────────────────
-
-	/** Yaw turn speed in degrees/second when A/D are held. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "30.0", ClampMax = "720.0"))
-	float TurnRate = 180.0f;
-
 	// ── Movement Tuning ────────────────────────────────────────────
+	// Applied to the CharacterMovementComponent in BeginPlay so per-instance
+	// Blueprint overrides take effect. These values define the LOCKED control
+	// feel — do not retune without designer sign-off.
 
-	/** Max ground speed (cm/s). */
+	/** Max ground speed (cm/s). 600 is the shipped feel (PrimeCatBase). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "100.0", ClampMax = "2000.0"))
-	float MovementMaxWalkSpeed = 400.0f;
+	float MovementMaxWalkSpeed = 600.0f;
 
 	/** How fast the cat accelerates to max speed (cm/s²). Lower = heavier ramp-up. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "50.0", ClampMax = "4000.0"))
@@ -214,17 +215,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0", ClampMax = "60.0"))
 	float UnderFootTolerance = 12.0f;
 
-	/** Strain injected directly into the Chaos cluster-bond graph via
-	 *  UGeometryCollectionComponent::ApplyExternalStrain. When this value exceeds the GC
-	 *  asset's Damage Threshold (set in Clustering → Damage Threshold) the bond breaks and
-	 *  OnChaosBreakEvent fires. Default 10 000 is 20× a threshold of 500 — tunable per-instance
-	 *  in PrimeCatBase without a rebuild. Has no effect on standard Static Mesh Actors. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "0.0"))
-	float BumperChaosImpulse = 10000.0f;
-
-	/** Radius (cm) of the radial impulse sphere emitted at the bumper contact point. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper", meta = (ClampMin = "1.0"))
-	float BumperDamageRadius = 200.0f;
+	// NOTE: Bumper contact with a Geometry Collection is a GUARANTEED full shatter
+	// (ForceShatterGC) by design — there is no strain/threshold tuning on this path.
+	// To make a prop harder to break, gate it on the BP side, not here.
 
 	// ── Mouth Grab ───────────────────────────────────────────────────────
 
@@ -358,7 +351,9 @@ protected:
 
 	// ── Input Handlers ──────────────────────────────────────────────────
 
-	/** Tank-style input: Y axis (W/S) moves along ActorForward, X axis (A/D) yaw-rotates the character. */
+	/** Camera-relative movement: input is projected onto the camera's yaw plane;
+	 *  the character orients toward movement via CMC bOrientRotationToMovement.
+	 *  This is the FINAL control scheme — do not change. */
 	void Move(const FInputActionValue& Value);
 
 	/** Processes IA_Look (Axis2D) — applies yaw/pitch to the controller rotation. */
@@ -410,6 +405,12 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_ReleaseGrab();
 
+	/** Server → owning client: the grab trace missed or failed validation.
+	 *  Rolls back the client-side drag-settings prediction applied in TriggerGrab,
+	 *  so a missed grab doesn't leave the player stuck at DragWalkSpeed. */
+	UFUNCTION(Client, Reliable)
+	void Client_GrabFailed();
+
 	/** Server → All: create the physics constraint on every machine's local Chaos solver. */
 	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_Grab(UPrimitiveComponent* GrabbedComp, FName BoneName);
@@ -420,13 +421,13 @@ protected:
 
 	// ── Networked Physics Bumper (GC Fracture) ────────────────────────────
 
-	/** Locally-controlled client → Server: validate a GC bumper hit and multicast strain. */
+	/** Locally-controlled client → Server: validate a GC bumper hit and multicast the shatter. */
 	UFUNCTION(Server, Reliable)
 	void Server_BumperHitGC(AActor* GCActor, FVector Origin);
 
-	/** Server → All: apply Chaos strain on every machine's local physics solver. */
+	/** Server → All: force-shatter the GC on every machine's local physics solver. */
 	UFUNCTION(NetMulticast, Unreliable)
-	void Multicast_BumperHitGC(AActor* GCActor, FVector Origin, float Radius, float Strain);
+	void Multicast_BumperHitGC(AActor* GCActor, FVector Origin);
 
 	/** Deterministic GC fracture — wakes the Chaos solver and injects overwhelming strain
 	 *  to guarantee immediate cluster-bond breakage. Call from Blueprints on high-speed
@@ -452,41 +453,9 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_SpeedType, Category = "Animation State")
 	ECatMoveType SpeedType = ECatMoveType::Idle;
 
-	/** Current special action the cat is performing. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentAction, Category = "Animation State")
-	ECatAction CurrentAction = ECatAction::None;
-
-	/** Camera/input control scheme. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_ControlMode, Category = "Animation State")
-	ECatControlMode ControlMode = ECatControlMode::Looking;
-
 	/** High-level locomotion surface (ground, air, swimming, ragdoll). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_MovementStage, Category = "Animation State")
 	ECatMovementStage MovementStage = ECatMovementStage::OnGround;
-
-	/** Head/body aim mode for look-at blendspaces. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_AimMode, Category = "Animation State")
-	ECatAim AimMode = ECatAim::Aim;
-
-	/** Which blendspace set the AnimBP should use. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_AnimBSMode, Category = "Animation State")
-	ECatAnimBSMode AnimBSMode = ECatAnimBSMode::Looking;
-
-	/** Priority action override (attack, damage, death, etc.). */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_BaseAction, Category = "Animation State")
-	ECatBaseAction BaseAction = ECatBaseAction::None;
-
-	/** Idle rest progression state. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_RestState, Category = "Animation State")
-	ECatRest RestState = ECatRest::None;
-
-	/** True while the cat is in crouch mode. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bCrouchMode, Category = "Animation State")
-	bool bCrouchMode = false;
-
-	/** True when the cat has died. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bDied, Category = "Animation State")
-	bool bDied = false;
 
 	/** True while a mouth grab is active. Replicated so the AnimBP can drive a jaw-open blend on all machines. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bIsGrabbing, Category = "Animation State")
@@ -502,31 +471,7 @@ protected:
 	void OnRep_SpeedType();
 
 	UFUNCTION()
-	void OnRep_CurrentAction();
-
-	UFUNCTION()
-	void OnRep_ControlMode();
-
-	UFUNCTION()
 	void OnRep_MovementStage();
-
-	UFUNCTION()
-	void OnRep_AimMode();
-
-	UFUNCTION()
-	void OnRep_AnimBSMode();
-
-	UFUNCTION()
-	void OnRep_BaseAction();
-
-	UFUNCTION()
-	void OnRep_RestState();
-
-	UFUNCTION()
-	void OnRep_bCrouchMode();
-
-	UFUNCTION()
-	void OnRep_bDied();
 
 	UFUNCTION()
 	void OnRep_JumpPhase();
@@ -543,9 +488,8 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float Speed = 0.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float SpeedDelay = 0.0f;
-
+	/** Source for PlayRateInterp. NOTE: currently never written (always 0) — the
+	 *  ABP consumes PlayRateInterp, so populate this if anim play-rate scaling is wanted. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float PlayRate = 0.0f;
 
@@ -562,9 +506,6 @@ protected:
 	float TimeInRun = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float TimeInRunCache = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float AimYaw = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -573,6 +514,7 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float AimYawClamped = 0.0f;
 
+	/** Local-controller camera pitch relative to the horizon — drives the ABP head look-up/down. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float AimPitch = 0.0f;
 
@@ -587,24 +529,6 @@ protected:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float AlphaAimInterp = 1.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float AlphaLookAt = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float LeanDrink = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float LeanDrinkClamp = 1.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float FixedLocationMesh = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float FixedLocationCamera = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float FixedLocationSwim = 0.0f;
 
 	/** Derived locally from CharacterMovement acceleration — NOT replicated. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -628,13 +552,7 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float JumpAirTime = 0.0f;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	bool bBackwards = false;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float SpeedMultiplierFinale = 0.75f;
-
-	/** Animation turn rate (renamed from BP "Turn Rate" to avoid collision with TurnRate). */
+	/** Animation turn rate sent to the server while turning in place. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float TurnRateAnim = 0.0f;
 
@@ -652,9 +570,6 @@ protected:
 
 	/** Last TurnRateAnim value sent via Server_SetTurnRate RPC. Used to throttle sends. */
 	float LastSentTurnRateAnim = 0.0f;
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
-	float PlayerDontMoveFor = 0.0f;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float DeltaTimeCached = 0.0f;

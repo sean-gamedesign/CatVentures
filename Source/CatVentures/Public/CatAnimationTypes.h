@@ -1,4 +1,6 @@
-// CatAnimationTypes.h — Native enums migrated from CharBP_Base (AnimX asset pack)
+// CatAnimationTypes.h — Native enums consumed by ACatBase and ABP_Cat_V2.
+// (Unused enums ported from the AnimX CharBP_Base were removed in the 2026-06 cleanup;
+//  recover them from git history if a future feature needs them.)
 
 #pragma once
 
@@ -16,38 +18,6 @@ enum class ECatMoveType : uint8
 	Run,
 	Crouch,
 	Turn
-};
-
-// ── Action ────────────────────────────────────────────────────────────────
-
-/** Special contextual actions the cat can perform. */
-UENUM(BlueprintType)
-enum class ECatAction : uint8
-{
-	None,
-	Eat,
-	Drink,
-	Dig,
-	JumpIntoSnow	UMETA(DisplayName = "Jump Into Snow"),
-	Howl,
-	Lick,
-	SharpenClaws	UMETA(DisplayName = "Sharpens Claws"),
-	Pet,
-	Roar,
-	Rub,
-	WavesHello		UMETA(DisplayName = "Waves Hello"),
-	DropItem		UMETA(DisplayName = "Drop Item")
-};
-
-// ── Control Mode ──────────────────────────────────────────────────────────
-
-/** How the character interprets camera/input for rotation. */
-UENUM(BlueprintType)
-enum class ECatControlMode : uint8
-{
-	Simple,
-	Looking,
-	Behind
 };
 
 // ── Movement Stage ────────────────────────────────────────────────────────
@@ -73,80 +43,4 @@ enum class ECatJumpPhase : uint8
 	Apex,		// Near peak, |Vz| < threshold          (AnimX: JumpApex)
 	Fall,		// Descending                            (AnimX: JumpFall)
 	Land		// Just touched ground, in recovery      (AnimX: JumpLand)
-};
-
-// ── Aim Mode ──────────────────────────────────────────────────────────────
-
-/** Head/body aim mode for look-at and aiming blendspaces. */
-UENUM(BlueprintType)
-enum class ECatAim : uint8
-{
-	None,
-	Aim,
-	LookAt,
-	AtCamera	UMETA(DisplayName = "AtCamara")
-};
-
-// ── Anim Blendspace Mode ──────────────────────────────────────────────────
-
-/** Which blendspace set the AnimBP should use. */
-UENUM(BlueprintType)
-enum class ECatAnimBSMode : uint8
-{
-	Simple,
-	Looking,
-	AI
-};
-
-// ── Base Action ───────────────────────────────────────────────────────────
-
-/** Priority action state that overrides normal locomotion (combat, damage, death). */
-UENUM(BlueprintType)
-enum class ECatBaseAction : uint8
-{
-	None,
-	Attack,
-	Shaking,
-	Dead,
-	Damage,
-	EnterToWater	UMETA(DisplayName = "Enter to Water")
-};
-
-// ── Rest State ────────────────────────────────────────────────────────────
-
-/** Idle rest progression: Standing → Sitting → Lying → Sleeping. */
-UENUM(BlueprintType)
-enum class ECatRest : uint8
-{
-	None,
-	Stand,
-	Sit,
-	Lie,
-	Sleep,
-	NearEdge	UMETA(DisplayName = "NearEdge")
-};
-
-// ── Turn In Place ─────────────────────────────────────────────────────────
-
-/** When the character should play a procedural turn-in-place animation. */
-UENUM(BlueprintType)
-enum class ECatTurnInPlace : uint8
-{
-	None,
-	Wait,
-	Always
-};
-
-// ── Damage Direction ──────────────────────────────────────────────────────
-
-/** Direction the damage came from — selects the correct hit-react montage. */
-UENUM(BlueprintType)
-enum class ECatDamageDirection : uint8
-{
-	BL	UMETA(DisplayName = "Back Left"),
-	BR	UMETA(DisplayName = "Back Right"),
-	FL	UMETA(DisplayName = "Front Left"),
-	FR	UMETA(DisplayName = "Front Right"),
-	SL	UMETA(DisplayName = "Side Left"),
-	SR	UMETA(DisplayName = "Side Right")
 };

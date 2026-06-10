@@ -34,6 +34,16 @@ class CATVENTURES_API UCatGameInstance : public UGameInstance
 
 public:
 
+	// ── Developer Toggles ─────────────────────────────────────────────────
+
+	/** When true, HostSession and FindSessions force bIsLAN=true regardless of
+	 *  the value passed from Blueprint. Lets us A/B test the LAN code path
+	 *  without touching the UI graph. UCatGameInstance is assigned directly in
+	 *  DefaultEngine.ini (no Blueprint subclass) — toggle this from C++ or a
+	 *  debug console route. Never ship enabled. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Network|Debug")
+	bool bForceLANMatch = false;
+
 	// ── Host ──────────────────────────────────────────────────────────────
 
 	/** Creates a named Steam session and advertises it for discovery.
@@ -79,20 +89,34 @@ private:
 	// ── Search state ──────────────────────────────────────────────────────
 	TSharedPtr<FOnlineSessionSearch> SessionSearch;
 
+	// ── Pending re-host state ─────────────────────────────────────────────
+	// DestroySession is async: when HostSession is called while a session still
+	// exists (re-hosting after a match), the create is deferred until the destroy
+	// completes. These hold the requested parameters across that gap.
+	int32 PendingHostMaxPlayers = 0;
+	bool  bPendingHostIsLAN = false;
+
 	// ── Native OSS delegates ──────────────────────────────────────────────
 	// Constructed once in Init(). Registered immediately before each async OSS
 	// call and cleared inside the completion callback to prevent duplicate fires.
 	FOnCreateSessionCompleteDelegate      CreateSessionCompleteDelegate;
+	FOnDestroySessionCompleteDelegate     DestroySessionCompleteDelegate;
 	FOnFindSessionsCompleteDelegate       FindSessionsCompleteDelegate;
 	FOnJoinSessionCompleteDelegate        JoinSessionCompleteDelegate;
 	FOnSessionUserInviteAcceptedDelegate  SessionUserInviteAcceptedDelegate;
 
 	FDelegateHandle CreateSessionCompleteDelegateHandle;
+	FDelegateHandle DestroySessionCompleteDelegateHandle;
 	FDelegateHandle FindSessionsCompleteDelegateHandle;
 	FDelegateHandle JoinSessionCompleteDelegateHandle;
 
+	/** Issues the actual CreateSession call. Shared by the direct host path and
+	 *  the deferred destroy-then-recreate path. */
+	void CreateSessionInternal(int32 MaxPlayers, bool bIsLAN);
+
 	// ── Native callbacks (bound to delegates above) ───────────────────────
 	void HandleCreateSessionComplete(FName SessionName, bool bWasSuccessful);
+	void HandleDestroySessionComplete(FName SessionName, bool bWasSuccessful);
 	void HandleFindSessionsComplete(bool bWasSuccessful);
 	void HandleJoinSessionComplete(FName SessionName, EOnJoinSessionCompleteResult::Type Result);
 	void HandleSessionUserInviteAccepted(const bool bWasSuccessful, const int32 ControllerId,

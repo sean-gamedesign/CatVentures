@@ -1,6 +1,7 @@
 // CatGameMode.cpp
 
 #include "CatGameMode.h"
+#include "CatVenturesLog.h"
 #include "CatGameState.h"
 #include "CatPlayerController.h"
 #include "CatPlayerState.h"
@@ -51,7 +52,7 @@ APawn* ACatGameMode::SpawnDefaultPawnAtTransform_Implementation(AController* New
 
 	if (!ResultPawn)
 	{
-		UE_LOG(LogTemp, Warning,
+		UE_LOG(LogCatVentures, Warning,
 			TEXT("ACatGameMode::SpawnDefaultPawnAtTransform — SpawnActor returned null. PawnClass=%s"),
 			PawnClass ? *PawnClass->GetName() : TEXT("<null>"));
 	}
@@ -74,7 +75,7 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 		Location = Item->GetActorLocation();
 	}
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] ReportItemDestroyed  Item=%s  RawLoc=(%.1f, %.1f, %.1f)  FinalLoc=(%.1f, %.1f, %.1f)  Key=%s"),
 		*ItemPathBefore, RawLocation.X, RawLocation.Y, RawLocation.Z,
 		Location.X, Location.Y, Location.Z, *ChaosRewardKey.ToString());
@@ -108,11 +109,6 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 		GS->ChaosScore = TotalChaosScore;
 	}
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Orange,
-			FString::Printf(TEXT("Chaos +%.0f  (%.0f / %.0f)"), Value, TotalChaosScore, ChaosThreshold));
-	}
 
 	// Threshold check.
 	if (TotalChaosScore >= ChaosThreshold)
@@ -149,16 +145,11 @@ void ACatGameMode::BeginMatchEnd()
 	GetWorldTimerManager().SetTimer(PhaseTimerHandle, this,
 		&ACatGameMode::TransitionToFinalCut, ScheduledRate, false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] Warning  RealT=%.2f GameT=%.2f Dilation=%.2f  WarningDuration=%.2f  -> TransitionToFinalCut after %.2f game-secs (=%.2f real)"),
 		GetWorld()->GetRealTimeSeconds(), GetWorld()->GetTimeSeconds(),
 		Dilation, WarningDuration, ScheduledRate, WarningDuration);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-			TEXT("MATCH END — Phase 1: The Warning"));
-	}
 }
 
 // ── Phase 2: The Final Cut ──────────────────────────────────────────
@@ -180,16 +171,11 @@ void ACatGameMode::TransitionToFinalCut()
 	GetWorldTimerManager().SetTimer(PhaseTimerHandle, this,
 		&ACatGameMode::TransitionToFade, ScheduledRate, false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] FinalCut RealT=%.2f GameT=%.2f Dilation=%.2f  CinematicHoldDuration=%.2f  -> TransitionToFade after %.2f game-secs (=%.2f real)"),
 		GetWorld()->GetRealTimeSeconds(), GetWorld()->GetTimeSeconds(),
 		Dilation, CinematicHoldDuration, ScheduledRate, CinematicHoldDuration);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-			TEXT("MATCH END — Phase 2: The Final Cut"));
-	}
 }
 
 // ── Phase 2b: Fade ──────────────────────────────────────────────────
@@ -212,16 +198,11 @@ void ACatGameMode::TransitionToFade()
 	GetWorldTimerManager().SetTimer(PhaseTimerHandle, this,
 		&ACatGameMode::BeginActualFade, PostCinematicHoldDuration, false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] Fade-Hold RealT=%.2f GameT=%.2f Dilation=1.0  PostCinematicHoldDuration=%.2f  -> BeginActualFade in %.2fs"),
 		GetWorld()->GetRealTimeSeconds(), GetWorld()->GetTimeSeconds(),
 		PostCinematicHoldDuration, PostCinematicHoldDuration);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-			TEXT("MATCH END — Phase 2b: Real-Time Hold (no fade yet)"));
-	}
 }
 
 // ── Phase 2c: Actual Fade Trigger ───────────────────────────────────
@@ -237,16 +218,11 @@ void ACatGameMode::BeginActualFade()
 	GetWorldTimerManager().SetTimer(PhaseTimerHandle, this,
 		&ACatGameMode::TransitionToAftermath, ScheduledRate, false);
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] Fade-RPC  RealT=%.2f GameT=%.2f Dilation=%.2f  FadeDuration=%.2f  -> TransitionToAftermath after %.2f game-secs (=%.2f real)"),
 		GetWorld()->GetRealTimeSeconds(), GetWorld()->GetTimeSeconds(),
 		Dilation, FadeDuration, ScheduledRate, FadeDuration);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-			TEXT("MATCH END — Phase 2b: Fade RPC firing"));
-	}
 }
 
 // ── Phase 3: The Aftermath ──────────────────────────────────────────
@@ -265,7 +241,7 @@ void ACatGameMode::TransitionToAftermath()
 	// This must happen first; the value is captured into the local before being used below.
 	const FVector Hotspot = ComputeChaosHotspot();
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] Aftermath ENTER  RealT=%.2f  DestroyedItems=%d  ComputedHotspot=(%.1f, %.1f, %.1f)"),
 		GetWorld()->GetRealTimeSeconds(), DestroyedItems.Num(),
 		Hotspot.X, Hotspot.Y, Hotspot.Z);
@@ -303,16 +279,11 @@ void ACatGameMode::TransitionToAftermath()
 	}
 
 	// ── Step 4: fire the RPC carrying the just-computed Hotspot ──
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] Aftermath RPC firing  Hotspot=(%.1f, %.1f, %.1f)"),
 		Hotspot.X, Hotspot.Y, Hotspot.Z);
 	NotifyAllControllersPhaseChanged(ECatMatchPhase::Aftermath, Hotspot, nullptr);
 
-	if (GEngine)
-	{
-		GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red,
-			FString::Printf(TEXT("MATCH END — Phase 3: Aftermath at %s"), *Hotspot.ToString()));
-	}
 }
 
 // ── Chaos Hotspot ───────────────────────────────────────────────────
@@ -356,7 +327,7 @@ FVector ACatGameMode::ComputeChaosHotspot() const
 		? CellWeightedLocSums[BestCell] / BestWeight
 		: FinalBreakLocation;
 
-	UE_LOG(LogTemp, Warning,
+	UE_LOG(LogCatVentures, Log,
 		TEXT("[CatMatch] ComputeChaosHotspot  DestroyedItems=%d  Hotspot=(%.1f, %.1f, %.1f)  FinalBreakLoc=(%.1f, %.1f, %.1f)"),
 		DestroyedItems.Num(), Hotspot.X, Hotspot.Y, Hotspot.Z,
 		FinalBreakLocation.X, FinalBreakLocation.Y, FinalBreakLocation.Z);
