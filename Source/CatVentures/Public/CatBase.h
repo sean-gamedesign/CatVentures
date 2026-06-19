@@ -332,6 +332,10 @@ protected:
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
 
+	/** Ground-traces each paw and publishes the per-foot vertical offset the AnimBP adds to its VB
+	 *  Hand/Foot goals before Leg IK. Cosmetic, local-only; skipped on dedicated servers. */
+	void UpdateFootIK(float DeltaTime);
+
 	// ── Enhanced Input Assets ────────────────────────────────────────────
 public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
@@ -596,6 +600,48 @@ protected:
 	/** Accel-lean spring damping — lower = more overshoot/bounce, higher = more settle. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0", ClampMax = "50.0"))
 	float AccelLeanDamping = 14.0f;
+
+	// ── Foot IK (quadruped ground placement) ────────────────────────────
+	/** Master switch for quadruped foot-IK ground placement. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
+	bool bEnableFootIK = true;
+
+	/** Draw the per-paw ground traces + hit points for tuning/debugging. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
+	bool bFootIKDebugDraw = false;
+
+	/** Ground-trace start height above each paw (cm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0"))
+	float FootIKTraceUpDistance = 25.0f;
+
+	/** How far below each paw the trace reaches (cm) — also clamps how far a paw drops. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0"))
+	float FootIKTraceDownDistance = 45.0f;
+
+	/** Vertical lift added to the trace hit so the paw rests on the surface (cm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
+	float FootIKPawHeight = 2.0f;
+
+	/** Interp speed for the alpha and the per-paw Z offsets — higher = snappier, lower = smoother. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "1.0"))
+	float FootIKInterpSpeed = 15.0f;
+
+	/** Per-paw vertical ground-conform offsets (cm, mesh component up). The AnimBP feeds each to a
+	 *  Modify Bone (Add, component space, +Z) on the matching VB Hand/Foot goal — which tracks the
+	 *  live FK paw — then Leg IK solves. Additive to the stride, so it never pins the foot.
+	 *  Cosmetic, local-only (computed on every non-dedicated machine for every pawn). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FootIKOffsetZ_HandL = 0.0f;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FootIKOffsetZ_HandR = 0.0f;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FootIKOffsetZ_FootL = 0.0f;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FootIKOffsetZ_FootR = 0.0f;
+
+	/** Master foot-IK blend [0..1]; eased to 0 while airborne so the legs free up for the jump. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float FootIKAlpha = 0.0f;
 
 	/** True while the capsule is being procedurally rotated to commit a turn-in-place. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")

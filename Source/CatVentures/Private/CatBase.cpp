@@ -19,6 +19,9 @@
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 #include "Kismet/GameplayStatics.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/SkinnedAsset.h"
+#include "ReferenceSkeleton.h"
 
 ACatBase::ACatBase()
 {
@@ -297,6 +300,7 @@ void ACatBase::Tick(float DeltaTime)
 	if (GetNetMode() != NM_DedicatedServer)
 	{
 		UpdateCosmeticInterpolation(DeltaTime);
+		UpdateFootIK(DeltaTime);
 	}
 
 	// ── Pitch Clamping (local player only) ─────────────────────────
@@ -1081,6 +1085,115 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AccelLean -- Accel: %.0f | Target: %.3f | Lean: %.3f"),
 			*GetName(), Accel, Target, AccelLeanAmount);
 	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── UpdateFootIK ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Quadruped foot planting. For each paw we trace straight down from the animated
+// (FK) paw and publish only the VERTICAL offset needed to meet the ground. The
+// AnimBP adds that offset to the matching VB Hand/Foot goal (which tracks the live
+// FK paw) and lets Leg IK solve the chain — so the stride is fully preserved and
+// only ground conform is layered on. FootIKAlpha scales the whole effect.
+//
+// Cosmetic and local: runs on every non-dedicated machine for every pawn (no
+// replication), so each client plants feet against its own world.
+void ACatBase::UpdateFootIK(float DeltaTime)
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	UWorld* World = GetWorld();
+	if (!MeshComp || !World) return;
+
+	// Blend in when grounded, out while airborne. bIsOnGround is refreshed earlier
+	// this frame in UpdateAnimationStates().
+	const float TargetAlpha = (bEnableFootIK && bIsOnGround) ? 1.0f : 0.0f;
+	FootIKAlpha = FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
+
+	// Fully blended out — let the offsets settle to zero and skip the traces.
+	if (TargetAlpha == 0.0f && FootIKAlpha < KINDA_SMALL_NUMBER)
+	{
+		FootIKOffsetZ_HandL = FootIKOffsetZ_HandR = FootIKOffsetZ_FootL = FootIKOffsetZ_FootR = 0.0f;
+		return;
+	}
+
+	auto SolveFoot = [&](const FName Bone, float& OutOffsetZ)
+	{
+		const FVector PawWorld = MeshComp->GetSocketLocation(Bone);
+		const FVector Start    = PawWorld + FVector(0.0f, 0.0f, FootIKTraceUpDistance);
+		const FVector End      = PawWorld - FVector(0.0f, 0.0f, FootIKTraceDownDistance);
+
+		FHitResult Hit;
+		FCollisionQueryParams Params(FName(TEXT("CatFootIK")), /*bTraceComplex*/ false, this);
+		const bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+
+		// Vertical-only correction toward the ground.
+		float DesiredOffsetZ = 0.0f;
+		if (bHit)
+		{
+			DesiredOffsetZ = (Hit.ImpactPoint.Z + FootIKPawHeight) - PawWorld.Z;
+
+			// ── Swing-phase gate ──────────────────────────────────────────
+			// Only conform a paw that's near the ground (stance). As the paw lifts
+			// through its stride (swing), fade the offset to zero so the solver never
+			// yanks a swinging foot back down — that yank was the per-stride pop.
+			// Full IK below FadeLow cm above ground; zero IK above FadeHigh cm.
+			const float FootAboveGround = FMath::Max(PawWorld.Z - Hit.ImpactPoint.Z, 0.0f);
+			const float FadeLow  = 2.0f;
+			const float FadeHigh = 10.0f;
+			const float Fade = 1.0f - FMath::Clamp((FootAboveGround - FadeLow) / (FadeHigh - FadeLow), 0.0f, 1.0f);
+			DesiredOffsetZ *= Fade;
+
+			// ── Over-extension guard ──────────────────────────────────────
+			// A downward pull on an already near-straight leg slams it to full
+			// extension (the "snap straight" pop). Walk up the 3-bone limb to find
+			// its root + total reach, then fade the *downward* pull out as the leg
+			// approaches full extension. Upward pulls (which bend the leg) are safe.
+			if (DesiredOffsetZ < 0.0f)
+			{
+				if (const USkinnedAsset* Skinned = MeshComp->GetSkinnedAsset())
+				{
+					const FReferenceSkeleton& Ref = Skinned->GetRefSkeleton();
+					FName Cur = Bone;
+					FVector ChildPos = PawWorld;
+					float Reach = 0.0f;
+					for (int32 i = 0; i < 2; ++i)   // 3 bones in limb -> walk 2 parents up
+					{
+						const int32 Ci = Ref.FindBoneIndex(Cur);
+						const int32 Pi = (Ci != INDEX_NONE) ? Ref.GetParentIndex(Ci) : INDEX_NONE;
+						if (Pi == INDEX_NONE) break;
+						const FName Parent = Ref.GetBoneName(Pi);
+						const FVector ParentPos = MeshComp->GetSocketLocation(Parent);
+						Reach += FVector::Dist(ChildPos, ParentPos);
+						ChildPos = ParentPos;
+						Cur = Parent;
+					}
+					if (Reach > 1.0f)
+					{
+						const float Ext = FVector::Dist(PawWorld, ChildPos) / Reach;  // ~1 = straight
+						const float Slack = FMath::Clamp((0.95f - Ext) / 0.10f, 0.0f, 1.0f);
+						DesiredOffsetZ *= Slack;   // -> 0 as the leg nears full extension
+					}
+				}
+			}
+		}
+		DesiredOffsetZ = FMath::Clamp(DesiredOffsetZ, -FootIKTraceDownDistance, FootIKTraceUpDistance);
+		OutOffsetZ = FMath::FInterpTo(OutOffsetZ, DesiredOffsetZ, DeltaTime, FootIKInterpSpeed);
+
+		if (bFootIKDebugDraw)
+		{
+			DrawDebugLine(World, Start, End, FColor::Yellow, false, -1.0f, 0, 0.5f);
+			if (bHit)
+			{
+				DrawDebugPoint(World, Hit.ImpactPoint, 8.0f, FColor::Green, false, -1.0f);
+			}
+		}
+	};
+
+	SolveFoot(TEXT("Hand_L"), FootIKOffsetZ_HandL);
+	SolveFoot(TEXT("Hand_R"), FootIKOffsetZ_HandR);
+	SolveFoot(TEXT("Foot_L"), FootIKOffsetZ_FootL);
+	SolveFoot(TEXT("Foot_R"), FootIKOffsetZ_FootR);
 }
 
 // ── Server RPC: Turn Active (Reliable) ────────────────────────────
