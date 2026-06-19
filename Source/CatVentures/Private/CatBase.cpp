@@ -1006,20 +1006,13 @@ void ACatBase::UpdateAnimationStates()
 void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 {
 	// ── (A) Breath ────────────────────────────────────────────────────
-	if (SpeedType == ECatMoveType::Run)
-	{
-		TimeInRun += DeltaTime;
-	}
-	else if (SpeedType == ECatMoveType::Trot)
-	{
-		TimeInRun += DeltaTime * 0.35f;
-	}
-	else
-	{
-		TimeInRun = 0.0f;
-	}
-
-	AlphaPlayBreath = (TimeInRun > 1.0f) ? 1.0f : 0.0f;
+	// Idle breathing: strongest when standing still, eased out as the cat
+	// gains speed (the locomotion anims already carry their own body motion).
+	// (Was previously panting-after-exertion gated on TimeInRun, which left
+	//  the idle pose frozen — TimeInRun is now unused; drop it on the next
+	//  full rebuild rather than churn reflection data during live iteration.)
+	AlphaPlayBreath = FMath::GetMappedRangeValueClamped(
+		FVector2D(10.0f, 200.0f), FVector2D(1.0f, 0.0f), Speed);
 	AlphaPlayBreathInterp = FMath::FInterpTo(AlphaPlayBreathInterp, AlphaPlayBreath, DeltaTime, 4.0f);
 
 	// ── (B) Aim Interp ────────────────────────────────────────────────
