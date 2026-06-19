@@ -323,8 +323,8 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 		// Look (mouse/stick) — fires every frame while input is non-zero
 		EnhancedInput->BindAction(LookAction,   ETriggerEvent::Triggered, this, &ACatBase::Look);
 
-		// Jump — Started/Completed for variable-height
-		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Started,   this, &ACharacter::Jump);
+		// Jump — Started records the buffer + jumps; Completed for variable-height release
+		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Started,   this, &ACatBase::OnJumpInputPressed);
 		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Completed, this, &ACharacter::StopJumping);
 
 		// Meow
@@ -1063,6 +1063,31 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Lean -- Rate: %.1f d/s | Raw: %.3f | Final: %.3f | Gate: %d"),
 			*GetName(), YawRate, RawLean, LeanAmount, bShouldLean);
 	}
+
+	// ── (E) Longitudinal weight lean (accel / decel) ──────────────────
+	// The body pitches into acceleration and braces back on deceleration. Driven by a
+	// spring-damper (not a plain interp) so a hard stop overshoots past neutral and settles —
+	// that overshoot is what reads as mass. Target is the signed change in speed, normalized
+	// by the reference acceleration. Steady cruising -> accel ~0 -> lean settles to 0.
+	{
+		const float SafeDT = FMath::Max(DeltaTime, 0.001f);
+		const float Accel = (Speed - PreviousLeanSpeed) / SafeDT;   // cm/s^2, signed
+		PreviousLeanSpeed = Speed;
+
+		const float Ref = (AccelLeanReference > KINDA_SMALL_NUMBER)
+			? AccelLeanReference
+			: (GetCharacterMovement() ? FMath::Max(GetCharacterMovement()->MaxAcceleration, 1.0f) : 1.0f);
+		const float Target = FMath::Clamp(Accel / Ref, -1.0f, 1.0f);
+
+		// Semi-implicit spring-damper toward Target.
+		AccelLeanVelocity += (Target - AccelLeanAmount) * AccelLeanStiffness * SafeDT;
+		AccelLeanVelocity -= AccelLeanVelocity * AccelLeanDamping * SafeDT;
+		AccelLeanAmount   += AccelLeanVelocity * SafeDT;
+		AccelLeanAmount    = FMath::Clamp(AccelLeanAmount, -1.5f, 1.5f);
+
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AccelLean -- Accel: %.0f | Target: %.3f | Lean: %.3f"),
+			*GetName(), Accel, Target, AccelLeanAmount);
+	}
 }
 
 // ── Server RPC: Turn Active (Reliable) ────────────────────────────
@@ -1092,10 +1117,22 @@ void ACatBase::SetJumpPhase(ECatJumpPhase NewPhase)
 	OnJumpPhaseChanged.Broadcast(NewPhase);
 }
 
+void ACatBase::OnJumpInputPressed()
+{
+	// Arm the jump buffer, then forward to the standard jump. If the jump can't fire
+	// right now (airborne beyond the coyote window), the buffer lets Landed() re-fire it.
+	JumpBufferTimer = JumpBufferTime;
+	Jump();
+}
+
 void ACatBase::OnJumped_Implementation()
 {
 	bFallPending = false;
 	FallTransitionHoldTimer = 0.0f;
+	// A jump fired: consume the buffer and suppress coyote-time for this airborne span.
+	JumpBufferTimer = 0.0f;
+	CoyoteTimer = 0.0f;
+	bLeftGroundByJumping = true;
 	SetJumpPhase(ECatJumpPhase::Launch);
 	LaunchVelocityZ = FMath::Abs(GetVelocity().Z);
 	JumpAirTime = 0.0f;
@@ -1113,12 +1150,28 @@ void ACatBase::Landed(const FHitResult& Hit)
 
 	SetJumpPhase(ECatJumpPhase::Land);
 	OnCatLanded.Broadcast(LandImpactIntensity, JumpAirTime);
+
+	// Kill any stale held-jump so merely *holding* the button doesn't auto-bounce on landing.
+	// A *fresh* press near touchdown survives via JumpBufferTimer and is re-fired by the
+	// per-frame buffer retry in UpdateJumpPhase — giving deterministic one-press-one-jump.
+	StopJumping();
 }
 
 bool ACatBase::CanJumpInternal_Implementation() const
 {
 	if (JumpCooldownTimer > 0.0f) return false;
-	return Super::CanJumpInternal_Implementation();
+
+	// Normal grounded jump.
+	if (Super::CanJumpInternal_Implementation()) return true;
+
+	// Coyote time — allow a jump shortly after walking off a ledge (but not after jumping),
+	// even though the CMC already reports falling. DoJump still applies JumpZVelocity.
+	if (CoyoteTimer > 0.0f && !bLeftGroundByJumping)
+	{
+		return true;
+	}
+
+	return false;
 }
 
 void ACatBase::UpdateJumpGravity()
@@ -1167,6 +1220,32 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	if (JumpCooldownTimer > 0.0f)
 	{
 		JumpCooldownTimer -= DeltaTime;
+	}
+
+	// ── Coyote-time + jump-buffer timers ─────────────────────────────
+	// bIsOnGround / bIsFalling are refreshed earlier in UpdateAnimationStates().
+	if (bIsOnGround)
+	{
+		// Re-arm coyote every grounded frame; a fresh ground contact is not "left by jumping".
+		CoyoteTimer = CoyoteTime;
+		bLeftGroundByJumping = false;
+	}
+	else if (CoyoteTimer > 0.0f)
+	{
+		CoyoteTimer -= DeltaTime;
+	}
+
+	if (JumpBufferTimer > 0.0f)
+	{
+		JumpBufferTimer -= DeltaTime;
+	}
+
+	// Per-frame buffer retry: a buffered press keeps trying until the jump is legal
+	// (covers taps eaten by a same-frame release, land-recovery, and cooldown). OnJumped
+	// clears the buffer on success, so exactly one jump fires per press.
+	if (JumpBufferTimer > 0.0f && IsLocallyControlled() && CanJump())
+	{
+		Jump();
 	}
 
 	// ── Air time accumulation ────────────────────────────────────────

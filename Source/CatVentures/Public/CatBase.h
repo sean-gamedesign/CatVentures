@@ -131,34 +131,44 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "200.0", ClampMax = "1500.0"))
 	float JumpLaunchVelocity = 700.0f;
 
-	/** Gravity scale while ascending (Vz > ApexVelocityThreshold). */
+	/** Gravity scale while ascending (Vz > ApexVelocityThreshold). LOCKED 2026-06-18. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
-	float GravityScaleRising = 2.8f;
+	float GravityScaleRising = 2.0f;
 
-	/** Gravity scale near the peak (|Vz| <= ApexVelocityThreshold). Slight hang feel. */
+	/** Gravity scale near the peak (|Vz| <= ApexVelocityThreshold). Above GravityScaleRising
+	 *  to push through the apex for a crisp, readable platforming peak. LOCKED 2026-06-18. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
-	float GravityScaleApex = 2.0f;
+	float GravityScaleApex = 3.4f;
 
-	/** Gravity scale while falling (Vz < -ApexVelocityThreshold). The key "weight" knob. */
+	/** Gravity scale while falling (Vz < -ApexVelocityThreshold). The key "weight" knob. LOCKED 2026-06-18. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "10.0"))
-	float GravityScaleFalling = 4.5f;
+	float GravityScaleFalling = 5.5f;
 
 	/** How fast GravityScale ramps between phases — eliminates the Apex→Fall velocity spike.
-	 *  Higher = snappier. Lower = slower ramp. Tune live in PIE; recommended range: 10–20. */
+	 *  Higher = snappier (less apex smear). Lower = slower ramp. Tune live in PIE. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "1.0", ClampMax = "50.0"))
-	float GravityScaleInterpSpeed = 15.0f;
+	float GravityScaleInterpSpeed = 25.0f;
 
-	/** |Velocity.Z| (cm/s) below which the character is considered at the apex. */
+	/** |Velocity.Z| (cm/s) below which the character is considered at the apex. Narrower = less loiter. LOCKED 2026-06-18. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "10.0", ClampMax = "200.0"))
-	float ApexVelocityThreshold = 60.0f;
+	float ApexVelocityThreshold = 30.0f;
 
-	/** Air control while jumping. Lower = less mid-air steering, preserving momentum. */
+	/** Air control while jumping. Higher = tighter mid-air steering for precision platforming. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float JumpAirControl = 0.3f;
+	float JumpAirControl = 0.7f;
 
 	/** Max hold time (seconds) for variable-height jump. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float JumpMaxHoldTimeTuning = 0.3f;
+	float JumpMaxHoldTimeTuning = 0.18f;
+
+	/** Coyote time (seconds): grace window to still jump just after walking off a ledge
+	 *  (does NOT apply if the cat left the ground by jumping). 0 disables. LOCKED 2026-06-18. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float CoyoteTime = 0.12f;
+
+	/** Jump buffer (seconds): a jump pressed this long before landing still fires on touchdown. 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float JumpBufferTime = 0.15f;
 
 	/** How long (seconds) the Land phase persists for the landing animation. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.05", ClampMax = "1.0"))
@@ -174,9 +184,9 @@ public:
 
 	/** Minimum seconds in Launch/Apex before the Fall phase is allowed to fire.
 	 *  Ensures the AnimBP always has time to finish the uncoil animation before
-	 *  the Fall state broadcasts, preventing the snap on both short hops and full jumps. */
+	 *  the Fall state broadcasts, preventing the snap on both short hops and full jumps. LOCKED 2026-06-18. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
-	float MinFallTransitionHoldTime = 0.12f;
+	float MinFallTransitionHoldTime = 0.30f;
 
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
@@ -371,6 +381,10 @@ protected:
 	/** Fires on IA_Grab Completed — releases mouth grab. */
 	void TriggerRelease();
 
+	/** Fires on IA_Jump Started — records the jump-buffer timestamp, then forwards to ACharacter::Jump.
+	 *  The buffer lets a press made just before landing still fire on touchdown (see Landed). */
+	void OnJumpInputPressed();
+
 	// ── Networked Meow ──────────────────────────────────────────────────
 
 	/** Client → Server: request a meow. */
@@ -564,6 +578,25 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float LeanAmount = 0.0f;
 
+	/** Longitudinal weight lean [-1.5, 1.5]. The body pitches into acceleration (+) and braces
+	 *  back on deceleration (-). Spring-damped, so a hard stop overshoots past neutral and settles —
+	 *  that overshoot is the felt "weight". Cosmetic, local-only. Wire to the free Roll pin of the
+	 *  Spine_2 Modify Bone in ABP_Cat_V2 (scale to taste; sign flips forward/back). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AccelLeanAmount = 0.0f;
+
+	/** Reference acceleration (cm/s^2) mapping to full lean (±1). <= 0 falls back to CMC MaxAcceleration. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0"))
+	float AccelLeanReference = 0.0f;
+
+	/** Accel-lean spring stiffness — higher = snappier brace. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "1.0", ClampMax = "500.0"))
+	float AccelLeanStiffness = 120.0f;
+
+	/** Accel-lean spring damping — lower = more overshoot/bounce, higher = more settle. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0", ClampMax = "50.0"))
+	float AccelLeanDamping = 14.0f;
+
 	/** True while the capsule is being procedurally rotated to commit a turn-in-place. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bIsCommittingTurn = false;
@@ -642,6 +675,16 @@ private:
 	 *  the Apex→Fall velocity spike. Not replicated; purely a physics-smoothing value. */
 	float GravityScaleInterp = 2.8f;
 
+	/** Counts down from CoyoteTime once the cat leaves the ground; while > 0 a ledge-walk jump
+	 *  is still permitted (see CanJumpInternal). Reset to CoyoteTime every grounded frame. */
+	float CoyoteTimer = 0.0f;
+
+	/** True once the cat has left the ground by jumping — suppresses coyote-time for that airborne span. */
+	bool bLeftGroundByJumping = false;
+
+	/** Counts down from JumpBufferTime after a jump press; if still > 0 on Landed, the jump re-fires. */
+	float JumpBufferTimer = 0.0f;
+
 	// ── Mouth Grab State ────────────────────────────────────────────
 
 	/** The physics component currently held. Valid only on authority while bIsGrabbing. */
@@ -650,4 +693,9 @@ private:
 	// ── Turn Commitment & Lean ──────────────────────────────────────
 	FRotator TargetTurnRotation = FRotator::ZeroRotator;
 	float PreviousYaw = 0.0f;
+
+	/** Previous-frame horizontal speed, for the accel-lean velocity derivative. */
+	float PreviousLeanSpeed = 0.0f;
+	/** Spring velocity state for AccelLeanAmount. */
+	float AccelLeanVelocity = 0.0f;
 };

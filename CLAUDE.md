@@ -11,8 +11,9 @@ CatVentures is an Unreal Engine 5.7 multiplayer third-person cat game. There is 
 The current movement/camera feel is designer-approved and locked:
 
 - **Camera-relative movement**: `Move()` projects input onto the camera's yaw plane; the character orients toward movement via `bOrientRotationToMovement`. (Tank controls existed in an earlier iteration and were deliberately replaced — do not reintroduce them.)
-- **Walk speed 400 cm/s** (`MovementMaxWalkSpeed` override on PrimeCatBase; the C++ default is 600 but the approved feel is 400 — the constructor-baking bug meant playtesting always happened at 400, so 400 was locked in deliberately on 2026-06-09). It is the only tuning value PrimeCatBase overrides; acceleration/friction/braking/turn-in-place/lean all ship at C++ defaults.
-- **Do not change** movement, camera, or input behavior — including "fixes" that alter feel — without explicit designer sign-off.
+- **Walk speed 400 cm/s** (`MovementMaxWalkSpeed` override on PrimeCatBase; the C++ default is 600 but the approved feel is 400 — the constructor-baking bug meant playtesting always happened at 400, so 400 was locked in deliberately on 2026-06-09). It is the only *movement-component* value PrimeCatBase overrides away from its C++ default; acceleration/friction/braking/turn-in-place/lean all ship at C++ defaults.
+- **Jump tuning — LOCKED 2026-06-18** (platforming rework final). Locked values: `JumpLaunchVelocity 700`, `GravityScaleRising 2.0`, `GravityScaleApex 3.4`, `GravityScaleFalling 5.5`, `GravityScaleInterpSpeed 25`, `ApexVelocityThreshold 30`, `JumpAirControl 0.7`, `JumpMaxHoldTimeTuning 0.18`, `CoyoteTime 0.12`, `JumpBufferTime 0.15`, `JumpCooldown 0.05`, `LandRecoveryDuration 0.25`, `MinFallTransitionHoldTime 0.30`, `HardLandSpeedThreshold 900`. Yields apex ~125 cm in ~0.36 s rise. These are baked into the C++ header defaults **and** mirrored as redundant PrimeCatBase overrides (equal values) — change neither without designer sign-off. Coyote time + jump buffer are shipped (see *Jump State Machine*).
+- **Do not change** movement, camera, jump, or input behavior — including "fixes" that alter feel — without explicit designer sign-off.
 
 All movement tuning UPROPERTYs are re-applied to the CMC in `ACatBase::BeginPlay` (the constructor bakes C++ defaults into the CMC *before* Blueprint serialization, so BeginPlay re-application is what makes PrimeCatBase overrides work — keep new tuning knobs on that list).
 
@@ -93,7 +94,12 @@ Enhanced Input (IMC_Cat mapping context), camera-relative (see *Controls Are FIN
 
 ### Jump State Machine
 
-The jump uses asymmetric gravity (tunable `GravityScaleRising`, `GravityScaleApex`, `GravityScaleFalling`). The `ECatJumpPhase` enum (None → Launch → Apex → Fall → Land) drives the AnimBP via `OnJumpPhaseChanged` delegate. `LandRecoveryTimer` enforces the Land phase duration; `JumpCooldownTimer` gates re-jump after landing.
+The jump uses asymmetric gravity (tunable `GravityScaleRising`, `GravityScaleApex`, `GravityScaleFalling`, interpolated by `GravityScaleInterpSpeed` to kill the Apex→Fall velocity spike). The `ECatJumpPhase` enum (None → Launch → Apex → Fall → Land) drives the AnimBP via `OnJumpPhaseChanged` delegate. `LandRecoveryTimer` enforces the Land phase duration; `JumpCooldownTimer` gates re-jump after landing.
+
+**Coyote time + jump buffer** (shipped 2026-06, tuning LOCKED — see *Controls Are FINAL*):
+- **Coyote time** (`CoyoteTimer`/`CoyoteTime`): re-armed every grounded frame; `CanJumpInternal` allows a jump shortly after walking off a ledge. Gated by `bLeftGroundByJumping` so it does **not** apply after an actual jump.
+- **Jump buffer** (`JumpBufferTimer`/`JumpBufferTime`): the input is bound to `OnJumpInputPressed` (Started), which arms the timer; a per-frame retry in `UpdateJumpPhase` re-fires once the jump is legal. `OnJumped` clears the buffer → exactly one jump per press. `Landed()` calls `StopJumping()` so merely *holding* the button doesn't auto-bounce.
+- **Stale-binary trap**: this logic lives in `CatBase.cpp`, so edits don't take effect in PIE until a `LiveCoding.Compile`. New `UPROPERTY`s showing up in reflection only proves the *header* compiled — verify the `.dll` mtime vs the `.cpp` if behavior seems unchanged.
 
 ### The Swat — Combat
 
