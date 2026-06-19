@@ -1035,30 +1035,42 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 	PlayRateInterp = FMath::FInterpTo(PlayRateInterp, PlayRate, DeltaTime, PlayRateInterpSpeed);
 
 	// ── (D) Locomotion Lean ──────────────────────────────────────────
-	// Signed yaw RATE (deg/sec) mapped to [-1, 1]. Positive = turning right.
-	// Drive a Modify Bone Roll in the ABP — NOT the incline additive.
-	// Zero during Turn/Idle to avoid fighting the turn-in-place animation.
+	// Banked turn lean from the SIGNED ANGLE between where the cat is moving
+	// (velocity) and where the player is steering (input acceleration). Unlike a
+	// yaw-RATE signal, this persists through the whole turn — when you tap A/D the
+	// input snaps to the new direction while the body catches up, so a sustained
+	// angle (and thus a sustained, blended lean) holds until velocity realigns.
+	// Positive = steering right of current motion. Zeroed during Turn/Idle.
 	{
-		const float CurrentYaw = GetActorRotation().Yaw;
-		const float YawDelta = FRotator::NormalizeAxis(CurrentYaw - PreviousYaw);
-		const float SafeDT = FMath::Max(DeltaTime, 0.001f);
-		// Yaw rate in deg/sec — 90°/s maps to full lean (±1)
-		const float YawRate = YawDelta / SafeDT;
-		const float RawLean = FMath::GetMappedRangeValueClamped(
-			FVector2D(-90.0f, 90.0f), FVector2D(-1.0f, 1.0f), YawRate);
+		FVector Vel = GetVelocity();
+		FVector InputAccel = GetCharacterMovement()
+			? GetCharacterMovement()->GetCurrentAcceleration() : FVector::ZeroVector;
+		Vel.Z = 0.0f; InputAccel.Z = 0.0f;
+
+		float RawLean = 0.0f;
+		if (Vel.SizeSquared() > 100.0f && InputAccel.SizeSquared() > 1.0f)
+		{
+			const FVector VelDir   = Vel.GetSafeNormal();
+			const FVector InputDir = InputAccel.GetSafeNormal();
+			const float Dot   = FVector::DotProduct(VelDir, InputDir);
+			const float SignZ = FVector::CrossProduct(VelDir, InputDir).Z;   // + = input right of motion
+			const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0f, 1.0f)))
+				* FMath::Sign(SignZ);
+			// 60° of steering offset maps to full lean (±1)
+			RawLean = FMath::GetMappedRangeValueClamped(FVector2D(-60.0f, 60.0f), FVector2D(-1.0f, 1.0f), AngleDeg);
+		}
 
 		// Gate: only lean while actually moving, never during Turn or Idle
 		const bool bShouldLean = (Speed > 10.0f)
 			&& (SpeedType != ECatMoveType::Turn)
 			&& (SpeedType != ECatMoveType::Idle);
 		const float TargetLean = bShouldLean ? RawLean : 0.0f;
-		// Fast attack (6.0) when leaning, slow decay (2.0) to bleed out — eliminates pop on Turn entry
-		const float LeanInterpSpeed = bShouldLean ? 6.0f : 2.0f;
+		// Fast attack while steering, slower decay to bleed the bank out smoothly.
+		const float LeanInterpSpeed = bShouldLean ? 8.0f : 3.0f;
 		LeanAmount = FMath::FInterpTo(LeanAmount, TargetLean, DeltaTime, LeanInterpSpeed);
-		PreviousYaw = CurrentYaw;
 
-		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Lean -- Rate: %.1f d/s | Raw: %.3f | Final: %.3f | Gate: %d"),
-			*GetName(), YawRate, RawLean, LeanAmount, bShouldLean);
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Lean -- Raw: %.3f | Final: %.3f | Gate: %d"),
+			*GetName(), RawLean, LeanAmount, bShouldLean);
 	}
 
 	// ── (E) Longitudinal weight lean (accel / decel) ──────────────────
