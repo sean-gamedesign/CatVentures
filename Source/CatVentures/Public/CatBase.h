@@ -183,10 +183,12 @@ public:
 	float JumpCooldown = 0.05f;
 
 	/** Minimum seconds in Launch/Apex before the Fall phase is allowed to fire.
-	 *  Ensures the AnimBP always has time to finish the uncoil animation before
-	 *  the Fall state broadcasts, preventing the snap on both short hops and full jumps. LOCKED 2026-06-18. */
+	 *  Kept short so Fall commits near the apex while vertical speed is still low —
+	 *  otherwise the cat holds the apex pose through a fast descent and the fall
+	 *  blendspace snaps when Fall finally fires. Reduced 0.30→0.05 on 2026-06-20
+	 *  (jump anim pass, designer sign-off). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
-	float MinFallTransitionHoldTime = 0.30f;
+	float MinFallTransitionHoldTime = 0.05f;
 
 	// ── Combat — The Swat ──────────────────────────────────────────────
 

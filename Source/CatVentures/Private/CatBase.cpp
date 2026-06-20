@@ -1391,6 +1391,17 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 
 	const float Vz = GetVelocity().Z;
 
+	// Fall-speed signal for the fall blendspace — computed CONTINUOUSLY while descending
+	// in any airborne phase (not just Fall). If it only updated in the Fall case, the
+	// blendspace axis stayed at its apex value for the first frame of Fall and then
+	// snapped to the real value — a visible pop at the Apex->Fall handoff. Computing it
+	// here means the axis is already correct the instant Fall begins.
+	if (Vz < 0.0f && JumpPhase != ECatJumpPhase::None && JumpPhase != ECatJumpPhase::Land)
+	{
+		const float TerminalReference = FMath::Max(LaunchVelocityZ * 1.5f, HardLandSpeedThreshold);
+		NormalizedFallSpeed = FMath::Clamp(FMath::Abs(Vz) / TerminalReference, 0.0f, 1.0f);
+	}
+
 	switch (JumpPhase)
 	{
 	case ECatJumpPhase::Launch:
@@ -1454,9 +1465,7 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	case ECatJumpPhase::Fall:
 	{
 		// Fall -> Land is handled by Landed() override, not tick.
-		// NormalizedFallSpeed cosmetic update:
-		const float TerminalReference = FMath::Max(LaunchVelocityZ * 1.5f, HardLandSpeedThreshold);
-		NormalizedFallSpeed = FMath::Clamp(FMath::Abs(Vz) / TerminalReference, 0.0f, 1.0f);
+		// NormalizedFallSpeed is updated continuously above (before the switch).
 		break;
 	}
 	case ECatJumpPhase::Land:
