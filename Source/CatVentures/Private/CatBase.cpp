@@ -422,8 +422,16 @@ void ACatBase::UpdateTurnInPlace()
 	const float CurrentYaw = GetActorRotation().Yaw;
 	const float DeltaToCam = FRotator::NormalizeAxis(DesiredYaw - CurrentYaw);
 
+	// Require the cat to have nearly stopped before engaging. Coming straight out of
+	// movement there is a window where SpeedType==Idle but the body is still sliding;
+	// if we forced SpeedType=Turn during it, the Locomotion SM (which has no direct
+	// Move->Turn edge) would stay stuck in Move and rotate with no footwork. Gating on
+	// near-zero speed lets Move->Idle finish first, so the following Idle->Turn shows
+	// the BS1_Cat_Turn footwork — and it reads naturally as "settle, then turn".
+	constexpr float TurnEngageMaxSpeed = 10.0f;   // cm/s
 	const bool bCanTurn = (SpeedType == ECatMoveType::Idle)
-		&& (MovementStage == ECatMovementStage::OnGround);
+		&& (MovementStage == ECatMovementStage::OnGround)
+		&& (Speed < TurnEngageMaxSpeed);
 
 	// Hysteresis: a deliberate offset (TurnInPlaceThreshold) engages the turn; it stays
 	// engaged until the body is nearly aligned, so it neither quits short nor chatters at
