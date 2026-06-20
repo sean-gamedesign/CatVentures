@@ -200,6 +200,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")
 	TObjectPtr<UAnimMontage> SwatMontage;
 
+	// ── Turn-In-Place (procedural) ──────────────────────────────────────
+	/** AimYaw (deg) beyond which an idle cat rotates in place to face the camera. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Turn In Place", meta = (ClampMin = "10.0", ClampMax = "120.0"))
+	float TurnInPlaceThreshold = 50.0f;
+
 	// ── Interaction ─────────────────────────────────────────────────────
 
 	/** How far forward (cm) the interaction sphere trace reaches. */
@@ -375,6 +380,10 @@ protected:
 
 	/** Fires on IA_Swat Started — local prediction + Server RPC. */
 	void TriggerSwat();
+
+	// ── Turn-In-Place ───────────────────────────────────────────────────
+	/** When idle, procedurally rotates the body toward the camera and drives the BS1_Cat_Turn footwork. */
+	void UpdateTurnInPlace();
 
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
@@ -678,6 +687,9 @@ private:
 	UFUNCTION()
 	void OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted);
 
+	/** True while a procedural turn-in-place is engaged (hysteresis flag; see UpdateTurnInPlace). */
+	bool bIsTurningInPlace = false;
+
 	/** Fires when PhysicsBumper overlaps a PhysicsBody. Applies BumperPushForce on authority. */
 	UFUNCTION()
 	void OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
@@ -735,10 +747,6 @@ private:
 
 	/** The physics component currently held. Valid only on authority while bIsGrabbing. */
 	TWeakObjectPtr<UPrimitiveComponent> GrabbedComponent;
-
-	// ── Turn Commitment & Lean ──────────────────────────────────────
-	FRotator TargetTurnRotation = FRotator::ZeroRotator;
-	float PreviousYaw = 0.0f;
 
 	/** Previous-frame horizontal speed, for the accel-lean velocity derivative. */
 	float PreviousLeanSpeed = 0.0f;

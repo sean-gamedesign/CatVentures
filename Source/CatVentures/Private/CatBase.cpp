@@ -247,54 +247,9 @@ void ACatBase::Tick(float DeltaTime)
 		UpdateGrab(DeltaTime);
 	}
 
-	// ── Turn-In-Place Rotation Commitment ─────────────────────────────
-	// Runs BEFORE cosmetic interp so next frame's AimYaw sees the
-	// already-committed actor rotation — eliminates one-frame snap.
-	if (UCharacterMovementComponent* CMC_Mut = GetCharacterMovement())
-	{
-		// Commit rotation when bGoTurn is active.
-		// Two roles need this:
-		//   1. Local client (IsLocallyControlled) — for instant prediction
-		//   2. Server copy of client pawn (HasAuthority && !IsLocallyControlled) — so the
-		//      authoritative actor rotation matches the turn animation, preventing pop.
-		// Simulated proxies receive the replicated rotation automatically.
-		const bool bIsLocalTurn  = bGoTurn && IsLocallyControlled();
-		const bool bIsServerTurn = bGoTurn && HasAuthority() && !IsLocallyControlled();
-
-		if (bIsLocalTurn || bIsServerTurn)
-		{
-			CMC_Mut->bOrientRotationToMovement = false;
-			bIsCommittingTurn = true;
-
-			// Fresh target every frame — tracks the live camera yaw.
-			// GetControlRotation() is valid on both:
-			//   - Client: local PlayerController
-			//   - Server: the owning PlayerController exists server-side,
-			//     ControlRotation is updated via CMC packed movement RPCs.
-			TargetTurnRotation = FRotator(0.0f, GetControlRotation().Yaw, 0.0f);
-			const FRotator CurrentRotation = GetActorRotation();
-			// RInterpTo takes the shortest path across ±180° — prevents 360° death spins
-			const FRotator NewRotation = FMath::RInterpTo(CurrentRotation, TargetTurnRotation, DeltaTime, 5.0f);
-			SetActorRotation(NewRotation);
-
-			UE_LOG(LogCatVentures, Verbose, TEXT("[%s] CommitTurn -- Cur: %.1f | Tgt: %.1f | New: %.1f | Role: %s"),
-				*GetName(), CurrentRotation.Yaw, TargetTurnRotation.Yaw, NewRotation.Yaw,
-				IsLocallyControlled() ? TEXT("Local") : TEXT("Server"));
-		}
-		else if (bIsCommittingTurn)
-		{
-			// Only restore auto-rotation if a grab is not active — grab holds its own
-			// lock on bOrientRotationToMovement and restores it on release.
-			if (!bIsGrabbing)
-			{
-				CMC_Mut->bOrientRotationToMovement = true;
-			}
-			bIsCommittingTurn = false;
-
-			UE_LOG(LogCatVentures, Verbose, TEXT("[%s] CommitTurn -- Finished, restored bOrientRotationToMovement"),
-				*GetName());
-		}
-	}
+	// Turn-in-place is now driven by root-motion turn montages (see TryTurnInPlace),
+	// not a procedural rotation commitment — the montage's root motion rotates the actor
+	// with real footwork. (The old CommitTurn RInterpTo block was removed.)
 
 	// ── Cosmetic: skip on dedicated server (no visuals) ───────────
 	if (GetNetMode() != NM_DedicatedServer)
@@ -444,6 +399,85 @@ void ACatBase::PlaySwatMontageAndBindEnd()
 void ACatBase::OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 {
 	bIsSwatting = false;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Turn-In-Place (root-motion montages) ──────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Procedural turn-in-place (Fab-kit model): when the camera turns away from a
+// stationary cat, rotate the BODY toward the camera at a capped rate and drive the
+// in-place BS1_Cat_Turn footwork via TurnRateAnim. Rotation is by shortest signed
+// angle — so there is no ±180 wrap and no multi-second catch-up; the cat tracks the
+// camera continuously. Owner-only; proxies get bGoTurn + TurnRateAnim (replicated)
+// plus the replicated body rotation, and enter the Turn state via the else-branch
+// of UpdateAnimationStates.
+
+void ACatBase::UpdateTurnInPlace()
+{
+	if (!IsLocallyControlled()) return;
+
+	const float DeltaTime  = DeltaTimeCached;
+	const float DesiredYaw = GetControlRotation().Yaw;
+	const float CurrentYaw = GetActorRotation().Yaw;
+	const float DeltaToCam = FRotator::NormalizeAxis(DesiredYaw - CurrentYaw);
+
+	const bool bCanTurn = (SpeedType == ECatMoveType::Idle)
+		&& (MovementStage == ECatMovementStage::OnGround);
+
+	// Hysteresis: a deliberate offset (TurnInPlaceThreshold) engages the turn; it stays
+	// engaged until the body is nearly aligned, so it neither quits short nor chatters at
+	// the threshold. bIsTurningInPlace is the engaged flag.
+	constexpr float DisengageAngle = 4.0f;
+	if (!bCanTurn)
+	{
+		bIsTurningInPlace = false;
+	}
+	else if (bIsTurningInPlace)
+	{
+		if (FMath::Abs(DeltaToCam) <= DisengageAngle) bIsTurningInPlace = false;
+	}
+	else if (FMath::Abs(DeltaToCam) >= TurnInPlaceThreshold)
+	{
+		bIsTurningInPlace = true;
+	}
+
+	float TargetTurnRate = 0.0f;
+	if (bIsTurningInPlace)
+	{
+		// Rotate the capsule toward the camera by the shortest signed path, capped per
+		// frame. FixedTurn clamps the final step to the remaining angle, so the rotation
+		// eases out naturally as it lands on target — and it can never wrap the wrong way.
+		constexpr float TurnSpeedDegPerSec = 150.0f;
+		const float NewYaw       = FMath::FixedTurn(CurrentYaw, DesiredYaw, TurnSpeedDegPerSec * DeltaTime);
+		const float AppliedDelta = FRotator::NormalizeAxis(NewYaw - CurrentYaw);
+		SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
+
+		// Footwork blend param for BS1_Cat_Turn: signed, normalized so a full-speed turn
+		// reads as ±1 (the 90° step) and the ease-out near target settles toward 0 (idle).
+		const float AppliedRate = (DeltaTime > KINDA_SMALL_NUMBER) ? AppliedDelta / DeltaTime : 0.0f;
+		TargetTurnRate = FMath::Clamp(AppliedRate / TurnSpeedDegPerSec, -1.0f, 1.0f);
+
+		SpeedType = ECatMoveType::Turn;   // drive the AnimBP Locomotion Turn state
+	}
+
+	// Ease the blend param so the footwork fades in/out instead of popping.
+	constexpr float TurnRateInterpSpeed = 10.0f;
+	TurnRateAnim = FMath::FInterpTo(TurnRateAnim, TargetTurnRate, DeltaTime, TurnRateInterpSpeed);
+
+	// Replicate the turn to other machines via the existing RPC infra: proxies enter the
+	// Turn state from bGoTurn (else-branch) and read the replicated TurnRateAnim. On the
+	// listen-server host (authority) these writes are already authoritative.
+	if (bGoTurn != bIsTurningInPlace)
+	{
+		bGoTurn = bIsTurningInPlace;
+		if (!HasAuthority()) Server_SetTurnActive(bIsTurningInPlace);
+	}
+	if (FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f)
+	{
+		LastSentTurnRateAnim = TurnRateAnim;
+		if (!HasAuthority()) Server_SetTurnRate(TurnRateAnim);
+	}
 }
 
 void ACatBase::BeginSwatTrace(USkeletalMeshComponent* MeshComp, FName SocketName)
@@ -947,44 +981,12 @@ void ACatBase::UpdateAnimationStates()
 		AimPitch = FRotator::NormalizeAxis(GetControlRotation().Pitch);
 		AimPitchClamped = FMath::Clamp(AimPitch, -90.0f, 90.0f);
 
-		// (f3) Turn-In-Place detection (hysteresis unchanged)
-		const bool bWasTurning = bGoTurn;
-		if (SpeedType == ECatMoveType::Idle
-			&& MovementStage == ECatMovementStage::OnGround
-			&& FMath::Abs(AimYaw) > 40.0f)
-		{
-			bGoTurn = true;
-			SpeedType = ECatMoveType::Turn;
-		}
-		else if (FMath::Abs(AimYaw) < 10.0f)
-		{
-			bGoTurn = false;
-		}
+		// (f3) Turn-In-Place — when idle, procedurally rotate the body toward the camera
+		// and drive the BS1_Cat_Turn footwork (sets SpeedType=Turn, bGoTurn, TurnRateAnim).
+		UpdateTurnInPlace();
 
-		// (f4) TurnRateAnim
-		TurnRateAnim = FMath::GetMappedRangeValueClamped(
-			FVector2D(-90.0f, 90.0f), FVector2D(-1.0f, 1.0f), AimYaw);
-
-		// ── Client → Server RPC: send turn state so server can replicate it out ──
-		// Reliable edge-trigger for state; unreliable delta-trigger for blendspace.
-		if (!HasAuthority())
-		{
-			// Reliable edge-trigger: guaranteed ordered delivery for state flips
-			if (bGoTurn != bWasTurning)
-			{
-				Server_SetTurnActive(bGoTurn);
-			}
-
-			// Unreliable delta-trigger: smooth blendspace updates during active turn
-			if (bGoTurn && FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f)
-			{
-				Server_SetTurnRate(TurnRateAnim);
-				LastSentTurnRateAnim = TurnRateAnim;
-			}
-		}
-
-		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AimYaw: %.1f | bGoTurn: %d | TurnRateAnim: %.3f"),
-			*GetName(), AimYaw, bGoTurn, TurnRateAnim);
+		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AimYaw: %.1f | TurningInPlace: %d"),
+			*GetName(), AimYaw, bIsTurningInPlace);
 	}
 	else
 	{
