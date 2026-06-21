@@ -613,9 +613,13 @@ protected:
 	float AccelLeanDamping = 14.0f;
 
 	// ── Foot IK (quadruped ground placement) ────────────────────────────
-	/** Master switch for quadruped foot-IK ground placement. */
+	/** Master switch for quadruped foot-IK ground placement. Header default is FALSE:
+	 *  foot IK is shelved, and a Blueprint override of an inherited C++ default does NOT
+	 *  reliably propagate to spawned pawns (project gotcha) — so the C++ default is what
+	 *  the pawn actually runs. Leaving this true meant foot IK was silently active on
+	 *  landings (paws penetrating then rising to conform), despite the BP showing it off. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
-	bool bEnableFootIK = true;
+	bool bEnableFootIK = false;
 
 	/** Draw the per-paw ground traces + hit points for tuning/debugging. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
