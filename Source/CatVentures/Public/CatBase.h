@@ -190,6 +190,21 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
 	float MinFallTransitionHoldTime = 0.05f;
 
+	/** Predictive landing (AnimX pass Step 2, kit "bGoLand" port): while falling, a trace runs
+	 *  ahead along velocity; on a predicted ground hit the ANIM-facing phase (AnimJumpPhase)
+	 *  enters Land before physical impact, so the land clip's crouch-prep plays pre-contact.
+	 *  Lookahead is TIME-based (distance = |Velocity| × time) because our asymmetric-gravity
+	 *  descent (GravityScaleFalling 5.5, impacts up to ~900 cm/s) is far faster than the kit's
+	 *  −800 default — the kit's fixed 30/50 uu works out to roughly these windows at its speeds.
+	 *  Moving lands (Land_run) want less anticipation than standstill lands (Land_stop, which
+	 *  crouch-preps), mirroring the kit's 30 (moving) vs 50 (stopping). Header-only defaults. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float LandPredictTimeMoving = 0.08f;
+
+	/** Standstill-landing lookahead window (seconds). See LandPredictTimeMoving. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Jump Tuning", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float LandPredictTimeStopping = 0.12f;
+
 	// ── Combat — The Swat ──────────────────────────────────────────────
 
 	/** Impulse (kg·cm/s) applied to physics objects hit by the swat.
@@ -335,6 +350,23 @@ protected:
 
 	/** Derives JumpPhase from CMC velocity and movement mode. Called from UpdateAnimationStates(). */
 	void UpdateJumpPhase(float DeltaTime);
+
+	/** Predictive landing trace (Fall phase only): sets bLandPredicted when ground lies within
+	 *  |Velocity| × LandPredictTime along the fall path. Skipped on dedicated servers. */
+	void UpdateLandPrediction();
+
+	/** Integrates the landing-cushion spring and applies it to the mesh's relative Z.
+	 *  Runs in the cosmetic tick block (non-dedicated only), BEFORE UpdateFootIK so the
+	 *  dipped paw positions are what the foot-IK traces see (paws pushed into the ground
+	 *  get snap-lifted the same frame -> legs compress). */
+	void UpdateLandCushion(float DeltaTime);
+
+	/** Landing-cushion spring state (cm, cm/s) — mesh rel-Z offset from MeshCushionBaseZ. */
+	float MeshCushionOffset = 0.0f;
+	float MeshCushionVelocity = 0.0f;
+
+	/** The mesh's authored relative Z, captured in BeginPlay; the cushion offsets from this. */
+	float MeshCushionBaseZ = 0.0f;
 
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
@@ -631,6 +663,35 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
 	bool bFootIKDebugDraw = false;
 
+	// ── Landing cushion — mesh-Z spring (AnimX pass Step 4) ─────────────
+	/** Master switch for the landing cushion: a damped vertical spring on the mesh's relative Z.
+	 *  Landed() kicks the spring down proportional to impact speed; the BODY dips and recovers
+	 *  while the (upward-only) foot IK keeps the PAWS planted — so the legs visibly compress
+	 *  and act like springs absorbing the landing weight, replacing authored crouch/splay
+	 *  poses as the source of landing weight. Code port of the kit's HeightFixer physics rig
+	 *  (migration doc §1.6: replace the simulated sphere+constraint with a code spring).
+	 *  Cosmetic + local (every non-dedicated machine); never replicated. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
+	bool bEnableLandCushion = true;
+
+	/** Max body dip (cm) the cushion can produce (kit constraint limit was ±10). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0", ClampMax = "20.0"))
+	float LandCushionMaxDip = 10.0f;
+
+	/** Dip depth per unit of impact speed (cm of dip per cm/s of |Vz|). 0.01 → a 900 cm/s
+	 *  landing targets a 9 cm dip; a soft step-off barely registers. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0", ClampMax = "0.1"))
+	float LandCushionDipPerImpact = 0.01f;
+
+	/** Spring frequency (rad/s) — higher = snappier compress/recover. 14 ≈ peak dip ~0.07 s
+	 *  after impact, settled in ~0.3 s (inside the land recovery window). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "4.0", ClampMax = "40.0"))
+	float LandCushionFrequency = 14.0f;
+
+	/** Damping ratio: 1 = no rebound; <1 = slight springy overshoot on recovery. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.3", ClampMax = "1.5"))
+	float LandCushionDampingRatio = 0.85f;
+
 	/** Ground-trace start height above each paw (cm). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0"))
 	float FootIKTraceUpDistance = 25.0f;
@@ -664,6 +725,19 @@ protected:
 	/** Master foot-IK blend [0..1]; eased to 0 while airborne so the legs free up for the jump. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float FootIKAlpha = 0.0f;
+
+	/** True while falling and the lookahead trace predicts ground contact within the window
+	 *  (see LandPredictTimeMoving/Stopping). Local + cosmetic — recomputed every frame on
+	 *  every non-dedicated machine in UpdateJumpPhase; cleared when leaving the Fall phase. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bLandPredicted = false;
+
+	/** The ANIM-facing jump phase the ABP consumes (via Anim_JumpPhase): equals the replicated
+	 *  gameplay JumpPhase except it anticipates Land while falling with a positive landing
+	 *  prediction (bLandPredicted). Local + cosmetic, derived every frame — gameplay (recovery
+	 *  timer, cooldown, gravity, foot-IK landing snap) stays anchored to the real JumpPhase. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	ECatJumpPhase AnimJumpPhase = ECatJumpPhase::None;
 
 	/** True while the capsule is being procedurally rotated to commit a turn-in-place. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")

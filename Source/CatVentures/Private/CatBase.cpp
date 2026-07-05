@@ -115,6 +115,12 @@ void ACatBase::BeginPlay()
 	CameraBoom->bEnableCameraRotationLag = bEnableCameraRotationLag;
 	CameraBoom->CameraRotationLagSpeed   = CameraRotationLagSpeed;
 
+	// Landing cushion: remember the mesh's authored relative Z — the spring offsets from it.
+	if (const USkeletalMeshComponent* MeshComp = GetMesh())
+	{
+		MeshCushionBaseZ = MeshComp->GetRelativeLocation().Z;
+	}
+
 	// Apply movement + jump tuning UPROPERTYs to the CMC. The constructor bakes the
 	// C++ defaults into the CMC subobject BEFORE Blueprint property serialization, so
 	// per-instance overrides on PrimeCatBase only take effect if re-applied here.
@@ -255,6 +261,7 @@ void ACatBase::Tick(float DeltaTime)
 	if (GetNetMode() != NM_DedicatedServer)
 	{
 		UpdateCosmeticInterpolation(DeltaTime);
+		UpdateLandCushion(DeltaTime);   // before foot IK: the IK traces must see the dipped paws
 		UpdateFootIK(DeltaTime);
 	}
 
@@ -1110,6 +1117,54 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// ── UpdateLandCushion ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Damped vertical spring on the mesh's relative Z (AnimX pass Step 4 — the code
+// replacement for the kit's HeightFixer physics rig). Landed() injects a downward
+// velocity scaled by impact speed; this integrates the spring back to rest. The dip
+// pushes the paws into the ground, and the upward-only foot IK (which runs right
+// after this, same frame) snap-lifts them onto the surface — so the BODY dips while
+// the PAWS stay planted and the legs visibly compress like springs taking the weight.
+// Cosmetic and local: runs on every non-dedicated machine, never replicated.
+void ACatBase::UpdateLandCushion(float DeltaTime)
+{
+	USkeletalMeshComponent* MeshComp = GetMesh();
+	if (!MeshComp) return;
+
+	if (!bEnableLandCushion)
+	{
+		MeshCushionOffset = MeshCushionVelocity = 0.0f;
+		return;
+	}
+
+	// Nothing to do once settled (avoids per-tick transform writes at rest).
+	if (FMath::Abs(MeshCushionOffset) < 0.01f && FMath::Abs(MeshCushionVelocity) < 0.1f)
+	{
+		if (MeshCushionOffset != 0.0f)
+		{
+			MeshCushionOffset = MeshCushionVelocity = 0.0f;
+			FVector Rel = MeshComp->GetRelativeLocation();
+			Rel.Z = MeshCushionBaseZ;
+			MeshComp->SetRelativeLocation(Rel);
+		}
+		return;
+	}
+
+	// Semi-implicit damped spring toward offset 0. Substep-free: at ω≤40 and game
+	// framerates the integration is comfortably stable.
+	const float W = LandCushionFrequency;
+	const float Accel = (-W * W * MeshCushionOffset) - (2.0f * LandCushionDampingRatio * W * MeshCushionVelocity);
+	MeshCushionVelocity += Accel * DeltaTime;
+	MeshCushionOffset = FMath::Clamp(MeshCushionOffset + MeshCushionVelocity * DeltaTime,
+	                                 -LandCushionMaxDip, LandCushionMaxDip * 0.25f);
+
+	FVector Rel = MeshComp->GetRelativeLocation();
+	Rel.Z = MeshCushionBaseZ + MeshCushionOffset;
+	MeshComp->SetRelativeLocation(Rel);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // ── UpdateFootIK ──────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 //
@@ -1282,6 +1337,12 @@ void ACatBase::SetJumpPhase(ECatJumpPhase NewPhase)
 {
 	if (JumpPhase == NewPhase) return;
 
+	// A landing prediction only means something while falling.
+	if (NewPhase != ECatJumpPhase::Fall)
+	{
+		bLandPredicted = false;
+	}
+
 	JumpPhase = NewPhase;
 	OnJumpPhaseChanged.Broadcast(NewPhase);
 }
@@ -1316,6 +1377,18 @@ void ACatBase::Landed(const FHitResult& Hit)
 	const float ImpactZ = FMath::Abs(GetCharacterMovement()->Velocity.Z);
 	LandImpactIntensity = FMath::Clamp(ImpactZ / HardLandSpeedThreshold, 0.0f, 1.0f);
 	LandRecoveryTimer = LandRecoveryDuration;
+
+	// Kick the landing-cushion spring: aim for DipPerImpact × impact speed of body dip.
+	// v = dip × ω × e makes a critically-damped spring peak at ≈ the target dip.
+	// Moving landings get a reduced kick: foot IK is speed-gated off at a run, so a
+	// full dip there would sink the body without planted paws (Land_run's own motion
+	// carries the weight instead).
+	if (bEnableLandCushion)
+	{
+		const float MoveScale = (Speed > 150.0f) ? 0.4f : 1.0f;
+		const float DipTarget = FMath::Min(ImpactZ * LandCushionDipPerImpact, LandCushionMaxDip) * MoveScale;
+		MeshCushionVelocity = -DipTarget * LandCushionFrequency * UE_EULERS_NUMBER;
+	}
 
 	SetJumpPhase(ECatJumpPhase::Land);
 	OnCatLanded.Broadcast(LandImpactIntensity, JumpAirTime);
@@ -1432,15 +1505,35 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 
 	const float Vz = GetVelocity().Z;
 
-	// Fall-speed signal for the fall blendspace — computed CONTINUOUSLY while descending
-	// in any airborne phase (not just Fall). If it only updated in the Fall case, the
-	// blendspace axis stayed at its apex value for the first frame of Fall and then
-	// snapped to the real value — a visible pop at the Apex->Fall handoff. Computing it
-	// here means the axis is already correct the instant Fall begins.
-	if (Vz < 0.0f && JumpPhase != ECatJumpPhase::None && JumpPhase != ECatJumpPhase::Land)
+	// Fall-pose axis for the fall blendspaces — HEIGHT-ABOVE-GROUND based (AnimX pass,
+	// Step 2 follow-up). The old |Vz|/impact-speed ratio saturated ~0.2 s into ANY fall
+	// (falling gravity 5.5), so even a standstill hop swept the whole blendspace axis and
+	// showed the Fall_low "skydive" leg-splay on the way down. Kit equivalent: "Lean Fall"
+	// from the SetMaxHight ground probe — the splay belongs to how far the cat still has
+	// to FALL, not how fast it is currently falling. The grid is symmetric (apex@0,
+	// Fall_low@0.5, apex@1; ABP feeds 1-N), so:
+	//   height <= GatherHeight -> N=1.0 (feed 0.0 -> gathered apex pose; ALL hops live here)
+	//   height >= SpreadHeight -> N=0.5 (feed 0.5 -> full Fall_low skydive)
+	// with a linear ramp between — a tall fall always gathers through the last
+	// GatherHeight of descent, so the pose is collected by touchdown. Computed
+	// continuously in every airborne phase so the axis is correct the instant Fall begins.
+	if (JumpPhase != ECatJumpPhase::None && JumpPhase != ECatJumpPhase::Land)
 	{
-		const float TerminalReference = FMath::Max(LaunchVelocityZ * 1.5f, HardLandSpeedThreshold);
-		NormalizedFallSpeed = FMath::Clamp(FMath::Abs(Vz) / TerminalReference, 0.0f, 1.0f);
+		constexpr float GatherHeight = 150.0f;
+		constexpr float SpreadHeight = 350.0f;
+		float HeightAboveGround = SpreadHeight;   // no ground within reach -> treat as a high fall
+		if (GetNetMode() != NM_DedicatedServer)   // cosmetic-only signal; skip the trace headless
+		{
+			FHitResult Hit;
+			FCollisionQueryParams Params(FName(TEXT("CatFallHeight")), /*bTraceComplex*/ false, this);
+			const FVector Feet = GetCharacterMovement()->GetActorFeetLocation();
+			if (GetWorld()->LineTraceSingleByChannel(Hit, Feet, Feet - FVector(0.0f, 0.0f, SpreadHeight + 50.0f), ECC_Visibility, Params))
+			{
+				HeightAboveGround = Feet.Z - Hit.ImpactPoint.Z;
+			}
+		}
+		const float SpreadAlpha = FMath::Clamp((HeightAboveGround - GatherHeight) / (SpreadHeight - GatherHeight), 0.0f, 1.0f);
+		NormalizedFallSpeed = 1.0f - 0.5f * SpreadAlpha;
 	}
 
 	switch (JumpPhase)
@@ -1505,8 +1598,10 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	}
 	case ECatJumpPhase::Fall:
 	{
-		// Fall -> Land is handled by Landed() override, not tick.
+		// Fall -> Land (gameplay) is handled by Landed() override, not tick.
 		// NormalizedFallSpeed is updated continuously above (before the switch).
+		// The ANIM Land phase can start earlier via the landing predictor below.
+		UpdateLandPrediction();
 		break;
 	}
 	case ECatJumpPhase::Land:
@@ -1538,4 +1633,50 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		break;
 	}
 	}
+
+	// ── Anim-facing phase (predictive landing, AnimX pass Step 2) ────
+	// The ABP consumes AnimJumpPhase (not JumpPhase): identical except Land is
+	// anticipated while falling with a positive prediction, so the land clip's
+	// crouch-prep plays BEFORE impact (the kit's bGoLand behavior). Derived — never
+	// latched: if the prediction drops (slid off a lip), this reverts to Fall and
+	// the SM's Jump_Land -> Jump_Fall escape transition backs out of the land pose.
+	AnimJumpPhase = (JumpPhase == ECatJumpPhase::Fall && bLandPredicted)
+		? ECatJumpPhase::Land
+		: JumpPhase;
+}
+
+void ACatBase::UpdateLandPrediction()
+{
+	// Cosmetic-only signal — no visuals on a dedicated server, so skip the trace.
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		bLandPredicted = false;
+		return;
+	}
+
+	const FVector Vel = GetVelocity();
+	UWorld* World = GetWorld();
+	if (!World || Vel.Z >= 0.0f)
+	{
+		bLandPredicted = false;
+		return;
+	}
+
+	// Moving lands (Land_run) need less anticipation than standstill lands (Land_stop).
+	const float PredictTime = bHasMovementInput ? LandPredictTimeMoving : LandPredictTimeStopping;
+	const float LookaheadDist = Vel.Size() * PredictTime;
+	if (LookaheadDist <= KINDA_SMALL_NUMBER)
+	{
+		bLandPredicted = false;
+		return;
+	}
+
+	// Trace from the capsule's feet along the velocity direction — the same path the
+	// cat will actually travel over the lookahead window (kit: BottomLoc + Vel×30/50).
+	const FVector Start = GetCharacterMovement()->GetActorFeetLocation();
+	const FVector End   = Start + Vel.GetSafeNormal() * LookaheadDist;
+
+	FHitResult Hit;
+	FCollisionQueryParams Params(FName(TEXT("CatLandPredict")), /*bTraceComplex*/ false, this);
+	bLandPredicted = World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
 }
