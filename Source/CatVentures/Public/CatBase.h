@@ -613,20 +613,19 @@ protected:
 	float AccelLeanDamping = 14.0f;
 
 	// ── Foot IK (quadruped ground placement) ────────────────────────────
-	/** Master switch for quadruped foot-IK ground placement. DISABLED 2026-06-22 (designer
-	 *  sign-off, isolation-confirmed). The AnimGraph foot-IK chain ends in 2× engine Leg IK
-	 *  (NumBonesInLimb=4) — and the engine Leg IK CANNOT solve the cat's 4-bone DIGITIGRADE
-	 *  legs: at FootIKAlpha=1 it both WARPS the limbs (the landing "stretch/deform" bug) and
-	 *  fails to actually plant the paws (penetration persisted with it ON). A per-frame
-	 *  landing isolation (forcing FootIKAlpha=0) removed the warp entirely, proving the engine
-	 *  Leg IK was the cause — not the offsets, the lean, the inertialization, or the blendspace
-	 *  (all ruled out by logging). So it is OFF. FootIKAlpha drives the Leg IK Alpha pins, so
-	 *  bEnableFootIK=false -> FootIKAlpha stays 0 -> the Leg IK nodes pass through (no solve).
+	/** Master switch for quadruped foot-IK ground placement. RE-ENABLED 2026-07-05 at the
+	 *  AnimX-kit chain spec. The 2026-06-22 warp was NOT "engine Leg IK is unfit" — it was our
+	 *  chain definition: we solved the FRONT leg through the paw joint (IK goal VB Hand,
+	 *  NumBonesInLimb=4) and the back leg one bone too deep (n=4 past the Thigh). The kit uses
+	 *  the same engine Leg IK warp-free by never solving the front paw: front = VB Pastern goal,
+	 *  FK Pastern, n=3 (Forearm/UpperArm/Shoulder), Hand stays FK; back = VB Foot goal, n=3
+	 *  (Hook/Shin/Thigh); MaxIterations 15, MinRotationAngle 3–5°. ABP_Cat_V2 now matches that
+	 *  spec (see Saved/.Aura/plans/quadruped-ik-port.md). FootIKAlpha drives the Leg IK Alpha
+	 *  pins, so this=false -> alpha 0 -> both Leg IK nodes pass through (no solve).
 	 *  Set via the C++ header default, NOT a BP override (the inherited-default-doesn't-
-	 *  propagate gotcha). A real fix for landing penetration needs a proper quadruped IK (the
-	 *  kit's VB Pastern/Hook ModifyBones + Spline IK), NOT engine Leg IK — tracked, not done. */
+	 *  propagate gotcha). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
-	bool bEnableFootIK = false;
+	bool bEnableFootIK = true;
 
 	/** Draw the per-paw ground traces + hit points for tuning/debugging. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
@@ -649,8 +648,9 @@ protected:
 	float FootIKInterpSpeed = 15.0f;
 
 	/** Per-paw vertical ground-conform offsets (cm, mesh component up). The AnimBP feeds each to a
-	 *  Modify Bone (Add, component space, +Z) on the matching VB Hand/Foot goal — which tracks the
-	 *  live FK paw — then Leg IK solves. Additive to the stride, so it never pins the foot.
+	 *  Modify Bone (Add, component space, +Z) on the IK goal VB — front: VB Pastern (offset is
+	 *  still MEASURED at the Hand paw; lifting the pastern goal lifts the FK paw rigidly with it),
+	 *  back: VB Foot — then Leg IK solves. Additive to the stride, so it never pins the foot.
 	 *  Cosmetic, local-only (computed on every non-dedicated machine for every pawn). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float FootIKOffsetZ_HandL = 0.0f;

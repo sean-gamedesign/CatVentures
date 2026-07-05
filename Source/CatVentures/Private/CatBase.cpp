@@ -1115,9 +1115,11 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 //
 // Quadruped foot planting. For each paw we trace straight down from the animated
 // (FK) paw and publish only the VERTICAL offset needed to meet the ground. The
-// AnimBP adds that offset to the matching VB Hand/Foot goal (which tracks the live
-// FK paw) and lets Leg IK solve the chain — so the stride is fully preserved and
-// only ground conform is layered on. FootIKAlpha scales the whole effect.
+// AnimBP adds that offset to the IK goal VB (front: VB Pastern — the hand paw stays
+// FK and rides the solved pastern; back: VB Foot) and lets Leg IK solve the chain —
+// so the stride is fully preserved and only ground conform is layered on.
+// FootIKAlpha scales the whole effect. Chain spec is the AnimX kit's (n=3, never
+// through the front paw) — see Saved/.Aura/plans/quadruped-ik-port.md.
 //
 // Cosmetic and local: runs on every non-dedicated machine for every pawn (no
 // replication), so each client plants feet against its own world.
