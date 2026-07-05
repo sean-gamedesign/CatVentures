@@ -1127,10 +1127,28 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	UWorld* World = GetWorld();
 	if (!MeshComp || !World) return;
 
-	// Blend in when grounded, out while airborne. bIsOnGround is refreshed earlier
-	// this frame in UpdateAnimationStates().
-	const float TargetAlpha = (bEnableFootIK && bIsOnGround) ? 1.0f : 0.0f;
-	FootIKAlpha = FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
+	// Blend in when grounded AND moving slowly, out while airborne or running.
+	// bIsOnGround is refreshed earlier this frame in UpdateAnimationStates().
+	// The speed gate is the fix for the stretched-leg bug: foot IK is a landing/slope
+	// conform aid, and at run speed the per-paw Z offsets lag the stride and over-extend
+	// the 4-bone legs. Gating FootIKAlpha to 0 also kills the Leg IK nodes (they read it
+	// on their Alpha pin), so the legs free up entirely during a run.
+	// Ground speed (cm/s) at/above which foot IK fades fully out. 150 sits below the 400
+	// walk speed so a brisk walk keeps conform; a run drops it. constexpr (not a UPROPERTY)
+	// to keep this a Live-Coding-safe function-body change, matching UpdateTurnInPlace.
+	constexpr float FootIKMaxSpeed = 150.0f;
+	const bool bSlowEnough = Speed <= FootIKMaxSpeed;
+	const float TargetAlpha = (bEnableFootIK && bIsOnGround && bSlowEnough) ? 1.0f : 0.0f;
+
+	// Foot IK runs ONLY while grounded — never mid-air. (Pre-arming it during the fall made
+	// the Leg IK reprocess the airborne pose and stretch the legs on the way down.) To still
+	// avoid the first-grounded-frame pop, SNAP the alpha fully on at the moment of landing so
+	// the offset-snap below plants the paws on the contact frame; ease normally otherwise
+	// (e.g. decelerating into the slow-speed conform range).
+	const bool bJustLanded = (TargetAlpha > 0.0f) && (JumpPhase == ECatJumpPhase::Land) && (FootIKAlpha < 1.0f);
+	FootIKAlpha = bJustLanded
+		? 1.0f
+		: FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
 
 	// Fully blended out — let the offsets settle to zero and skip the traces.
 	if (TargetAlpha == 0.0f && FootIKAlpha < KINDA_SMALL_NUMBER)
@@ -1168,7 +1186,7 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 
 			// ── Over-extension guard ──────────────────────────────────────
 			// A downward pull on an already near-straight leg slams it to full
-			// extension (the "snap straight" pop). Walk up the 3-bone limb to find
+			// extension (the "snap straight" pop). Walk up the limb to find
 			// its root + total reach, then fade the *downward* pull out as the leg
 			// approaches full extension. Upward pulls (which bend the leg) are safe.
 			if (DesiredOffsetZ < 0.0f)
@@ -1179,7 +1197,14 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 					FName Cur = Bone;
 					FVector ChildPos = PawWorld;
 					float Reach = 0.0f;
-					for (int32 i = 0; i < 2; ++i)   // 3 bones in limb -> walk 2 parents up
+					// The cat's legs are 4-BONE limbs (digitigrade), so paw->root is 3
+					// parents — NOT the 2 a biped 3-bone leg uses:
+					//   front: Hand -> Pastern -> Forearm -> UpperArm
+					//   back : Foot -> Hook    -> Shin    -> Thigh
+					// Walking only 2 measured the lower sub-chain and never reached the
+					// limb root, so Ext was meaningless and the guard never engaged.
+					constexpr int32 LimbSegmentsToRoot = 3;   // 4-bone limb -> 3 parents
+					for (int32 i = 0; i < LimbSegmentsToRoot; ++i)
 					{
 						const int32 Ci = Ref.FindBoneIndex(Cur);
 						const int32 Pi = (Ci != INDEX_NONE) ? Ref.GetParentIndex(Ci) : INDEX_NONE;
@@ -1199,8 +1224,22 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 				}
 			}
 		}
-		DesiredOffsetZ = FMath::Clamp(DesiredOffsetZ, -FootIKTraceDownDistance, FootIKTraceUpDistance);
-		OutOffsetZ = FMath::FInterpTo(OutOffsetZ, DesiredOffsetZ, DeltaTime, FootIKInterpSpeed);
+		// Upward-only (anti-penetration) conform: lift a paw that is AT or BELOW the ground up
+		// to the surface, but NEVER pull a lifted paw DOWN. Downward pulls were stretching the
+		// hind legs on landing — the land-gather pose lifts the hind paws on purpose, and the IK
+		// was dragging them onto the floor and over-extending the limb (same root cause as the
+		// earlier run-stride stretch). Anti-penetration is all this game needs (landings + the
+		// uphill side of slopes); a lifted paw simply keeps its animated position.
+		DesiredOffsetZ = FMath::Clamp(DesiredOffsetZ, 0.0f, FootIKTraceUpDistance);
+
+		// Snap (don't smooth) when the paw is BELOW the ground: a landing paw is lifted to the
+		// surface on the contact frame instead of easing up over ~0.2s. That ease-up was the
+		// "slow paw rise with no animation" on landings. Smooth interp otherwise, so idle/slope
+		// micro-adjustments stay soft.
+		const bool bPenetrating = bHit && (PawWorld.Z < Hit.ImpactPoint.Z);
+		OutOffsetZ = bPenetrating
+			? DesiredOffsetZ
+			: FMath::FInterpTo(OutOffsetZ, DesiredOffsetZ, DeltaTime, FootIKInterpSpeed);
 
 		if (bFootIKDebugDraw)
 		{

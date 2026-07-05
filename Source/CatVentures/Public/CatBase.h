@@ -613,11 +613,18 @@ protected:
 	float AccelLeanDamping = 14.0f;
 
 	// ── Foot IK (quadruped ground placement) ────────────────────────────
-	/** Master switch for quadruped foot-IK ground placement. Header default is FALSE:
-	 *  foot IK is shelved, and a Blueprint override of an inherited C++ default does NOT
-	 *  reliably propagate to spawned pawns (project gotcha) — so the C++ default is what
-	 *  the pawn actually runs. Leaving this true meant foot IK was silently active on
-	 *  landings (paws penetrating then rising to conform), despite the BP showing it off. */
+	/** Master switch for quadruped foot-IK ground placement. DISABLED 2026-06-22 (designer
+	 *  sign-off, isolation-confirmed). The AnimGraph foot-IK chain ends in 2× engine Leg IK
+	 *  (NumBonesInLimb=4) — and the engine Leg IK CANNOT solve the cat's 4-bone DIGITIGRADE
+	 *  legs: at FootIKAlpha=1 it both WARPS the limbs (the landing "stretch/deform" bug) and
+	 *  fails to actually plant the paws (penetration persisted with it ON). A per-frame
+	 *  landing isolation (forcing FootIKAlpha=0) removed the warp entirely, proving the engine
+	 *  Leg IK was the cause — not the offsets, the lean, the inertialization, or the blendspace
+	 *  (all ruled out by logging). So it is OFF. FootIKAlpha drives the Leg IK Alpha pins, so
+	 *  bEnableFootIK=false -> FootIKAlpha stays 0 -> the Leg IK nodes pass through (no solve).
+	 *  Set via the C++ header default, NOT a BP override (the inherited-default-doesn't-
+	 *  propagate gotcha). A real fix for landing penetration needs a proper quadruped IK (the
+	 *  kit's VB Pastern/Hook ModifyBones + Spline IK), NOT engine Leg IK — tracked, not done. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
 	bool bEnableFootIK = false;
 
