@@ -52,7 +52,21 @@
       "PowerShell(& \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CatVenturesEditor Win64 Development \"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\")",
       "PowerShell(Start-Process \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Binaries\\\\Win64\\\\UnrealEditor.exe\" -ArgumentList '\"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\"'; \"launched\")",
       "PowerShell($deadline=\\(Get-Date\\).AddSeconds\\(240\\); $up=$false; while\\(\\(Get-Date\\) -lt $deadline\\){ try { $c = New-Object Net.Sockets.TcpClient; $c.Connect\\('127.0.0.1',8088\\); if\\($c.Connected\\){ $up=$true; $c.Close\\(\\); break } } catch {}; Start-Sleep -Seconds 10 }; if\\($up\\){ \"VIBEUE PORT UP\" } else { \"TIMED OUT\" })",
-      "PowerShell(git add *)"
+      "PowerShell(git add *)",
+      "Bash(\"C:/Program Files/Epic Games/UE_5.7/Engine/Build/BatchFiles/Build.bat\" CatVenturesEditor Win64 Development \"C:/Projects/CatVentures/CatVentures.uproject\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" --max-time 5 http://127.0.0.1:8088/mcp)",
+      "Bash(\"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CatVenturesEditor Win64 Development \"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\")",
+      "PowerShell(git checkout -- Content/Blueprints/ABP_Cat_V2.uasset Content/PrimeCatBase.uasset Source/CatVentures/Private/CatBase.cpp Source/CatVentures/Public/CatBase.h)",
+      "Read(//c/Projects/CatVentures/**)",
+      "Bash(grep -iE \"patch_[0-9]+\\\\.\\(exe|dll\\)$\")",
+      "Bash(git commit -m 'feat: procedural turn-in-place \\(rotate-to-camera + BS1_Cat_Turn footwork\\) *)",
+      "Bash(git commit -m 'fix: turn-in-place plays footwork when re-facing camera after movement *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'feat: movement-aware jump anim set + smoother fall \\(jump-feel Step 1\\) *)",
+      "PowerShell($ed = Get-Process UnrealEditor -ErrorAction SilentlyContinue; if \\($ed\\) { \"EDITOR RUNNING \\(PID $\\($ed.Id\\)\\) — external build blocked; use Live Coding or close editor\" } else { \"Editor NOT running — external build OK\" }; $dll = \"C:\\\\Projects\\\\CatVentures\\\\Binaries\\\\Win64\\\\UnrealEditor-CatVentures.dll\"; if \\(Test-Path $dll\\) { \"DLL mtime: \" + \\(Get-Item $dll\\).LastWriteTime } else { \"No module DLL found\" })",
+      "PowerShell(& \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Build\\\\BatchFiles\\\\Build.bat\" CatVenturesEditor Win64 Development \"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\"; \"EXITCODE: $LASTEXITCODE\")",
+      "Bash(git commit -m 'fix: revert Step-2 squash/stretch; keep Apex-blendspace fix + foot-IK gotcha fix *)",
+      "PowerShell(git *)"
     ]
   },
   "enableAllProjectMcpServers": true,
