@@ -1052,6 +1052,58 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 	AimBSPitch = FMath::GetMappedRangeValueClamped(
 		FVector2D(-60.0f, 60.0f), FVector2D(-1.0f, 1.0f), AimPitchInterp);
 
+	// ── (B1b) Jump rise scrub ─────────────────────────────────────────
+	// 0→1 over the EXPECTED RISE TIME while in Launch; the ABP's Jump_Launch evaluators
+	// scrub each clip's rise portion with it. Runs on every non-dedicated machine.
+	// TIME-based, deliberately NOT height-based (2026-07-06): a height scrub is physically
+	// exact but unreadable — the variable-height hold front-loads ~half the height into
+	// 0.18 s, so the push-off frames flashed by as a "little leg jut" and the clip parked
+	// in its airborne tuck (read as instant falling — Sean). Motion needs uniform screen
+	// time; taps simply exit the state before the clip finishes and blend to Apex.
+	{
+		// 0..0.425 = anticipation coil (clip share of the crouch: 0.51/1.2), 0.425..1 = rise.
+		constexpr float CoilShare = 0.425f;
+		if (JumpPhase == ECatJumpPhase::Launch)
+		{
+			if (!bJumpRiseTracking)
+			{
+				JumpRiseStartZ = GetActorLocation().Z;   // kept for the per-jump rise log
+				bJumpRiseTracking = true;
+			}
+			constexpr float ExpectedRiseTime = 0.53f;    // measured full-hold launch duration
+			JumpRiseProgress = CoilShare
+				+ (1.0f - CoilShare) * FMath::Clamp(JumpAirTime / ExpectedRiseTime, 0.0f, 1.0f);
+		}
+		else if (JumpPhase == ECatJumpPhase::None && JumpAnticipationTimer > 0.0f)
+		{
+			bJumpRiseTracking = false;
+			JumpRiseProgress = CoilShare
+				* (1.0f - JumpAnticipationTimer / FMath::Max(JumpAnticipationDuration, 0.01f));
+		}
+		else
+		{
+			if (bJumpRiseTracking && JumpPhase == ECatJumpPhase::Apex)
+			{
+				// One line per jump at the Launch→Apex hand-off — Sean reads feel, this
+				// reads the numbers behind it (rise height/time and how much of the clip
+				// scrub was consumed) from the log after a PIE session.
+				UE_LOG(LogCatVentures, Log, TEXT("[%s] JumpRise: %.1f cm in %.2f s | scrub progress at apex %.2f"),
+					*GetName(), GetActorLocation().Z - JumpRiseStartZ, JumpAirTime, JumpRiseProgress);
+			}
+			bJumpRiseTracking = false;
+			// Hold 1 through Apex/Fall (the Launch state may still be blending out); reset
+			// once grounded so the next hop starts from the clip's rise start.
+			if (JumpPhase == ECatJumpPhase::None || JumpPhase == ECatJumpPhase::Land)
+			{
+				JumpRiseProgress = 0.0f;
+			}
+			else
+			{
+				JumpRiseProgress = 1.0f;
+			}
+		}
+	}
+
 	// ── (B2) Additive idle life — blink & ear-twitch pulses ──────────
 	// Kit cadence (CharBP_Base "Idles & Add Anim" config, verified 2026-07-06): blink every
 	// 3–7 s, ear twitch every 6–12 s, three equal-chance ear clips never repeated back-to-back.
@@ -1234,7 +1286,11 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 				FVector(Center.X, Center.Y, CapsuleBottomZ - ConformMaxDrop - 20.0f),
 				ECC_Visibility, Params))
 			{
-				ConformTarget = FMath::Clamp(Hit.ImpactPoint.Z - CapsuleBottomZ, -ConformMaxDrop, 0.0f);
+				// Discontinuity rejection (2026-07-06): a gap LARGER than the conformable
+				// range means a ledge/edge under the capsule center, not a slope — clamping
+				// it sank the cat 10 cm into every platform lip. Conform only within range.
+				const float Delta = Hit.ImpactPoint.Z - CapsuleBottomZ;
+				ConformTarget = (Delta >= -ConformMaxDrop) ? FMath::Min(Delta, 0.0f) : 0.0f;
 			}
 		}
 		MeshGroundConformZ = FMath::FInterpTo(MeshGroundConformZ, ConformTarget, DeltaTime, ConformInterpSpeed);
@@ -1272,9 +1328,12 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 			float FrontZ = 0.0f, BackZ = 0.0f;
 			if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
 			{
-				PitchTarget = FMath::Clamp(
-					FMath::RadiansToDegrees(FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist)),
-					-MaxSlopePitch, MaxSlopePitch);
+				// Discontinuity rejection (2026-07-06): an implied angle beyond the max
+				// slope means the probes straddle a ledge, not a slope — clamping tilted
+				// the body ±25° on every platform lip during takeoffs/landings.
+				const float RawPitch = FMath::RadiansToDegrees(
+					FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist));
+				PitchTarget = (FMath::Abs(RawPitch) <= MaxSlopePitch) ? RawPitch : 0.0f;
 			}
 		}
 		MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, PitchInterpSpeed);
@@ -1604,6 +1663,17 @@ void ACatBase::OnJumpInputPressed()
 	// Arm the jump buffer, then forward to the standard jump. If the jump can't fire
 	// right now (airborne beyond the coyote window), the buffer lets Landed() re-fire it.
 	JumpBufferTimer = JumpBufferTime;
+
+	// Standstill anticipation (2026-07-06, Sean: "all 4 legs/body coil downward and then
+	// the up happens"): a grounded, near-stationary jump plays the authored crouch for
+	// JumpAnticipationDuration before the physics launch. Running jumps stay instant —
+	// an input delay at speed would hurt platforming. The buffered retry below is gated
+	// on the timer, so nothing else fires the jump early.
+	if (JumpAnticipationDuration > 0.0f && bIsOnGround && Speed <= 200.0f && CanJump())
+	{
+		JumpAnticipationTimer = JumpAnticipationDuration;
+		return;
+	}
 	Jump();
 }
 
@@ -1734,10 +1804,23 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		JumpBufferTimer -= DeltaTime;
 	}
 
+	// Standstill-anticipation countdown: the coil plays while this runs; the launch fires
+	// the moment it expires. Runs BEFORE the buffer retry so the retry can't preempt it.
+	if (JumpAnticipationTimer > 0.0f)
+	{
+		JumpAnticipationTimer -= DeltaTime;
+		if (JumpAnticipationTimer <= 0.0f)
+		{
+			JumpAnticipationTimer = 0.0f;
+			Jump();
+		}
+	}
+
 	// Per-frame buffer retry: a buffered press keeps trying until the jump is legal
 	// (covers taps eaten by a same-frame release, land-recovery, and cooldown). OnJumped
-	// clears the buffer on success, so exactly one jump fires per press.
-	if (JumpBufferTimer > 0.0f && IsLocallyControlled() && CanJump())
+	// clears the buffer on success, so exactly one jump fires per press. Held off while
+	// the anticipation coil is playing.
+	if (JumpBufferTimer > 0.0f && JumpAnticipationTimer <= 0.0f && IsLocallyControlled() && CanJump())
 	{
 		Jump();
 	}
@@ -1771,8 +1854,13 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	// continuously in every airborne phase so the axis is correct the instant Fall begins.
 	if (JumpPhase != ECatJumpPhase::None && JumpPhase != ECatJumpPhase::Land)
 	{
-		constexpr float GatherHeight = 150.0f;
-		constexpr float SpreadHeight = 350.0f;
+		// Raised from 150/350 (2026-07-06): those were tuned in the 125 cm tap-jump era —
+		// a HELD jump apexes at ~240 cm, which sat mid-ramp and blended the fall splay in
+		// right at the top of a deliberate jump (Sean's "back leg kickout at the apex").
+		// Any jump apex now stays in the gathered pose; the splay is reserved for real
+		// falls (walking off the taller JumpGym platforms).
+		constexpr float GatherHeight = 260.0f;
+		constexpr float SpreadHeight = 460.0f;
 		float HeightAboveGround = SpreadHeight;   // no ground within reach -> treat as a high fall
 		if (GetNetMode() != NM_DedicatedServer)   // cosmetic-only signal; skip the trace headless
 		{
@@ -1895,6 +1983,14 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	AnimJumpPhase = (JumpPhase == ECatJumpPhase::Fall && bLandPredicted)
 		? ECatJumpPhase::Land
 		: JumpPhase;
+
+	// Anticipation coil: the ABP enters Jump_Launch during the pre-launch crouch so the
+	// authored anticipation frames play before the physics jump fires (gameplay JumpPhase
+	// stays None until the real Jump()).
+	if (JumpPhase == ECatJumpPhase::None && JumpAnticipationTimer > 0.0f)
+	{
+		AnimJumpPhase = ECatJumpPhase::Launch;
+	}
 }
 
 void ACatBase::UpdateLandPrediction()

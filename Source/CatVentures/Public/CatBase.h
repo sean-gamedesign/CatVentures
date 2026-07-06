@@ -631,6 +631,21 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	int32 IndexEars = 0;
 
+	/** Normalized position on the standstill jump's anim timeline, 0..1 = [anticipation coil |
+	 *  rise]: 0→0.425 scrubs the authored crouch (clip 0→0.51 of A_Cat_Jump_InPlace) across the
+	 *  anticipation window, 0.425→1 scrubs the rise (clip 0.51→1.2) uniformly over the expected
+	 *  rise TIME (deliberately not height — height-faithful scrubbing compressed the push-off
+	 *  into an unreadable flash). The run branch maps only the 0.425..1 span (no coil at a run).
+	 *  Sequence Evaluators in Jump_Launch consume it via MapRangeClamped nodes. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float JumpRiseProgress = 0.0f;
+
+	/** Standstill-jump anticipation: how long the cat coils (playing the authored crouch)
+	 *  between the jump press and the actual launch. Running jumps fire instantly (an input
+	 *  delay at a run would hurt platforming). 0 disables the coil entirely. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning", meta = (ClampMin = "0.0", ClampMax = "0.3"))
+	float JumpAnticipationDuration = 0.12f;
+
 	/** Derived locally from CharacterMovement acceleration — NOT replicated. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bHasMovementInput = false;
@@ -927,4 +942,11 @@ private:
 	float EarsPulseRemaining = 0.0f;
 	/** First-tick flag: seeds the countdowns randomly so all cats don't fire in sync at spawn. */
 	bool bAdditiveTimersSeeded = false;
+
+	/** Actor Z captured on entering the Launch phase — the JumpRiseProgress baseline. */
+	float JumpRiseStartZ = 0.0f;
+	bool bJumpRiseTracking = false;
+
+	/** Counts down the standstill-jump coil; the actual Jump() fires when it expires. */
+	float JumpAnticipationTimer = 0.0f;
 };
