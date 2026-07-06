@@ -119,6 +119,7 @@ void ACatBase::BeginPlay()
 	if (const USkeletalMeshComponent* MeshComp = GetMesh())
 	{
 		MeshCushionBaseZ = MeshComp->GetRelativeLocation().Z;
+		MeshBaseRelRot   = MeshComp->GetRelativeRotation();   // the −90° rig yaw; slope pitch composes onto it
 	}
 
 	// Apply movement + jump tuning UPROPERTYs to the CMC. The constructor bakes the
@@ -1194,36 +1195,104 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	USkeletalMeshComponent* MeshComp = GetMesh();
 	if (!MeshComp) return;
 
-	if (!bEnableLandCushion)
+	// ── (A) Landing impulse spring ────────────────────────────────────
+	if (!bEnableLandCushion
+		|| (FMath::Abs(MeshCushionOffset) < 0.01f && FMath::Abs(MeshCushionVelocity) < 0.1f))
 	{
 		MeshCushionOffset = MeshCushionVelocity = 0.0f;
-		return;
 	}
-
-	// Nothing to do once settled (avoids per-tick transform writes at rest).
-	if (FMath::Abs(MeshCushionOffset) < 0.01f && FMath::Abs(MeshCushionVelocity) < 0.1f)
+	else
 	{
-		if (MeshCushionOffset != 0.0f)
-		{
-			MeshCushionOffset = MeshCushionVelocity = 0.0f;
-			FVector Rel = MeshComp->GetRelativeLocation();
-			Rel.Z = MeshCushionBaseZ;
-			MeshComp->SetRelativeLocation(Rel);
-		}
-		return;
+		// Semi-implicit damped spring toward offset 0. Substep-free: at ω≤40 and game
+		// framerates the integration is comfortably stable.
+		const float W = LandCushionFrequency;
+		const float Accel = (-W * W * MeshCushionOffset) - (2.0f * LandCushionDampingRatio * W * MeshCushionVelocity);
+		MeshCushionVelocity += Accel * DeltaTime;
+		MeshCushionOffset = FMath::Clamp(MeshCushionOffset + MeshCushionVelocity * DeltaTime,
+		                                 -LandCushionMaxDip, LandCushionMaxDip * 0.25f);
 	}
 
-	// Semi-implicit damped spring toward offset 0. Substep-free: at ω≤40 and game
-	// framerates the integration is comfortably stable.
-	const float W = LandCushionFrequency;
-	const float Accel = (-W * W * MeshCushionOffset) - (2.0f * LandCushionDampingRatio * W * MeshCushionVelocity);
-	MeshCushionVelocity += Accel * DeltaTime;
-	MeshCushionOffset = FMath::Clamp(MeshCushionOffset + MeshCushionVelocity * DeltaTime,
-	                                 -LandCushionMaxDip, LandCushionMaxDip * 0.25f);
+	// ── (B) Continuous slope ground-conform (kit HeightFixer role, 2026-07-06) ──
+	// On an incline the capsule touches the slope uphill of its center, leaving the mesh
+	// hanging above the surface directly below — the "cat floats on ramps" gap. Trace
+	// under the capsule bottom and ease the mesh down onto the surface (drop only; on
+	// flat ground the gap is ~0 and this stays inert). Runs before UpdateFootIK so the
+	// paw solve and the spine control points see the conformed body height this frame.
+	{
+		constexpr float ConformMaxDrop = 10.0f;
+		constexpr float ConformInterpSpeed = 8.0f;
+		float ConformTarget = 0.0f;
+		const UCapsuleComponent* Capsule = GetCapsuleComponent();
+		if (bIsOnGround && Capsule && GetWorld())
+		{
+			const float CapsuleBottomZ = GetActorLocation().Z - Capsule->GetScaledCapsuleHalfHeight();
+			const FVector Center = GetActorLocation();
+			FHitResult Hit;
+			FCollisionQueryParams Params(FName(TEXT("CatGroundConform")), false, this);
+			if (GetWorld()->LineTraceSingleByChannel(Hit,
+				FVector(Center.X, Center.Y, CapsuleBottomZ + 20.0f),
+				FVector(Center.X, Center.Y, CapsuleBottomZ - ConformMaxDrop - 20.0f),
+				ECC_Visibility, Params))
+			{
+				ConformTarget = FMath::Clamp(Hit.ImpactPoint.Z - CapsuleBottomZ, -ConformMaxDrop, 0.0f);
+			}
+		}
+		MeshGroundConformZ = FMath::FInterpTo(MeshGroundConformZ, ConformTarget, DeltaTime, ConformInterpSpeed);
+	}
 
+	// ── (C) Whole-body slope pitch (2026-07-06) ──────────────────────
+	// Pitch the entire mesh to the fore/aft ground slope. The Spline IK spine can't do
+	// this (the hips aren't in its chain — bending it kinks at the spine root, Sean's
+	// "weird back arch"); with the body aligned, the paw goals / spine CPs / paw rotation
+	// all reduce to micro-residuals on a uniform slope. Two probes ±30 uu along facing.
+	{
+		constexpr float ProbeDist = 30.0f;
+		constexpr float MaxSlopePitch = 25.0f;
+		constexpr float PitchInterpSpeed = 6.0f;
+		float PitchTarget = 0.0f;
+		const UCapsuleComponent* Capsule = GetCapsuleComponent();
+		if (bIsOnGround && Capsule && GetWorld())
+		{
+			const float BottomZ = GetActorLocation().Z - Capsule->GetScaledCapsuleHalfHeight();
+			const FVector Fwd = GetActorForwardVector() * ProbeDist;
+			const FVector Center = GetActorLocation();
+			auto ProbeZ = [&](const FVector& XY, float& OutZ) -> bool
+			{
+				FHitResult Hit;
+				FCollisionQueryParams Params(FName(TEXT("CatSlopePitch")), false, this);
+				if (GetWorld()->LineTraceSingleByChannel(Hit,
+					FVector(XY.X, XY.Y, BottomZ + 30.0f), FVector(XY.X, XY.Y, BottomZ - 40.0f),
+					ECC_Visibility, Params))
+				{
+					OutZ = Hit.ImpactPoint.Z;
+					return true;
+				}
+				return false;
+			};
+			float FrontZ = 0.0f, BackZ = 0.0f;
+			if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
+			{
+				PitchTarget = FMath::Clamp(
+					FMath::RadiansToDegrees(FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist)),
+					-MaxSlopePitch, MaxSlopePitch);
+			}
+		}
+		MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, PitchInterpSpeed);
+	}
+
+	// Single transform write; skip once fully at rest (avoids per-tick transform writes).
+	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ;
 	FVector Rel = MeshComp->GetRelativeLocation();
-	Rel.Z = MeshCushionBaseZ + MeshCushionOffset;
-	MeshComp->SetRelativeLocation(Rel);
+	if (FMath::Abs(TotalOffset) < 0.01f && FMath::Abs(MeshSlopePitch) < 0.05f
+		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f))
+	{
+		return;
+	}
+	Rel.Z = MeshCushionBaseZ + TotalOffset;
+	// Slope pitch is about the ACTOR's lateral axis — compose it in parent space ahead of
+	// the rig's authored relative rotation (the −90° yaw), then write both in one call.
+	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
+	MeshComp->SetRelativeLocationAndRotation(Rel, RelQuat.Rotator());
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1246,18 +1315,25 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	UWorld* World = GetWorld();
 	if (!MeshComp || !World) return;
 
-	// Blend in when grounded AND moving slowly, out while airborne or running.
+	// Blend in when grounded, out while airborne.
 	// bIsOnGround is refreshed earlier this frame in UpdateAnimationStates().
-	// The speed gate is the fix for the stretched-leg bug: foot IK is a landing/slope
-	// conform aid, and at run speed the per-paw Z offsets lag the stride and over-extend
-	// the 4-bone legs. Gating FootIKAlpha to 0 also kills the Leg IK nodes (they read it
-	// on their Alpha pin), so the legs free up entirely during a run.
-	// Ground speed (cm/s) at/above which foot IK fades fully out. 150 sits below the 400
-	// walk speed so a brisk walk keeps conform; a run drops it. constexpr (not a UPROPERTY)
-	// to keep this a Live-Coding-safe function-body change, matching UpdateTurnInPlace.
-	constexpr float FootIKMaxSpeed = 150.0f;
-	const bool bSlowEnough = Speed <= FootIKMaxSpeed;
-	const float TargetAlpha = (bEnableFootIK && bIsOnGround && bSlowEnough) ? 1.0f : 0.0f;
+	// NO speed taper (2026-07-06): the kit's 1.0→0.5-over-0..400 was tuned for its
+	// MaxWalkSpeed 250 — at our 400 a normal walk sat at the 0.5 floor, halving every
+	// terrain offset (downhill paws floated by half the reach, uphill paws penetrated by
+	// half the lift — exactly what Sean saw walking the ramp; standstill was perfect).
+	// The taper's rationale (paw-relative IK lagging the stride at speed) doesn't apply
+	// to the terrain-delta model: goals depend on ground geometry, not paw position, so
+	// they can't lag or fight the stride. Full weight whenever grounded.
+	const float TargetAlpha = (bEnableFootIK && bIsOnGround) ? 1.0f : 0.0f;
+
+	// Spine-block weight: the kit fades its Spline-IK spine 1→0 over speed 0..800 (steeper
+	// than the leg taper) and disables it in the air. Interp 10 (kit shared Interp helper).
+	{
+		const float SpineTarget = (bEnableFootIK && bIsOnGround)
+			? FMath::GetMappedRangeValueClamped(FVector2D(0.0f, 800.0f), FVector2D(1.0f, 0.0f), Speed)
+			: 0.0f;
+		SpineIKAlpha = FMath::FInterpTo(SpineIKAlpha, SpineTarget, DeltaTime, 10.0f);
+	}
 
 	// Foot IK runs ONLY while grounded — never mid-air. (Pre-arming it during the fall made
 	// the Leg IK reprocess the airborne pose and stretch the legs on the way down.) To still
@@ -1269,14 +1345,34 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		? 1.0f
 		: FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
 
-	// Fully blended out — let the offsets settle to zero and skip the traces.
+	// Fully blended out — settle every output to neutral and skip the traces.
 	if (TargetAlpha == 0.0f && FootIKAlpha < KINDA_SMALL_NUMBER)
 	{
 		FootIKOffsetZ_HandL = FootIKOffsetZ_HandR = FootIKOffsetZ_FootL = FootIKOffsetZ_FootR = 0.0f;
+		FootIKRot_HandL = FootIKRot_HandR = FootIKRot_FootL = FootIKRot_FootR = FRotator::ZeroRotator;
+		SpineInclineF = FMath::FInterpTo(SpineInclineF, 1.0f, DeltaTime, 10.0f);
+		SpineInclineS = FMath::FInterpTo(SpineInclineS, 0.0f, DeltaTime, 10.0f);
+		UpTailAlpha   = FMath::GetMappedRangeValueClamped(FVector2D(1.0f, 1.2f), FVector2D(0.0f, 0.3f), SpineInclineF);
+		PelvisDropZ = FMath::FInterpTo(PelvisDropZ, 0.0f, DeltaTime, 10.0f);
+		ChestDropZ  = FMath::FInterpTo(ChestDropZ,  0.0f, DeltaTime, 10.0f);
 		return;
 	}
 
-	auto SolveFoot = [&](const FName Bone, float& OutOffsetZ)
+	// Per-paw solve results the spine/incline block below aggregates.
+	struct FPawSolve
+	{
+		bool  bValidFloor = false;
+		float FloorZ = 0.0f;        // trace impact Z (world)
+		float GroundDeltaZ = 0.0f;  // ground under the paw relative to the capsule contact plane (<0 = downhill)
+	};
+	FPawSolve PawHandL, PawHandR, PawFootL, PawFootR;
+
+	// Capsule contact plane — terrain deltas and the stance fade are measured against this.
+	const UCapsuleComponent* Capsule = GetCapsuleComponent();
+	const float ActorGroundZ = GetActorLocation().Z
+		- (Capsule ? Capsule->GetScaledCapsuleHalfHeight() : 0.0f);
+
+	auto SolveFoot = [&](const FName Bone, float& OutOffsetZ, FRotator& OutRot, FPawSolve& OutSolve)
 	{
 		const FVector PawWorld = MeshComp->GetSocketLocation(Bone);
 		const FVector Start    = PawWorld + FVector(0.0f, 0.0f, FootIKTraceUpDistance);
@@ -1286,22 +1382,54 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		FCollisionQueryParams Params(FName(TEXT("CatFootIK")), /*bTraceComplex*/ false, this);
 		const bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
 
-		// Vertical-only correction toward the ground.
+		// Vertical-only correction, KIT MODEL (2026-07-06): the primary term is the pure
+		// TERRAIN DELTA (ground under the paw vs the capsule contact plane) — it depends
+		// only on geometry, so there is no feedback through the solved pose. (Both a
+		// direct paw-error target and an integrator were tried on the 20° ramp first:
+		// the paw error is measured on the POST-IK pose, so direct targeting converges
+		// to half the lift and integrating winds up when Leg IK hits the fold limit.)
+		// A direct anti-penetration lift is kept as a second term for the landing/cushion
+		// dips the terrain term can't see; max() of the two applies whichever matters.
 		float DesiredOffsetZ = 0.0f;
+		FRotator RotTarget = FRotator::ZeroRotator;
 		if (bHit)
 		{
+			// Direct paw residual (2026-07-06 final form): with the whole-body slope pitch +
+			// ground conform doing the COARSE alignment (UpdateLandCushion §B/§C), the paw
+			// offsets are small residuals again (≤ a few cm), so the direct measurement is
+			// valid — its post-IK feedback halves the correction, which is invisible at this
+			// magnitude (it only mattered when offsets carried the full 12 cm slope delta;
+			// that era's terrain-delta model is superseded by the body pitch). No swing fade:
+			// residuals this small can't yank a swinging paw visibly, and both fade bases
+			// break one slope direction (local-ground kills downhill, capsule-plane uphill).
 			DesiredOffsetZ = (Hit.ImpactPoint.Z + FootIKPawHeight) - PawWorld.Z;
 
-			// ── Swing-phase gate ──────────────────────────────────────────
-			// Only conform a paw that's near the ground (stance). As the paw lifts
-			// through its stride (swing), fade the offset to zero so the solver never
-			// yanks a swinging foot back down — that yank was the per-stride pop.
-			// Full IK below FadeLow cm above ground; zero IK above FadeHigh cm.
-			const float FootAboveGround = FMath::Max(PawWorld.Z - Hit.ImpactPoint.Z, 0.0f);
-			const float FadeLow  = 2.0f;
-			const float FadeHigh = 10.0f;
-			const float Fade = 1.0f - FMath::Clamp((FootAboveGround - FadeLow) / (FadeHigh - FadeLow), 0.0f, 1.0f);
-			DesiredOffsetZ *= Fade;
+			// Capture for the spine/incline aggregation. The pelvis/chest drop uses the GROUND
+			// height under the paw relative to the capsule's contact plane (kit CompBP model:
+			// "floor loc = paw XY at Root Z") — NOT the paw-to-ground distance. A back paw
+			// floating over the downhill side mid-stride must still report the full ground
+			// drop, and the swing fade below must not shrink it (that fade zeroed the drop
+			// signal and left the back legs floating on ramps — found by Sean 2026-07-06).
+			OutSolve.bValidFloor = true;
+			OutSolve.FloorZ = Hit.ImpactPoint.Z;
+			OutSolve.GroundDeltaZ = Hit.ImpactPoint.Z - ActorGroundZ;
+
+			// ── Paw rotation from the surface normal (kit SetToeRot) ──────
+			// Normal into MESH COMPONENT space — the ABP applies these as component-space
+			// additive rotations, and the mesh component is yawed −90° from the actor, so
+			// actor/world axes would mix roll into pitch. Kit formula on component axes:
+			// Roll = atan2(N.Y, N.Z), Pitch = −atan2(N.X, N.Z). Faded by proximity to the
+			// LOCAL surface — a paw only conforms its rotation when it's near the ground
+			// it would be standing on (a swinging or gathered paw stays neutral).
+			const float PawAboveLocal = FMath::Max(PawWorld.Z - Hit.ImpactPoint.Z, 0.0f);
+			const float RotFade = 1.0f - FMath::Clamp((PawAboveLocal - 2.0f) / 8.0f, 0.0f, 1.0f);
+			const FVector N = MeshComp->GetComponentTransform().InverseTransformVectorNoScale(Hit.ImpactNormal);
+			const float RollDeg  = FMath::RadiansToDegrees(FMath::Atan2(N.Y, N.Z));
+			const float PitchDeg = -FMath::RadiansToDegrees(FMath::Atan2(N.X, N.Z));
+			RotTarget = FRotator(
+				FMath::ClampAngle(PitchDeg, -45.0f, 45.0f) * RotFade,
+				0.0f,
+				FMath::ClampAngle(RollDeg, -45.0f, 45.0f) * RotFade);
 
 			// ── Over-extension guard ──────────────────────────────────────
 			// A downward pull on an already near-straight leg slams it to full
@@ -1342,14 +1470,15 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 					}
 				}
 			}
+
 		}
-		// Upward-only (anti-penetration) conform: lift a paw that is AT or BELOW the ground up
-		// to the surface, but NEVER pull a lifted paw DOWN. Downward pulls were stretching the
-		// hind legs on landing — the land-gather pose lifts the hind paws on purpose, and the IK
-		// was dragging them onto the floor and over-extending the limb (same root cause as the
-		// earlier run-stride stretch). Anti-penetration is all this game needs (landings + the
-		// uphill side of slopes); a lifted paw simply keeps its animated position.
-		DesiredOffsetZ = FMath::Clamp(DesiredOffsetZ, 0.0f, FootIKTraceUpDistance);
+		// Bound by the trace window; the downhill reach can never exceed the real terrain
+		// drop below the capsule plane (on flat ground the lower bound is 0 — a paw lifted
+		// by the stride or the land-gather pose is never yanked to the floor; the June bug
+		// the old upward-only rule fixed stays fixed).
+		const float DownhillReach = FMath::Min(OutSolve.GroundDeltaZ + FootIKPawHeight, 0.0f);
+		DesiredOffsetZ = FMath::Clamp(DesiredOffsetZ,
+			FMath::Max(DownhillReach, -FootIKTraceDownDistance), FootIKTraceUpDistance);
 
 		// Snap (don't smooth) when the paw is BELOW the ground: a landing paw is lifted to the
 		// surface on the contact frame instead of easing up over ~0.2s. That ease-up was the
@@ -1359,6 +1488,10 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		OutOffsetZ = bPenetrating
 			? DesiredOffsetZ
 			: FMath::FInterpTo(OutOffsetZ, DesiredOffsetZ, DeltaTime, FootIKInterpSpeed);
+
+		// Surface-conform rotation eases at the kit's RInterp speed 30 (both in and out —
+		// a missed trace interps back to zero rather than snapping).
+		OutRot = FMath::RInterpTo(OutRot, RotTarget, DeltaTime, 30.0f);
 
 		if (bFootIKDebugDraw)
 		{
@@ -1370,10 +1503,67 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		}
 	};
 
-	SolveFoot(TEXT("Hand_L"), FootIKOffsetZ_HandL);
-	SolveFoot(TEXT("Hand_R"), FootIKOffsetZ_HandR);
-	SolveFoot(TEXT("Foot_L"), FootIKOffsetZ_FootL);
-	SolveFoot(TEXT("Foot_R"), FootIKOffsetZ_FootR);
+	SolveFoot(TEXT("Hand_L"), FootIKOffsetZ_HandL, FootIKRot_HandL, PawHandL);
+	SolveFoot(TEXT("Hand_R"), FootIKOffsetZ_HandR, FootIKRot_HandR, PawHandR);
+	SolveFoot(TEXT("Foot_L"), FootIKOffsetZ_FootL, FootIKRot_FootL, PawFootL);
+	SolveFoot(TEXT("Foot_R"), FootIKOffsetZ_FootR, FootIKRot_FootR, PawFootR);
+
+	// ── Spine incline + pelvis/chest drop (kit CompBP_IK_ANX math, 2026-07-06) ──
+	// Fore/aft: front-vs-back floor height over the ~80 uu hand↔foot span, mapped to the
+	// A_Cat_Add_Incline scrub (1.0 neutral ± 0.2). Side: left-vs-right over ±20 uu → |0..0.2|
+	// squat weight. All derived from the four paw traces above — no extra casts.
+	{
+		constexpr float InclineFSpan = 80.0f;    // kit "Incline F - Dis Difference" 40 × 2
+		constexpr float InclineFMult = 0.2f;
+		constexpr float InclineSSpan = 20.0f;    // kit side map ±20 uu
+		constexpr float InclineSMult = 0.2f;
+		constexpr float InclineInterp = 10.0f;   // kit shared Interp helper default
+		constexpr float MaxBodyDrop = 15.0f;     // sanity clamp on the pelvis/chest reach (cm)
+
+		const bool bFront = PawHandL.bValidFloor && PawHandR.bValidFloor;
+		const bool bBack  = PawFootL.bValidFloor && PawFootR.bValidFloor;
+
+		float TargetF = 1.0f, TargetS = 0.0f;
+		if (bFront && bBack)
+		{
+			const float FrontZ = 0.5f * (PawHandL.FloorZ + PawHandR.FloorZ);
+			const float BackZ  = 0.5f * (PawFootL.FloorZ + PawFootR.FloorZ);
+			TargetF = 1.0f + InclineFMult * FMath::Clamp((FrontZ - BackZ) / InclineFSpan, -1.0f, 1.0f);
+
+			const float LeftZ  = 0.5f * (PawHandL.FloorZ + PawFootL.FloorZ);
+			const float RightZ = 0.5f * (PawHandR.FloorZ + PawFootR.FloorZ);
+			TargetS = FMath::Abs(InclineSMult * FMath::Clamp((LeftZ - RightZ) / InclineSSpan, -1.0f, 1.0f));
+		}
+		SpineInclineF = FMath::FInterpTo(SpineInclineF, TargetF, DeltaTime, InclineInterp);
+		SpineInclineS = FMath::FInterpTo(SpineInclineS, TargetS, DeltaTime, InclineInterp);
+		UpTailAlpha = FMath::GetMappedRangeValueClamped(FVector2D(1.0f, 1.2f), FVector2D(0.0f, 0.3f), SpineInclineF);
+
+		// Pelvis/chest follow the LOWEST ground delta of their pair — SIGNED, like the kit
+		// (drop toward downhill ground AND rise over uphill ground; the front legs hang off
+		// Spine_3, so a rising chest CP is what gives them room to reach a 20° slope —
+		// clamping to drop-only left the front paws buried to the wrist, 2026-07-06).
+		// Measured RELATIVE to the whole-body ground conform (UpdateLandCushion §B) so the
+		// Spline IK only bends for the fore/aft remainder (raw deltas double-counted the
+		// drop and arched the spine). Kit SetPelvisOffset interps direction-dependently.
+		auto DropTarget = [&](const FPawSolve& A, const FPawSolve& B) -> float
+		{
+			if (!A.bValidFloor || !B.bValidFloor) return 0.0f;
+			const float Remainder = FMath::Min(A.GroundDeltaZ, B.GroundDeltaZ) - MeshGroundConformZ;
+			return FMath::Clamp(Remainder, -MaxBodyDrop, MaxBodyDrop);
+		};
+		// Pelvis CP held at ZERO (2026-07-06): the back legs hang off the Pelvis bone, which
+		// the Spline IK (Spine→Spine_3) never moves — dropping the spine's pelvis end toward
+		// the downhill rear couldn't plant anything and read as a sagging lower back ("back
+		// arch looks funny", Sean). Rear planting comes from the signed paw goals; downhill
+		// body settle from the mesh ground-conform. The chest CP stays: Spine_3 carries the
+		// shoulders, so its rise/drop genuinely repositions the front legs on slopes.
+		const float PelvisTarget = 0.0f;
+		const float ChestTarget  = DropTarget(PawHandL, PawHandR);
+		PelvisDropZ = FMath::FInterpTo(PelvisDropZ, PelvisTarget, DeltaTime,
+			(PelvisTarget < PelvisDropZ) ? 15.0f : 10.0f);
+		ChestDropZ = FMath::FInterpTo(ChestDropZ, ChestTarget, DeltaTime,
+			(ChestTarget < ChestDropZ) ? 15.0f : 10.0f);
+	}
 }
 
 // ── Server RPC: Turn Active (Reliable) ────────────────────────────

@@ -368,6 +368,24 @@ protected:
 	/** The mesh's authored relative Z, captured in BeginPlay; the cushion offsets from this. */
 	float MeshCushionBaseZ = 0.0f;
 
+	/** Continuous slope ground-conform on the mesh's relative Z (≤0, interp state) — the kit
+	 *  HeightFixer role: on an incline the capsule contacts the slope uphill of center and the
+	 *  mesh hangs a few cm above the surface; this drops the whole body onto it. The spine
+	 *  control-point drops are computed RELATIVE to this so the Spline IK only bends for the
+	 *  fore/aft remainder instead of arching the whole correction. */
+	float MeshGroundConformZ = 0.0f;
+
+	/** Whole-body slope pitch on the mesh's relative rotation (degrees, interp state).
+	 *  Bending Spine→Spine_3 can't pitch a quadruped — the hips aren't in the chain, so the
+	 *  bend kinks at the spine root (the "weird back arch"). Pitching the whole mesh aligns
+	 *  hips AND shoulders to the slope; paw goals, spine CPs, and paw rotation then shrink
+	 *  to micro-residuals automatically. */
+	float MeshSlopePitch = 0.0f;
+
+	/** The mesh's authored relative rotation, captured in BeginPlay (the −90° yaw rig offset);
+	 *  the slope pitch composes onto this. */
+	FRotator MeshBaseRelRot = FRotator::ZeroRotator;
+
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
 
@@ -747,6 +765,43 @@ protected:
 	/** Master foot-IK blend [0..1]; eased to 0 while airborne so the legs free up for the jump. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float FootIKAlpha = 0.0f;
+
+	/** Per-paw surface-conform rotation (actor-space additive, fed to the same goal-VB ModifyBones
+	 *  as the Z offsets — kit SetToeRot: Roll=atan2(N.Y,N.Z), Pitch=−atan2(N.X,N.Z) on the trace
+	 *  normal, RInterp 30). Zeroed while the paw swings or the trace misses. Cosmetic, local. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	FRotator FootIKRot_HandL = FRotator::ZeroRotator;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	FRotator FootIKRot_HandR = FRotator::ZeroRotator;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	FRotator FootIKRot_FootL = FRotator::ZeroRotator;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	FRotator FootIKRot_FootR = FRotator::ZeroRotator;
+
+	/** Fore/aft slope scrub for the A_Cat_Add_Incline evaluator (2 s clip, time = incline axis):
+	 *  1.0 = flat, 0.8 = full downhill, 1.2 = full uphill (kit multiplier 0.2 around neutral). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float SpineInclineF = 1.0f;
+
+	/** Lateral slope magnitude → A_Cat_Add_P_Squat additive weight, 0..0.2 (kit |±20 uu → ±0.2|). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float SpineInclineS = 0.0f;
+
+	/** A_Cat_Add_P_UpTail additive weight — kit MapClamped(SpineInclineF, 1.0..1.2 → 0..0.3). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float UpTailAlpha = 0.0f;
+
+	/** Spline-IK control-point drops (cm, ≤0): the body sinks toward the lowest UNCLAMPED paw
+	 *  offset (pelvis = back paws, chest = front) so the upward-only foot IK bends the uphill
+	 *  legs — the kit's "pelvis follows lowest foot" with our anti-penetration offsets. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float PelvisDropZ = 0.0f;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float ChestDropZ = 0.0f;
+
+	/** Spine-block weight: grounded × MapClamped(Speed, 0..800 → 1..0) (kit taper), interp 10. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float SpineIKAlpha = 0.0f;
 
 	/** True while falling and the lookahead trace predicts ground contact within the window
 	 *  (see LandPredictTimeMoving/Stopping). Local + cosmetic — recomputed every frame on
