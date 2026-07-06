@@ -1042,6 +1042,68 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 	AimYawInterp = FMath::FInterpTo(AimYawInterp, AimYawClamped, DeltaTime, 5.0f);
 	AimPitchInterp = FMath::FInterpTo(AimPitchInterp, AimPitchClamped, DeltaTime, 5.0f);
 
+	// BS1_Cat_Aim inputs (kit AnimBP wiring: the aim clips bake the yaw sweep into their
+	// timeline, so yaw scrubs NormalizedTime while pitch is the blend axis). Kit ranges:
+	// yaw-max 180° → 0..1 (0.5 centered), pitch-max 60° → −1..+1. Non-local pawns keep
+	// AimYaw/PitchInterp at 0 (no valid ControlRotation), so proxies hold a neutral head.
+	AimBSYawTime = FMath::GetMappedRangeValueClamped(
+		FVector2D(-180.0f, 180.0f), FVector2D(0.0f, 1.0f), AimYawInterp);
+	AimBSPitch = FMath::GetMappedRangeValueClamped(
+		FVector2D(-60.0f, 60.0f), FVector2D(-1.0f, 1.0f), AimPitchInterp);
+
+	// ── (B2) Additive idle life — blink & ear-twitch pulses ──────────
+	// Kit cadence (CharBP_Base "Idles & Add Anim" config, verified 2026-07-06): blink every
+	// 3–7 s, ear twitch every 6–12 s, three equal-chance ear clips never repeated back-to-back.
+	// Each machine rolls its own randomness — cosmetic divergence between clients is fine
+	// (same policy as Geometry Collection debris).
+	{
+		constexpr float BlinkIntervalMin = 3.0f, BlinkIntervalMax = 7.0f;
+		constexpr float EarsIntervalMin  = 6.0f, EarsIntervalMax  = 12.0f;
+		constexpr int32 NumEarsClips = 3;
+		// Must outlive one anim update but end before the SM's auto-return transition
+		// finishes (shortest ears clip is 0.6 s), or the state would immediately retrigger.
+		constexpr float PulseDuration = 0.2f;
+
+		if (!bAdditiveTimersSeeded)
+		{
+			BlinkCountdown = FMath::FRandRange(0.0f, BlinkIntervalMax);
+			EarsCountdown  = FMath::FRandRange(0.0f, EarsIntervalMax);
+			bAdditiveTimersSeeded = true;
+		}
+
+		if (BlinkPulseRemaining > 0.0f)
+		{
+			BlinkPulseRemaining -= DeltaTime;
+			if (BlinkPulseRemaining <= 0.0f)
+			{
+				bPlayBlink = false;
+			}
+		}
+		else if ((BlinkCountdown -= DeltaTime) <= 0.0f)
+		{
+			bPlayBlink = true;
+			BlinkPulseRemaining = PulseDuration;
+			BlinkCountdown = FMath::FRandRange(BlinkIntervalMin, BlinkIntervalMax);
+		}
+
+		if (EarsPulseRemaining > 0.0f)
+		{
+			EarsPulseRemaining -= DeltaTime;
+			if (EarsPulseRemaining <= 0.0f)
+			{
+				bPlayEarsTwitch = false;
+			}
+		}
+		else if ((EarsCountdown -= DeltaTime) <= 0.0f)
+		{
+			// Pick a different clip than last time (kit "Get Random Index without repetitions").
+			IndexEars = (IndexEars + FMath::RandRange(1, NumEarsClips - 1)) % NumEarsClips;
+			bPlayEarsTwitch = true;
+			EarsPulseRemaining = PulseDuration;
+			EarsCountdown = FMath::FRandRange(EarsIntervalMin, EarsIntervalMax);
+		}
+	}
+
 	// ── (C) PlayRate Interp ───────────────────────────────────────────
 	const float OutputYAbs = (GetCharacterMovement() && GetCharacterMovement()->MaxWalkSpeed > KINDA_SMALL_NUMBER)
 		? FMath::Clamp(Speed / GetCharacterMovement()->MaxWalkSpeed, 0.0f, 1.0f)

@@ -591,6 +591,28 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float AlphaAimInterp = 1.0f;
 
+	/** BS1_Cat_Aim scrub time — camera yaw vs body mapped from ±180° to 0..1 (0.5 = centered).
+	 *  The aim clips bake the full yaw sweep into their timeline; the ABP's Blendspace Evaluator
+	 *  scrubs it with this (kit AnimBP wiring: NormalizedTime = yaw, X axis = pitch). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimBSYawTime = 0.5f;
+
+	/** BS1_Cat_Aim X axis — camera pitch mapped from ±60° (kit pitch-max) to −1..+1. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float AimBSPitch = 0.0f;
+
+	/** Short pulse telling the ABP's ears/blink additive SM to fire the blink one-shot. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bPlayBlink = false;
+
+	/** Short pulse telling the ABP's ears/blink additive SM to fire an ear-twitch one-shot. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	bool bPlayEarsTwitch = false;
+
+	/** Which ear-twitch clip the ABP plays (0..2 → A_Cat_Add_Ears_1/2/3; never repeats back-to-back). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	int32 IndexEars = 0;
+
 	/** Derived locally from CharacterMovement acceleration — NOT replicated. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	bool bHasMovementInput = false;
@@ -839,4 +861,15 @@ private:
 	float PreviousLeanSpeed = 0.0f;
 	/** Spring velocity state for AccelLeanAmount. */
 	float AccelLeanVelocity = 0.0f;
+
+	// ── Additive idle-life timers (blink / ear twitch) — cosmetic, local ──
+	// Countdowns to the next blink / ear twitch; re-rolled on fire (intervals are
+	// constexpr in UpdateCosmeticInterpolation, mirroring the kit's 3–7 s / 6–12 s).
+	float BlinkCountdown = 0.0f;
+	float EarsCountdown = 0.0f;
+	/** Remaining hold time on the bPlayBlink / bPlayEarsTwitch pulses. */
+	float BlinkPulseRemaining = 0.0f;
+	float EarsPulseRemaining = 0.0f;
+	/** First-tick flag: seeds the countdowns randomly so all cats don't fire in sync at spawn. */
+	bool bAdditiveTimersSeeded = false;
 };
