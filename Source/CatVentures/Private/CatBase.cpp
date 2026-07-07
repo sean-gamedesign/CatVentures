@@ -484,15 +484,27 @@ void ACatBase::UpdateTurnInPlace()
 	// Replicate the turn to other machines via the existing RPC infra: proxies enter the
 	// Turn state from bGoTurn (else-branch) and read the replicated TurnRateAnim. On the
 	// listen-server host (authority) these writes are already authoritative.
+	// Turn-in-place body rotation does NOT replicate via the CMC: with orient-to-movement
+	// the server DERIVES rotation from acceleration and never receives the client's
+	// SetActorRotation — at zero acceleration (in-place) the server copy freezes (found in
+	// the 2026-07-06 MP pass: the host saw the client cat's body never rotate). The yaw
+	// therefore rides the turn RPCs explicitly; the server applies it and standard movement
+	// replication carries it on to simulated proxies.
+	const float BodyYaw = GetActorRotation().Yaw;
 	if (bGoTurn != bIsTurningInPlace)
 	{
 		bGoTurn = bIsTurningInPlace;
-		if (!HasAuthority()) Server_SetTurnActive(bIsTurningInPlace);
+		LastSentBodyYaw = BodyYaw;
+		if (!HasAuthority()) Server_SetTurnActive(bIsTurningInPlace, BodyYaw);
 	}
-	if (FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f)
+	// Send on rate change OR yaw drift: a saturated full-speed turn holds TurnRateAnim
+	// constant at ±1, so a rate-only throttle would starve the server of yaw mid-turn.
+	if (FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f
+		|| (bIsTurningInPlace && FMath::Abs(FRotator::NormalizeAxis(BodyYaw - LastSentBodyYaw)) > 5.0f))
 	{
 		LastSentTurnRateAnim = TurnRateAnim;
-		if (!HasAuthority()) Server_SetTurnRate(TurnRateAnim);
+		LastSentBodyYaw = BodyYaw;
+		if (!HasAuthority()) Server_SetTurnRate(TurnRateAnim, BodyYaw);
 	}
 }
 
@@ -1015,6 +1027,27 @@ void ACatBase::UpdateAnimationStates()
 		{
 			SpeedType = ECatMoveType::Turn;
 		}
+
+		// Smooth pursuit of the owning client's RPC'd turn yaw (server copies only —
+		// bHasClientTurnTarget is set exclusively by the Server RPCs, so this is inert on
+		// simulated proxies, whose rotation arrives via movement replication instead).
+		// EXPONENTIAL smoothing, deliberately NOT a fixed-rate chase: a pursuit faster
+		// than the real 150°/s catches each ~5° RPC step and stalls until the next one
+		// (move-stop-move = the jitter in the 2026-07-06 MP retest). Velocity proportional
+		// to remaining error stays continuous; the few degrees of steady-state lag are
+		// invisible on a remote cat, and the reliable final yaw closes it at turn end.
+		if (bHasClientTurnTarget)
+		{
+			constexpr float PursuitInterpSpeed = 12.0f;
+			const float CurYaw = GetActorRotation().Yaw;
+			const float ErrDeg = FRotator::NormalizeAxis(ClientTurnTargetYaw - CurYaw);
+			const float NewYaw = CurYaw + ErrDeg * FMath::Clamp(PursuitInterpSpeed * DeltaTimeCached, 0.0f, 1.0f);
+			SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
+			if (!bGoTurn && FMath::Abs(FRotator::NormalizeAxis(NewYaw - ClientTurnTargetYaw)) < 0.1f)
+			{
+				bHasClientTurnTarget = false;
+			}
+		}
 	}
 
 	UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Tick — Speed: %.1f | NormSpeed: %.2f | SpeedType: %d | HasInput: %d | OnGround: %d"),
@@ -1220,11 +1253,22 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 			: (GetCharacterMovement() ? FMath::Max(GetCharacterMovement()->MaxAcceleration, 1.0f) : 1.0f);
 		const float Target = FMath::Clamp(Accel / Ref, -1.0f, 1.0f);
 
-		// Semi-implicit spring-damper toward Target.
-		AccelLeanVelocity += (Target - AccelLeanAmount) * AccelLeanStiffness * SafeDT;
-		AccelLeanVelocity -= AccelLeanVelocity * AccelLeanDamping * SafeDT;
-		AccelLeanAmount   += AccelLeanVelocity * SafeDT;
-		AccelLeanAmount    = FMath::Clamp(AccelLeanAmount, -1.5f, 1.5f);
+		// Semi-implicit spring-damper toward Target. The integration step is CLAMPED
+		// (2026-07-06 MP pass): a frame hitch making Damping×dt exceed 1 flips the
+		// velocity's sign and grows it — the spring explodes, slams into the ±1.5 rail,
+		// and the old clamp kept the position but not the velocity, parking the lean at
+		// full bow forever (the "stuck landing pose" that survived every slope fix;
+		// AccelLeanAmount read ±1.5 standing still on both machines). Rails now also
+		// zero the velocity (anti-windup).
+		const float SpringDT = FMath::Min(SafeDT, 1.0f / 30.0f);
+		AccelLeanVelocity += (Target - AccelLeanAmount) * AccelLeanStiffness * SpringDT;
+		AccelLeanVelocity -= AccelLeanVelocity * FMath::Min(AccelLeanDamping * SpringDT, 0.9f);
+		AccelLeanAmount   += AccelLeanVelocity * SpringDT;
+		if (FMath::Abs(AccelLeanAmount) >= 1.5f)
+		{
+			AccelLeanAmount   = FMath::Clamp(AccelLeanAmount, -1.5f, 1.5f);
+			AccelLeanVelocity = 0.0f;
+		}
 
 		UE_LOG(LogCatVentures, Verbose, TEXT("[%s] AccelLean -- Accel: %.0f | Target: %.3f | Lean: %.3f"),
 			*GetName(), Accel, Target, AccelLeanAmount);
@@ -1255,12 +1299,13 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	}
 	else
 	{
-		// Semi-implicit damped spring toward offset 0. Substep-free: at ω≤40 and game
-		// framerates the integration is comfortably stable.
+		// Semi-implicit damped spring toward offset 0. Integration step clamped like the
+		// accel-lean spring (2026-07-06): at a frame-hitch dt, ω²·dt explodes the update.
+		const float CushionDT = FMath::Min(DeltaTime, 1.0f / 30.0f);
 		const float W = LandCushionFrequency;
 		const float Accel = (-W * W * MeshCushionOffset) - (2.0f * LandCushionDampingRatio * W * MeshCushionVelocity);
-		MeshCushionVelocity += Accel * DeltaTime;
-		MeshCushionOffset = FMath::Clamp(MeshCushionOffset + MeshCushionVelocity * DeltaTime,
+		MeshCushionVelocity += Accel * CushionDT;
+		MeshCushionOffset = FMath::Clamp(MeshCushionOffset + MeshCushionVelocity * CushionDT,
 		                                 -LandCushionMaxDip, LandCushionMaxDip * 0.25f);
 	}
 
@@ -1296,48 +1341,14 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		MeshGroundConformZ = FMath::FInterpTo(MeshGroundConformZ, ConformTarget, DeltaTime, ConformInterpSpeed);
 	}
 
-	// ── (C) Whole-body slope pitch (2026-07-06) ──────────────────────
-	// Pitch the entire mesh to the fore/aft ground slope. The Spline IK spine can't do
-	// this (the hips aren't in its chain — bending it kinks at the spine root, Sean's
-	// "weird back arch"); with the body aligned, the paw goals / spine CPs / paw rotation
-	// all reduce to micro-residuals on a uniform slope. Two probes ±30 uu along facing.
-	{
-		constexpr float ProbeDist = 30.0f;
-		constexpr float MaxSlopePitch = 25.0f;
-		constexpr float PitchInterpSpeed = 6.0f;
-		float PitchTarget = 0.0f;
-		const UCapsuleComponent* Capsule = GetCapsuleComponent();
-		if (bIsOnGround && Capsule && GetWorld())
-		{
-			const float BottomZ = GetActorLocation().Z - Capsule->GetScaledCapsuleHalfHeight();
-			const FVector Fwd = GetActorForwardVector() * ProbeDist;
-			const FVector Center = GetActorLocation();
-			auto ProbeZ = [&](const FVector& XY, float& OutZ) -> bool
-			{
-				FHitResult Hit;
-				FCollisionQueryParams Params(FName(TEXT("CatSlopePitch")), false, this);
-				if (GetWorld()->LineTraceSingleByChannel(Hit,
-					FVector(XY.X, XY.Y, BottomZ + 30.0f), FVector(XY.X, XY.Y, BottomZ - 40.0f),
-					ECC_Visibility, Params))
-				{
-					OutZ = Hit.ImpactPoint.Z;
-					return true;
-				}
-				return false;
-			};
-			float FrontZ = 0.0f, BackZ = 0.0f;
-			if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
-			{
-				// Discontinuity rejection (2026-07-06): an implied angle beyond the max
-				// slope means the probes straddle a ledge, not a slope — clamping tilted
-				// the body ±25° on every platform lip during takeoffs/landings.
-				const float RawPitch = FMath::RadiansToDegrees(
-					FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist));
-				PitchTarget = (FMath::Abs(RawPitch) <= MaxSlopePitch) ? RawPitch : 0.0f;
-			}
-		}
-		MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, PitchInterpSpeed);
-	}
+	// ── (C) Whole-body slope pitch — APPLY only ──────────────────────
+	// MeshSlopePitch is COMPUTED in UpdateFootIK from the paw-floor traces (single source
+	// of truth with the foot conform; runs after this function — 1-frame lag, invisible).
+	// It originally had its own ±30 uu fore/aft probes here: standing at the ramp's BASE,
+	// one probe caught the lip while the paws stood on flat ground — a persistent false
+	// ~19° reading under the 25° rejection threshold, bowing the cat on level ground
+	// (Sean's "stuck downward pose", snapshot-confirmed 2026-07-06: SpineInclineF 0.978
+	// vs applied pitch 19.55). Paw-floor-derived pitch cannot disagree with the stance.
 
 	// Single transform write; skip once fully at rest (avoids per-tick transform writes).
 	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ;
@@ -1374,16 +1385,20 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	UWorld* World = GetWorld();
 	if (!MeshComp || !World) return;
 
-	// Blend in when grounded, out while airborne.
-	// bIsOnGround is refreshed earlier this frame in UpdateAnimationStates().
+	// Blend in when grounded, out while airborne — and out during TURN-IN-PLACE
+	// (2026-07-06 MP pass): the turn clips are pure authored footwork (force_root_lock)
+	// and the capsule rotates procedurally under them; per-frame paw traces lag that
+	// rotation by a frame and the conform fights the stepping feet (leg jitter, most
+	// visible on a remote copy driven by the turn-yaw pursuit).
 	// NO speed taper (2026-07-06): the kit's 1.0→0.5-over-0..400 was tuned for its
 	// MaxWalkSpeed 250 — at our 400 a normal walk sat at the 0.5 floor, halving every
 	// terrain offset (downhill paws floated by half the reach, uphill paws penetrated by
 	// half the lift — exactly what Sean saw walking the ramp; standstill was perfect).
 	// The taper's rationale (paw-relative IK lagging the stride at speed) doesn't apply
 	// to the terrain-delta model: goals depend on ground geometry, not paw position, so
-	// they can't lag or fight the stride. Full weight whenever grounded.
-	const float TargetAlpha = (bEnableFootIK && bIsOnGround) ? 1.0f : 0.0f;
+	// they can't lag or fight the stride. Full weight whenever grounded otherwise.
+	const bool bTurningFootwork = (SpeedType == ECatMoveType::Turn);
+	const float TargetAlpha = (bEnableFootIK && bIsOnGround && !bTurningFootwork) ? 1.0f : 0.0f;
 
 	// Spine-block weight: the kit fades its Spline-IK spine 1→0 over speed 0..800 (steeper
 	// than the leg taper) and disables it in the air. Interp 10 (kit shared Interp helper).
@@ -1409,6 +1424,7 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	{
 		FootIKOffsetZ_HandL = FootIKOffsetZ_HandR = FootIKOffsetZ_FootL = FootIKOffsetZ_FootR = 0.0f;
 		FootIKRot_HandL = FootIKRot_HandR = FootIKRot_FootL = FootIKRot_FootR = FRotator::ZeroRotator;
+		MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, 0.0f, DeltaTime, 14.0f);   // airborne/off: level out fast
 		SpineInclineF = FMath::FInterpTo(SpineInclineF, 1.0f, DeltaTime, 10.0f);
 		SpineInclineS = FMath::FInterpTo(SpineInclineS, 0.0f, DeltaTime, 10.0f);
 		UpTailAlpha   = FMath::GetMappedRangeValueClamped(FVector2D(1.0f, 1.2f), FVector2D(0.0f, 0.3f), SpineInclineF);
@@ -1423,6 +1439,7 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		bool  bValidFloor = false;
 		float FloorZ = 0.0f;        // trace impact Z (world)
 		float GroundDeltaZ = 0.0f;  // ground under the paw relative to the capsule contact plane (<0 = downhill)
+		FVector2D PawXY = FVector2D::ZeroVector;   // paw world XY — for the stance-span slope pitch
 	};
 	FPawSolve PawHandL, PawHandR, PawFootL, PawFootR;
 
@@ -1472,6 +1489,7 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 			OutSolve.bValidFloor = true;
 			OutSolve.FloorZ = Hit.ImpactPoint.Z;
 			OutSolve.GroundDeltaZ = Hit.ImpactPoint.Z - ActorGroundZ;
+			OutSolve.PawXY = FVector2D(PawWorld.X, PawWorld.Y);
 
 			// ── Paw rotation from the surface normal (kit SetToeRot) ──────
 			// Normal into MESH COMPONENT space — the ABP applies these as component-space
@@ -1617,27 +1635,115 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		// body settle from the mesh ground-conform. The chest CP stays: Spine_3 carries the
 		// shoulders, so its rise/drop genuinely repositions the front legs on slopes.
 		const float PelvisTarget = 0.0f;
-		const float ChestTarget  = DropTarget(PawHandL, PawHandR);
+		// Chest CP is RISE-ONLY (2026-07-06, Sean's second screenshot): uphill it lifts the
+		// shoulders so the front legs can reach a rising slope (its reason to exist);
+		// downhill it dropped the shoulders ~5 cm on top of the body pitch and bowed the
+		// front end. Downhill reach belongs to the legs (signed paw offsets) + the pitch.
+		const float ChestTarget  = FMath::Max(DropTarget(PawHandL, PawHandR), 0.0f);
 		PelvisDropZ = FMath::FInterpTo(PelvisDropZ, PelvisTarget, DeltaTime,
 			(PelvisTarget < PelvisDropZ) ? 15.0f : 10.0f);
 		ChestDropZ = FMath::FInterpTo(ChestDropZ, ChestTarget, DeltaTime,
 			(ChestTarget < ChestDropZ) ? 15.0f : 10.0f);
+
+		// ── Whole-body slope pitch target (applied by UpdateLandCushion §C) ──
+		// TWO estimators, take the SMALLER magnitude — each vetoes the other's failure mode
+		// (both hit in the 2026-07-06 MP pass):
+		//  • Capsule-anchored probes (±30 uu along facing, pose-independent): fooled at a
+		//    ramp base — one probe on the lip, paws on flat → persistent false ~19° bow.
+		//  • Paw-floor differential (stance-true): FEEDS BACK through pose — pitching moves
+		//    the paw XY down-slope where floors are lower → runaway to ~2× the true slope.
+		// min(|probe|, |paw|) can neither run away (probes bound it) nor bow off-stance
+		// (paws bound it). Signs must agree, else 0 (genuinely ambiguous footing).
+		{
+			constexpr float MaxSlopePitch = 25.0f;
+			constexpr float ProbeDist = 30.0f;
+			float ProbePitch = 0.0f; bool bProbeValid = false;
+			{
+				const FVector Fwd = GetActorForwardVector() * ProbeDist;
+				const FVector Center = GetActorLocation();
+				auto ProbeZ = [&](const FVector& XY, float& OutZ) -> bool
+				{
+					FHitResult PHit;
+					FCollisionQueryParams PParams(FName(TEXT("CatSlopePitch")), false, this);
+					if (World->LineTraceSingleByChannel(PHit,
+						FVector(XY.X, XY.Y, ActorGroundZ + 30.0f), FVector(XY.X, XY.Y, ActorGroundZ - 40.0f),
+						ECC_Visibility, PParams))
+					{
+						OutZ = PHit.ImpactPoint.Z;
+						return true;
+					}
+					return false;
+				};
+				float FrontZ = 0.0f, BackZ = 0.0f;
+				if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
+				{
+					ProbePitch = FMath::RadiansToDegrees(FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist));
+					bProbeValid = FMath::Abs(ProbePitch) <= MaxSlopePitch;
+				}
+			}
+			float PawPitch = 0.0f; bool bPawValid = false;
+			if (bFront && bBack)
+			{
+				const FVector2D FrontXY = (PawHandL.PawXY + PawHandR.PawXY) * 0.5f;
+				const FVector2D BackXY  = (PawFootL.PawXY + PawFootR.PawXY) * 0.5f;
+				const float Span = FVector2D::Distance(FrontXY, BackXY);
+				if (Span > 20.0f)
+				{
+					const float FrontFloor = 0.5f * (PawHandL.FloorZ + PawHandR.FloorZ);
+					const float BackFloor  = 0.5f * (PawFootL.FloorZ + PawFootR.FloorZ);
+					PawPitch = FMath::RadiansToDegrees(FMath::Atan2(FrontFloor - BackFloor, Span));
+					bPawValid = FMath::Abs(PawPitch) <= MaxSlopePitch;
+				}
+			}
+			float PitchTarget = 0.0f;
+			if (bProbeValid && bPawValid && (FMath::Sign(ProbePitch) == FMath::Sign(PawPitch)))
+			{
+				PitchTarget = (FMath::Abs(ProbePitch) < FMath::Abs(PawPitch)) ? ProbePitch : PawPitch;
+			}
+			// FRACTIONAL at IDLE only (2026-07-06, Sean's screenshots): full-slope body pitch
+			// on a standing cat face-plants the low-hanging idle-pose head into a 20° ramp —
+			// a standing quadruped keeps the body mostly level and lets the legs compensate
+			// (the signed paw reach does exactly that). MOVING restores FULL alignment: at a
+			// reduced moving fraction the front legs must absorb the difference and hit the
+			// Leg IK fold limit — the uphill-walk leg IK Sean approved all day regressed.
+			PitchTarget *= FMath::GetMappedRangeValueClamped(
+				FVector2D(0.0f, 200.0f), FVector2D(0.35f, 1.0f), Speed);
+			// Asymmetric ease: settle onto a slope slowly (weight), recover to level fast.
+			const float EaseSpeed = (FMath::Abs(PitchTarget) < FMath::Abs(MeshSlopePitch)) ? 14.0f : 6.0f;
+			MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, EaseSpeed);
+		}
 	}
 }
 
 // ── Server RPC: Turn Active (Reliable) ────────────────────────────
-void ACatBase::Server_SetTurnActive_Implementation(bool bNewGoTurn)
+void ACatBase::Server_SetTurnActive_Implementation(bool bNewGoTurn, float BodyYaw)
 {
 	bGoTurn = bNewGoTurn;
 	// SpeedType derivation happens next frame in UpdateAnimationStates() else-branch.
 	// bGoTurn replicates to all proxies via DOREPLIFETIME_CONDITION (COND_SkipOwner).
+	ApplyClientTurnYaw(BodyYaw);
 }
 
 // ── Server RPC: Turn Rate (Unreliable) ────────────────────────────
-void ACatBase::Server_SetTurnRate_Implementation(float NewTurnRateAnim)
+void ACatBase::Server_SetTurnRate_Implementation(float NewTurnRateAnim, float BodyYaw)
 {
 	TurnRateAnim = NewTurnRateAnim;
 	// Replicates to all proxies via DOREPLIFETIME_CONDITION (COND_SkipOwner).
+	ApplyClientTurnYaw(BodyYaw);
+}
+
+void ACatBase::ApplyClientTurnYaw(float BodyYaw)
+{
+	// The owning client is authoritative for its cosmetic in-place body yaw. RPC yaws
+	// arrive as discrete ~5° steps — store as a TARGET and let the per-frame interp in
+	// UpdateAnimationStates rotate the server copy smoothly toward it (snapping here read
+	// as jitter on the host, 2026-07-06 MP retest). Never applied to a locally controlled
+	// pawn — the host's own turn logic owns that.
+	if (!IsLocallyControlled())
+	{
+		ClientTurnTargetYaw = BodyYaw;
+		bHasClientTurnTarget = true;
+	}
 }
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -518,11 +518,14 @@ protected:
 
 	/** Client → Server: edge-trigger for turn on/off. Reliable guarantees ordered delivery. */
 	UFUNCTION(Server, Reliable)
-	void Server_SetTurnActive(bool bNewGoTurn);
+	void Server_SetTurnActive(bool bNewGoTurn, float BodyYaw);
 
 	/** Client → Server: continuous blendspace update during active turn. Unreliable is fine — loss just holds last value. */
 	UFUNCTION(Server, Unreliable)
-	void Server_SetTurnRate(float NewTurnRateAnim);
+	void Server_SetTurnRate(float NewTurnRateAnim, float BodyYaw);
+
+	/** Applies an owning client's in-place body yaw to this (non-locally-controlled) copy. */
+	void ApplyClientTurnYaw(float BodyYaw);
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
@@ -837,6 +840,17 @@ protected:
 
 	/** Last TurnRateAnim value sent via Server_SetTurnRate RPC. Used to throttle sends. */
 	float LastSentTurnRateAnim = 0.0f;
+
+	/** Last body yaw sent via the turn RPCs — turn-in-place rotation does NOT replicate
+	 *  through the CMC (SetActorRotation with zero acceleration never leaves the client;
+	 *  found in the 2026-07-06 MP pass), so the yaw rides the turn RPCs explicitly. */
+	float LastSentBodyYaw = 0.0f;
+
+	/** Server-side target for a remote client's in-place body yaw. RPCs arrive in ~5° steps;
+	 *  snapping to each read as jitter on the host — the server copy interps toward this at
+	 *  the turn speed instead (smooth locally AND a smooth source for proxy replication). */
+	float ClientTurnTargetYaw = 0.0f;
+	bool bHasClientTurnTarget = false;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
 	float DeltaTimeCached = 0.0f;
