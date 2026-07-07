@@ -1635,79 +1635,49 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		// body settle from the mesh ground-conform. The chest CP stays: Spine_3 carries the
 		// shoulders, so its rise/drop genuinely repositions the front legs on slopes.
 		const float PelvisTarget = 0.0f;
-		// Chest CP is RISE-ONLY (2026-07-06, Sean's second screenshot): uphill it lifts the
-		// shoulders so the front legs can reach a rising slope (its reason to exist);
-		// downhill it dropped the shoulders ~5 cm on top of the body pitch and bowed the
-		// front end. Downhill reach belongs to the legs (signed paw offsets) + the pitch.
-		const float ChestTarget  = FMath::Max(DropTarget(PawHandL, PawHandR), 0.0f);
+		// Chest CP is SIGNED again (2026-07-06 late revert to the Sean-approved 0f1c28b
+		// slope stack): the rise-only clamp was treating a downhill "bow" whose real cause
+		// was the railed accel-lean spring (now disabled) — with the villain gone, the
+		// downhill chest drop is legitimate reach assistance, not a bow.
+		const float ChestTarget  = DropTarget(PawHandL, PawHandR);
 		PelvisDropZ = FMath::FInterpTo(PelvisDropZ, PelvisTarget, DeltaTime,
 			(PelvisTarget < PelvisDropZ) ? 15.0f : 10.0f);
 		ChestDropZ = FMath::FInterpTo(ChestDropZ, ChestTarget, DeltaTime,
 			(ChestTarget < ChestDropZ) ? 15.0f : 10.0f);
 
 		// ── Whole-body slope pitch target (applied by UpdateLandCushion §C) ──
-		// TWO estimators, take the SMALLER magnitude — each vetoes the other's failure mode
-		// (both hit in the 2026-07-06 MP pass):
-		//  • Capsule-anchored probes (±30 uu along facing, pose-independent): fooled at a
-		//    ramp base — one probe on the lip, paws on flat → persistent false ~19° bow.
-		//  • Paw-floor differential (stance-true): FEEDS BACK through pose — pitching moves
-		//    the paw XY down-slope where floors are lower → runaway to ~2× the true slope.
-		// min(|probe|, |paw|) can neither run away (probes bound it) nor bow off-stance
-		// (paws bound it). Signs must agree, else 0 (genuinely ambiguous footing).
+		// REVERTED to the Sean-approved 0f1c28b stack (2026-07-06 late): capsule-anchored
+		// probes (±30 uu along facing, pose-independent), FULL pitch, discontinuity
+		// rejection. The MP-session layers (paw-floor veto, idle fraction) each traded leg
+		// reach away to treat a "bow" whose real cause was the railed accel-lean spring —
+		// with the spring disabled they cost more (floating paws on the ramp) than they
+		// protect against. If the ramp-base false-positive resurfaces, prefer tightening
+		// the rejection over re-stacking estimators (see the handoff plan §6).
 		{
 			constexpr float MaxSlopePitch = 25.0f;
 			constexpr float ProbeDist = 30.0f;
-			float ProbePitch = 0.0f; bool bProbeValid = false;
-			{
-				const FVector Fwd = GetActorForwardVector() * ProbeDist;
-				const FVector Center = GetActorLocation();
-				auto ProbeZ = [&](const FVector& XY, float& OutZ) -> bool
-				{
-					FHitResult PHit;
-					FCollisionQueryParams PParams(FName(TEXT("CatSlopePitch")), false, this);
-					if (World->LineTraceSingleByChannel(PHit,
-						FVector(XY.X, XY.Y, ActorGroundZ + 30.0f), FVector(XY.X, XY.Y, ActorGroundZ - 40.0f),
-						ECC_Visibility, PParams))
-					{
-						OutZ = PHit.ImpactPoint.Z;
-						return true;
-					}
-					return false;
-				};
-				float FrontZ = 0.0f, BackZ = 0.0f;
-				if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
-				{
-					ProbePitch = FMath::RadiansToDegrees(FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist));
-					bProbeValid = FMath::Abs(ProbePitch) <= MaxSlopePitch;
-				}
-			}
-			float PawPitch = 0.0f; bool bPawValid = false;
-			if (bFront && bBack)
-			{
-				const FVector2D FrontXY = (PawHandL.PawXY + PawHandR.PawXY) * 0.5f;
-				const FVector2D BackXY  = (PawFootL.PawXY + PawFootR.PawXY) * 0.5f;
-				const float Span = FVector2D::Distance(FrontXY, BackXY);
-				if (Span > 20.0f)
-				{
-					const float FrontFloor = 0.5f * (PawHandL.FloorZ + PawHandR.FloorZ);
-					const float BackFloor  = 0.5f * (PawFootL.FloorZ + PawFootR.FloorZ);
-					PawPitch = FMath::RadiansToDegrees(FMath::Atan2(FrontFloor - BackFloor, Span));
-					bPawValid = FMath::Abs(PawPitch) <= MaxSlopePitch;
-				}
-			}
 			float PitchTarget = 0.0f;
-			if (bProbeValid && bPawValid && (FMath::Sign(ProbePitch) == FMath::Sign(PawPitch)))
+			const FVector Fwd = GetActorForwardVector() * ProbeDist;
+			const FVector Center = GetActorLocation();
+			auto ProbeZ = [&](const FVector& XY, float& OutZ) -> bool
 			{
-				PitchTarget = (FMath::Abs(ProbePitch) < FMath::Abs(PawPitch)) ? ProbePitch : PawPitch;
+				FHitResult PHit;
+				FCollisionQueryParams PParams(FName(TEXT("CatSlopePitch")), false, this);
+				if (World->LineTraceSingleByChannel(PHit,
+					FVector(XY.X, XY.Y, ActorGroundZ + 30.0f), FVector(XY.X, XY.Y, ActorGroundZ - 40.0f),
+					ECC_Visibility, PParams))
+				{
+					OutZ = PHit.ImpactPoint.Z;
+					return true;
+				}
+				return false;
+			};
+			float FrontZ = 0.0f, BackZ = 0.0f;
+			if (ProbeZ(Center + Fwd, FrontZ) && ProbeZ(Center - Fwd, BackZ))
+			{
+				const float RawPitch = FMath::RadiansToDegrees(FMath::Atan2(FrontZ - BackZ, 2.0f * ProbeDist));
+				PitchTarget = (FMath::Abs(RawPitch) <= MaxSlopePitch) ? RawPitch : 0.0f;
 			}
-			// FRACTIONAL at IDLE only (2026-07-06, Sean's screenshots): full-slope body pitch
-			// on a standing cat face-plants the low-hanging idle-pose head into a 20° ramp —
-			// a standing quadruped keeps the body mostly level and lets the legs compensate
-			// (the signed paw reach does exactly that). MOVING restores FULL alignment: at a
-			// reduced moving fraction the front legs must absorb the difference and hit the
-			// Leg IK fold limit — the uphill-walk leg IK Sean approved all day regressed.
-			PitchTarget *= FMath::GetMappedRangeValueClamped(
-				FVector2D(0.0f, 200.0f), FVector2D(0.35f, 1.0f), Speed);
 			// Asymmetric ease: settle onto a slope slowly (weight), recover to level fast.
 			const float EaseSpeed = (FMath::Abs(PitchTarget) < FMath::Abs(MeshSlopePitch)) ? 14.0f : 6.0f;
 			MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, EaseSpeed);
