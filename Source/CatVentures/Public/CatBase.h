@@ -125,6 +125,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
 	float MovementRotationRateYaw = 360.0f;
 
+	// ── Sprint Gait (M1, weighty-movement pass) ────────────────────────
+	// W alone = trot at MovementMaxWalkSpeed; W+Shift = sprint. The weight comes
+	// from differentiation: the sprint turns wider and reads as a distinct gait.
+
+	/** Max ground speed while sprinting (cm/s). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Sprint", meta = (ClampMin = "100.0", ClampMax = "2000.0"))
+	float SprintMaxWalkSpeed = 650.0f;
+
+	/** Yaw rotation rate (°/s) while sprinting. Lower than the trot rate = wider arcs at speed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Sprint", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
+	float SprintRotationRateYaw = 150.0f;
+
 	// ── Jump Tuning ───────────────────────────────────────────────────
 
 	/** Initial vertical launch velocity (cm/s). Wired to CMC->JumpZVelocity. */
@@ -420,6 +432,9 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> GrabAction;
 
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> SprintAction;
+
 	// ── Input Handlers ──────────────────────────────────────────────────
 
 	/** Camera-relative movement: input is projected onto the camera's yaw plane;
@@ -449,6 +464,26 @@ protected:
 	/** Fires on IA_Jump Started — records the jump-buffer timestamp, then forwards to ACharacter::Jump.
 	 *  The buffer lets a press made just before landing still fire on touchdown (see Landed). */
 	void OnJumpInputPressed();
+
+	/** Fires on IA_Sprint Started/Completed — owner-predicted gait switch (see SetSprinting). */
+	void OnSprintPressed();
+	void OnSprintReleased();
+
+	// ── Sprint Gait ─────────────────────────────────────────────────────
+
+	/** Local entry point for sprint intent: predicts the gait switch on the owning
+	 *  client (same pattern as the grab drag-settings prediction) and routes to the
+	 *  server for authority. Listen-server hosts set state directly (RPC no-op gotcha). */
+	void SetSprinting(bool bNewSprinting);
+
+	/** Client → Server: sprint intent. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetSprinting(bool bNewSprinting);
+
+	/** Applies the active gait's CMC tuning (MaxWalkSpeed, yaw rotation rate) from
+	 *  bIsSprinting. Skipped while grabbing — drag settings own the CMC then; the
+	 *  grab-release restore re-applies the current gait. */
+	void ApplyGaitMovementSettings();
 
 	// ── Networked Meow ──────────────────────────────────────────────────
 
@@ -543,6 +578,11 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bIsGrabbing, Category = "Animation State")
 	bool bIsGrabbing = false;
 
+	/** True while sprinting (server-authoritative gait state, owner-predicted). Replicated to
+	 *  every machine so all copies agree on gait CMC tuning and SpeedType classification. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_bIsSprinting, Category = "Animation State")
+	bool bIsSprinting = false;
+
 	/** Current jump phase for AnimBP state machine transitions. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_JumpPhase, Category = "Animation State")
 	ECatJumpPhase JumpPhase = ECatJumpPhase::None;
@@ -560,6 +600,9 @@ protected:
 
 	UFUNCTION()
 	void OnRep_bIsGrabbing();
+
+	UFUNCTION()
+	void OnRep_bIsSprinting();
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Local Cosmetic Variables (NOT replicated) ─────────────────────

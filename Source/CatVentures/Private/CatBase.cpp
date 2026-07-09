@@ -306,6 +306,9 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 		// Mouth Grab — Started = bite, Completed = release
 		EnhancedInput->BindAction(GrabAction, ETriggerEvent::Started,   this, &ACatBase::TriggerGrab);
 		EnhancedInput->BindAction(GrabAction, ETriggerEvent::Completed, this, &ACatBase::TriggerRelease);
+
+		EnhancedInput->BindAction(SprintAction, ETriggerEvent::Started,   this, &ACatBase::OnSprintPressed);
+		EnhancedInput->BindAction(SprintAction, ETriggerEvent::Completed, this, &ACatBase::OnSprintReleased);
 	}
 }
 
@@ -849,6 +852,60 @@ void ACatBase::UpdateGrab(float DeltaTime)
 	}
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// ── Sprint Gait (M1, weighty-movement pass) ───────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void ACatBase::OnSprintPressed()  { SetSprinting(true); }
+void ACatBase::OnSprintReleased() { SetSprinting(false); }
+
+void ACatBase::SetSprinting(bool bNewSprinting)
+{
+	if (bIsSprinting == bNewSprinting)
+	{
+		return;
+	}
+
+	// Owner prediction: apply the gait locally right away (same pattern as the
+	// grab drag-settings prediction); the server copy follows via RPC/authority.
+	bIsSprinting = bNewSprinting;
+	ApplyGaitMovementSettings();
+
+	if (!HasAuthority())
+	{
+		Server_SetSprinting(bNewSprinting);
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Sprint %s"), *GetName(), bNewSprinting ? TEXT("ON") : TEXT("OFF"));
+}
+
+void ACatBase::Server_SetSprinting_Implementation(bool bNewSprinting)
+{
+	bIsSprinting = bNewSprinting;
+	ApplyGaitMovementSettings();
+}
+
+void ACatBase::OnRep_bIsSprinting()
+{
+	ApplyGaitMovementSettings();
+}
+
+void ACatBase::ApplyGaitMovementSettings()
+{
+	// Drag settings own the CMC during a grab; RestoreNormalMovementSettings
+	// re-applies the current gait on release.
+	if (bIsGrabbing)
+	{
+		return;
+	}
+
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->MaxWalkSpeed = bIsSprinting ? SprintMaxWalkSpeed : MovementMaxWalkSpeed;
+		CMC->RotationRate = FRotator(0.0f, bIsSprinting ? SprintRotationRateYaw : MovementRotationRateYaw, 0.0f);
+	}
+}
+
 void ACatBase::ApplyDragMovementSettings()
 {
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
@@ -862,7 +919,7 @@ void ACatBase::RestoreNormalMovementSettings()
 {
 	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
 	{
-		CMC->MaxWalkSpeed              = MovementMaxWalkSpeed;
+		CMC->MaxWalkSpeed              = bIsSprinting ? SprintMaxWalkSpeed : MovementMaxWalkSpeed;
 		CMC->bOrientRotationToMovement = true;
 	}
 }
@@ -889,6 +946,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
+	DOREPLIFETIME(ACatBase, bIsSprinting);
 }
 
 void ACatBase::PossessedBy(AController* NewController)
@@ -975,15 +1033,19 @@ void ACatBase::UpdateAnimationStates()
 	// (e2) Jump phase — tick-driven phase transitions
 	UpdateJumpPhase(DeltaTimeCached);
 
-	// (f) SpeedType — threshold chain on normalized speed
-	const float MaxSpeed = CMC->MaxWalkSpeed;
-	const float NormalizedSpeed = (MaxSpeed > KINDA_SMALL_NUMBER) ? (Speed / MaxSpeed) : 0.0f;
+	// (f) SpeedType — threshold chain on ABSOLUTE speed (M1 gait pass). With sprint,
+	// MaxWalkSpeed is gait-dependent, so normalizing by it would reclassify a full
+	// trot (400/400 = 1.0) as Run. Absolute thresholds derived from the two gait
+	// speeds agree on every machine regardless of the local CMC state:
+	// Run is only reachable while sprinting; a full plain-W trot stays Trot.
+	const float RunSpeedThreshold  = SprintMaxWalkSpeed * 0.8f;     // 520 at defaults
+	const float TrotSpeedThreshold = MovementMaxWalkSpeed * 0.6f;   // 240 at defaults
 
-	if (NormalizedSpeed >= 0.8f)
+	if (Speed >= RunSpeedThreshold)
 	{
 		SpeedType = ECatMoveType::Run;
 	}
-	else if (NormalizedSpeed >= 0.6f)
+	else if (Speed >= TrotSpeedThreshold)
 	{
 		SpeedType = ECatMoveType::Trot;
 	}
@@ -1050,8 +1112,8 @@ void ACatBase::UpdateAnimationStates()
 		}
 	}
 
-	UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Tick — Speed: %.1f | NormSpeed: %.2f | SpeedType: %d | HasInput: %d | OnGround: %d"),
-		*GetName(), Speed, NormalizedSpeed, (int32)SpeedType, bHasMovementInput, bIsOnGround);
+	UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Tick — Speed: %.1f | Sprint: %d | SpeedType: %d | HasInput: %d | OnGround: %d"),
+		*GetName(), Speed, (int32)bIsSprinting, (int32)SpeedType, bHasMovementInput, bIsOnGround);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1390,15 +1452,24 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	// and the capsule rotates procedurally under them; per-frame paw traces lag that
 	// rotation by a frame and the conform fights the stepping feet (leg jitter, most
 	// visible on a remote copy driven by the turn-yaw pursuit).
-	// NO speed taper (2026-07-06): the kit's 1.0→0.5-over-0..400 was tuned for its
-	// MaxWalkSpeed 250 — at our 400 a normal walk sat at the 0.5 floor, halving every
-	// terrain offset (downhill paws floated by half the reach, uphill paws penetrated by
-	// half the lift — exactly what Sean saw walking the ramp; standstill was perfect).
-	// The taper's rationale (paw-relative IK lagging the stride at speed) doesn't apply
-	// to the terrain-delta model: goals depend on ground geometry, not paw position, so
-	// they can't lag or fight the stride. Full weight whenever grounded otherwise.
+	// Speed taper, reinstated 2026-07-08 (M1 gait pass) with a DIFFERENT band than the
+	// kit's. The kit's 1.0→0.5-over-0..400 halved slope offsets at a normal walk (the
+	// 2026-07-06 ramp bug) and was removed. But the M1 trot exposed the other failure
+	// mode: at gait speeds the Leg IK node re-solves the near-straight front leg at full
+	// stride reach and snaps between chain configurations — a visible shoulder pop —
+	// while its measured useful contribution at steady trot is ±0.15 cm (sampler,
+	// 2026-07-08). So: FULL alpha through every walk/blend speed (≤300, slope conform
+	// untouched), fading to ZERO by 380 — below the 400 trot cruise, so the solver is
+	// bypassed at trot/sprint. Ground conform at gait speeds is carried by the
+	// whole-body slope pitch + mesh conform (coarse layers), as the kit intended.
+	// Speed-driven, not phase-driven — per-paw swing fades stay banned (slope trap).
+	constexpr float FootIKFadeStartSpeed = 300.0f;
+	constexpr float FootIKFadeEndSpeed   = 380.0f;
 	const bool bTurningFootwork = (SpeedType == ECatMoveType::Turn);
-	const float TargetAlpha = (bEnableFootIK && bIsOnGround && !bTurningFootwork) ? 1.0f : 0.0f;
+	const float TargetAlpha = (bEnableFootIK && bIsOnGround && !bTurningFootwork)
+		? FMath::GetMappedRangeValueClamped(
+			FVector2D(FootIKFadeStartSpeed, FootIKFadeEndSpeed), FVector2D(1.0f, 0.0f), Speed)
+		: 0.0f;
 
 	// Spine-block weight: the kit fades its Spline-IK spine 1→0 over speed 0..800 (steeper
 	// than the leg taper) and disables it in the air. Interp 10 (kit shared Interp helper).
@@ -1420,7 +1491,13 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		: FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
 
 	// Fully blended out — settle every output to neutral and skip the traces.
-	if (TargetAlpha == 0.0f && FootIKAlpha < KINDA_SMALL_NUMBER)
+	// EXCEPT when the zero came purely from the speed taper while grounded: the paw
+	// layer is bypassed in the ABP by FootIKAlpha ≈ 0 anyway, but the rest of this
+	// function must keep running — MeshSlopePitch (the coarse slope layer that carries
+	// ramps at trot/sprint) and the spine/incline probes are computed below and would
+	// level out / freeze if we returned here.
+	const bool bZeroFromSpeedTaper = bEnableFootIK && bIsOnGround && !bTurningFootwork;
+	if (TargetAlpha == 0.0f && FootIKAlpha < KINDA_SMALL_NUMBER && !bZeroFromSpeedTaper)
 	{
 		FootIKOffsetZ_HandL = FootIKOffsetZ_HandR = FootIKOffsetZ_FootL = FootIKOffsetZ_FootR = 0.0f;
 		FootIKRot_HandL = FootIKRot_HandR = FootIKRot_FootL = FootIKRot_FootR = FRotator::ZeroRotator;
