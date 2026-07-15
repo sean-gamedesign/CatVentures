@@ -115,6 +115,14 @@ void ACatBase::BeginPlay()
 	CameraBoom->bEnableCameraRotationLag = bEnableCameraRotationLag;
 	CameraBoom->CameraRotationLagSpeed   = CameraRotationLagSpeed;
 
+	// Camera weight (M3): remember the authored socket offset + FOV — the dip spring
+	// and the sprint FOV push offset from these.
+	CamBaseSocketOffsetZ = CameraBoom->SocketOffset.Z;
+	if (FollowCamera)
+	{
+		CameraBaseFOV = FollowCamera->FieldOfView;
+	}
+
 	// Landing cushion: remember the mesh's authored relative Z — the spring offsets from it.
 	if (const USkeletalMeshComponent* MeshComp = GetMesh())
 	{
@@ -266,9 +274,11 @@ void ACatBase::Tick(float DeltaTime)
 		UpdateFootIK(DeltaTime);
 	}
 
-	// ── Pitch Clamping (local player only) ─────────────────────────
+	// ── Camera weight (M3) + pitch clamping (local player only) ────────
 	if (IsLocallyControlled())
 	{
+		UpdateCameraWeight(DeltaTime);
+
 		if (APlayerController* PC = Cast<APlayerController>(Controller))
 		{
 			FRotator ControlRot = PC->GetControlRotation();
@@ -1428,6 +1438,88 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// ── UpdateCameraWeight ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// M3 of the weighty-movement pass: per-gait spring-arm lag, landing dip, sprint
+// FOV push, stop-settle. Runs only for the locally controlled cat (it owns the
+// rendered camera) — purely cosmetic, nothing here replicates.
+void ACatBase::UpdateCameraWeight(float DeltaTime)
+{
+	if (!CameraBoom || !FollowCamera) return;
+
+	if (!bEnableCameraWeight)
+	{
+		// Kill any live dip so toggling the switch off can't strand the camera low.
+		if (CamDipOffset != 0.0f || CamDipVelocity != 0.0f)
+		{
+			CamDipOffset = CamDipVelocity = 0.0f;
+			FVector Socket = CameraBoom->SocketOffset;
+			Socket.Z = CamBaseSocketOffsetZ;
+			CameraBoom->SocketOffset = Socket;
+		}
+		return;
+	}
+
+	// ── (A) Per-gait lag — blended by ACTUAL speed, not sprint intent ──
+	// The blend RISES with raw speed (the CMC accel already ramps that over
+	// ~0.5 s) but RELAXES back through an interp: braking collapses Speed in a
+	// few frames, and an instantaneous blend snaps the lag speeds back to base
+	// mid-catch-up — the camera lurches onto the stopped cat (2026-07-14 PIE).
+	const FVector2D GaitSpeedRange(MovementMaxWalkSpeed, SprintMaxWalkSpeed);
+	const float SprintAlphaRaw = FMath::GetMappedRangeValueClamped(GaitSpeedRange, FVector2D(0.0f, 1.0f), Speed);
+	CamGaitAlpha = (SprintAlphaRaw >= CamGaitAlpha)
+		? SprintAlphaRaw
+		: FMath::FInterpTo(CamGaitAlpha, SprintAlphaRaw, DeltaTime, CameraGaitRelaxSpeed);
+	CameraBoom->CameraLagSpeed         = FMath::Lerp(CameraLagSpeed,         SprintCameraLagSpeed,         CamGaitAlpha);
+	CameraBoom->CameraRotationLagSpeed = FMath::Lerp(CameraRotationLagSpeed, SprintCameraRotationLagSpeed, CamGaitAlpha);
+
+	// ── (B) Sprint FOV push (shares the relaxed blend so the zoom-out eases with the lag) ──
+	const float TargetFOV = CameraBaseFOV + SprintFOVPush * CamGaitAlpha;
+	FollowCamera->SetFieldOfView(
+		FMath::FInterpTo(FollowCamera->FieldOfView, TargetFOV, DeltaTime, CameraFOVInterpSpeed));
+
+	// ── (C) Stop-settle — a sprint halting kicks a small dip ──────────
+	// Peak-tracking: the kick scales by how fast the run WAS (mapped over the
+	// trot→sprint band, so a plain trot stop stays silent).
+	constexpr float StoppedSpeed = 60.0f;
+	if (Speed >= StoppedSpeed)
+	{
+		CamPeakSpeedSinceStop = FMath::Max(CamPeakSpeedSinceStop, Speed);
+	}
+	else if (CamPeakSpeedSinceStop >= StoppedSpeed)
+	{
+		if (bIsOnGround && StopSettleDip > 0.0f)
+		{
+			const float SettleScale = FMath::GetMappedRangeValueClamped(
+				GaitSpeedRange, FVector2D(0.0f, 1.0f), CamPeakSpeedSinceStop);
+			CamDipVelocity -= StopSettleDip * SettleScale * CameraDipFrequency * UE_EULERS_NUMBER;
+		}
+		CamPeakSpeedSinceStop = 0.0f;
+	}
+
+	// ── (D) Dip spring (landing + stop-settle kicks) ──────────────────
+	// Same clamped-step semi-implicit spring as the landing cushion, applied to
+	// the spring arm's SocketOffset.Z (post-lag, so it reads as a camera dip).
+	if (FMath::Abs(CamDipOffset) < 0.01f && FMath::Abs(CamDipVelocity) < 0.1f)
+	{
+		CamDipOffset = CamDipVelocity = 0.0f;
+	}
+	else
+	{
+		const float DipDT = FMath::Min(DeltaTime, 1.0f / 30.0f);
+		const float W = CameraDipFrequency;
+		const float Accel = (-W * W * CamDipOffset) - (2.0f * CameraDipDampingRatio * W * CamDipVelocity);
+		CamDipVelocity += Accel * DipDT;
+		CamDipOffset = FMath::Clamp(CamDipOffset + CamDipVelocity * DipDT,
+		                            -CameraLandDipMax, CameraLandDipMax * 0.25f);
+	}
+	FVector Socket = CameraBoom->SocketOffset;
+	Socket.Z = CamBaseSocketOffsetZ + CamDipOffset;
+	CameraBoom->SocketOffset = Socket;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // ── UpdateFootIK ──────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 //
@@ -1863,6 +1955,13 @@ void ACatBase::Landed(const FHitResult& Hit)
 		const float MoveScale = (Speed > 150.0f) ? 0.4f : 1.0f;
 		const float DipTarget = FMath::Min(ImpactZ * LandCushionDipPerImpact, LandCushionMaxDip) * MoveScale;
 		MeshCushionVelocity = -DipTarget * LandCushionFrequency * UE_EULERS_NUMBER;
+	}
+
+	// Camera weight (M3): landing dip on the local player's camera. Additive into the
+	// dip spring so it composes with an in-flight stop-settle instead of clobbering it.
+	if (bEnableCameraWeight && IsLocallyControlled())
+	{
+		CamDipVelocity -= LandImpactIntensity * CameraLandDipMax * CameraDipFrequency * UE_EULERS_NUMBER;
 	}
 
 	SetJumpPhase(ECatJumpPhase::Land);

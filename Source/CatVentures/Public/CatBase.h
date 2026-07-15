@@ -96,6 +96,61 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", EditCondition = "bEnableCameraRotationLag"))
 	float CameraRotationLagSpeed = 8.0f;
 
+	// ── Camera Weight (M3, weighty-movement pass) ──────────────────────
+	// Per-gait spring-arm lag, landing dip, sprint FOV push, stop-settle.
+	// Local player's camera only — purely cosmetic, zero replication surface.
+	// Header-only defaults (no PrimeCatBase mirrors); all live-tunable in PIE.
+
+	/** Master switch for the M3 camera-weight layer. Disabling mid-play resets the
+	 *  dip but leaves lag/FOV at their last blended values until re-set. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight")
+	bool bEnableCameraWeight = true;
+
+	/** Positional lag speed at full sprint speed (blends from CameraLagSpeed by actual
+	 *  speed). Lower than the base = the camera trails at sprint — the speed read. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.0"))
+	float SprintCameraLagSpeed = 6.0f;
+
+	/** Rotational lag speed at full sprint speed (blends from CameraRotationLagSpeed).
+	 *  Lower = the camera swings wide on sprint turns. NOTE: the AnimX kit goes the
+	 *  OTHER direction (snappier at run, 5.0 vs 3.0 walk) — if trailing reads wrong
+	 *  in PIE, flip this above the base value instead. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.0"))
+	float SprintCameraRotationLagSpeed = 7.0f;
+
+	/** Max camera dip (cm) on a saturated hard landing (scaled by LandImpactIntensity —
+	 *  which saturates fast at GravityScaleFalling 5.5: most real jumps land near 1.0). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.0", ClampMax = "50.0"))
+	float CameraLandDipMax = 8.0f;
+
+	/** Camera dip spring angular frequency (rad/s). Higher = faster dip-and-recover. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "1.0", ClampMax = "40.0"))
+	float CameraDipFrequency = 9.0f;
+
+	/** Camera dip spring damping ratio (≥1 = no overshoot past rest). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.1", ClampMax = "2.0"))
+	float CameraDipDampingRatio = 0.9f;
+
+	/** FOV push (degrees) at full sprint speed, eased by actual speed. 0 disables.
+	 *  (6 read as too much on the 2026-07-11 first pass — halved.) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.0", ClampMax = "30.0"))
+	float SprintFOVPush = 3.0f;
+
+	/** Interp speed for the sprint FOV push. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.5", ClampMax = "20.0"))
+	float CameraFOVInterpSpeed = 5.0f;
+
+	/** Camera dip (cm) kicked when a sprint comes to a stop, scaled by how fast the
+	 *  run was (a trot stop is silent — only sprint-speed stops settle). 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.0", ClampMax = "20.0"))
+	float StopSettleDip = 4.0f;
+
+	/** Interp speed for the gait blend RELAXING back to base (lag speeds + FOV target)
+	 *  after slowing down; the rise tracks raw speed directly. Lower = gentler camera
+	 *  catch-up when a sprint stops (2026-07-14: instantaneous release read as a lurch). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Weight", meta = (ClampMin = "0.2", ClampMax = "20.0"))
+	float CameraGaitRelaxSpeed = 2.0f;
+
 	// ── Movement Tuning ────────────────────────────────────────────
 	// Applied to the CharacterMovementComponent in BeginPlay so per-instance
 	// Blueprint overrides take effect. These values define the LOCKED control
@@ -397,6 +452,27 @@ protected:
 	/** The mesh's authored relative rotation, captured in BeginPlay (the −90° yaw rig offset);
 	 *  the slope pitch composes onto this. */
 	FRotator MeshBaseRelRot = FRotator::ZeroRotator;
+
+	/** Camera-weight layer (M3): per-gait lag blend, dip spring, sprint FOV push,
+	 *  stop-settle. Runs for the locally controlled cat only (it owns the camera). */
+	void UpdateCameraWeight(float DeltaTime);
+
+	/** Camera dip spring state (cm, cm/s) on the spring arm's SocketOffset.Z —
+	 *  kicked by Landed() (impact dip) and the stop-settle detector. */
+	float CamDipOffset = 0.0f;
+	float CamDipVelocity = 0.0f;
+
+	/** The spring arm's authored SocketOffset.Z / camera FOV, captured in BeginPlay;
+	 *  the dip and FOV push offset from these. */
+	float CamBaseSocketOffsetZ = 0.0f;
+	float CameraBaseFOV = 90.0f;
+
+	/** Peak ground speed since the cat last stopped — drives the stop-settle kick scale. */
+	float CamPeakSpeedSinceStop = 0.0f;
+
+	/** Smoothed sprint blend (0..1) for the lag/FOV gait lerp — rises with raw speed,
+	 *  relaxes at CameraGaitRelaxSpeed so braking doesn't snap the lag back to base. */
+	float CamGaitAlpha = 0.0f;
 
 	/** Interpolates cosmetic-only variables (aim, breath, mesh offsets). Skipped on dedicated servers. */
 	void UpdateCosmeticInterpolation(float DeltaTime);
