@@ -267,6 +267,55 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "10.0"))
 	float PivotPlantDip = 5.0f;
 
+	// ── Weighty Stop (M2 part 2b, weighty-movement pass) ───────────────
+	// Releasing input at speed swaps the CMC's exponential friction braking
+	// (GroundFriction-dominated — a sprint halts in ~52 cm / 0.26 s) for a
+	// CONSTANT deceleration, so stop distance scales with v²: the sprint run-out
+	// carries ~3× a trot's from the single deceleration knob. When the speed
+	// collapses (the plant) the landing-cushion spring takes an entry-speed-scaled
+	// kick and a short re-acceleration ramp keeps a fresh press from instantly
+	// cancelling the halt. The braking swap is movement-affecting (mirrored to the
+	// server, pivot pattern); the plant dip and ramp are local cosmetics.
+
+	/** Master switch for weighty stops (constant-deceleration run-out + plant on input release). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop")
+	bool bEnableWeightyStops = true;
+
+	/** Minimum ground speed (cm/s) at input release to start a run-out. Below it (the walk
+	 *  band) the ordinary friction stop already reads fine. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "1000.0"))
+	float StopMinSpeed = 300.0f;
+
+	/** Constant braking deceleration (cm/s²) during the run-out — THE stop-distance knob.
+	 *  Distance = v²/2a: at 1000, sprint 650 ≈ 209 cm / 0.57 s, trot 400 ≈ 77 cm / 0.32 s.
+	 *  (First pass shipped 1400 — the sprint glide was too short to register on screen;
+	 *  1000 Sean-approved 2026-07-19, PIE-measured 170 cm / 0.52 s from a 592 entry.) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "400.0", ClampMax = "4000.0"))
+	float StopBrakingDeceleration = 1000.0f;
+
+	/** Braking friction during the run-out (applied via bUseSeparateBrakingFriction). Near-zero
+	 *  keeps the deceleration constant so the v² distance scaling actually holds. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "8.0"))
+	float StopBrakingFriction = 0.0f;
+
+	/** Speed (cm/s) at which the run-out counts as planted — fires the cushion kick + re-accel ramp. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float StopPlantSpeed = 80.0f;
+
+	/** Plant dip (cm) kicked into the landing-cushion spring, scaled by the stop's entry speed.
+	 *  SHIPS 0 (2026-07-19 isolation probe): the kick read as a funky spine pop at the halt —
+	 *  at 10 it slammed the spring's clamp, and even moderate values fight the accel-lean
+	 *  release overshoot, which already gives the stop its rear-up settle for free. Keep the
+	 *  knob: a skid clip (M5) may want a small dip composed under its contact frames. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float StopPlantDip = 0.0f;
+
+	/** Post-plant re-acceleration ramp (s): Move input scales 0→1 over this window so a fresh
+	 *  press eases back in instead of instantly cancelling the halt. Scaled by entry speed
+	 *  (a trot plant's ramp is shorter than a sprint plant's); 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float StopReaccelDelay = 0.18f;
+
 	// ── Jump Tuning ───────────────────────────────────────────────────
 
 	/** Initial vertical launch velocity (cm/s). Wired to CMC->JumpZVelocity. */
@@ -618,6 +667,24 @@ protected:
 	/** Applies (true) or restores (false) the pivot braking deceleration on the CMC. */
 	void ApplyPivotBraking(bool bApply);
 
+	// ── Weighty Stop (M2 part 2b) ───────────────────────────────────────
+	/** Detects the input-release edge at speed and runs the stop run-out + plant. Local owner
+	 *  only; runs AFTER UpdateMovingPivot (a pivot supersedes a stop — its input suppression
+	 *  must not read as a release). */
+	void UpdateWeightyStop();
+
+	/** Stop entry: swap to constant-deceleration braking (predicted + server RPC). */
+	void EnterStop();
+
+	/** Stop exit: restore gait braking (deferring to a live pivot). bPlanted = the run-out
+	 *  completed — fires the cushion plant kick and arms the re-accel ramp. Safe to call redundantly. */
+	void ExitStop(bool bPlanted);
+
+	/** Applies (true) or restores (false) the stop braking: separate braking friction + the
+	 *  constant StopBrakingDeceleration. The restore path re-asserts whichever braking the
+	 *  CMC should be under (pivot boost if one is live, else the normal gait braking). */
+	void ApplyStopBraking(bool bApply);
+
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
 
@@ -733,6 +800,11 @@ protected:
 	 *  a lost restore would leave the server braking hard forever. */
 	UFUNCTION(Server, Reliable)
 	void Server_SetPivotBraking(bool bApply);
+
+	/** Client → Server: mirror the stop braking swap so server-side move replay coasts the same
+	 *  as the owning client. Reliable — a lost restore would leave the server coasting forever. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetStopBraking(bool bApply);
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
@@ -1124,6 +1196,30 @@ private:
 
 	/** Seconds since Move() last supplied non-zero input; past ~0.15 s the input counts as released. */
 	float PivotInputStaleTime = 1.0f;
+
+	// ── Weighty Stop State (local owner only) ──────────────────────────
+
+	/** True while a stop run-out is active (constant-deceleration braking applied). */
+	bool bIsStopping = false;
+
+	/** Ground speed when the run-out began — scales the plant dip and the re-accel ramp. */
+	float StopEntrySpeed = 0.0f;
+
+	/** World location where the run-out began (distance logging — the M5 skid-clip spec numbers). */
+	FVector StopStartLocation = FVector::ZeroVector;
+
+	/** Seconds the current run-out has been active (failsafe timeout on steep downhill). */
+	float StopElapsed = 0.0f;
+
+	/** Seconds remaining of the post-plant re-acceleration ramp (consumed by Move). */
+	float StopReaccelTimer = 0.0f;
+
+	/** The armed ramp's full duration (denominator of Move's 0→1 input scale). */
+	float StopReaccelDuration = 0.0f;
+
+	/** bHasMovementInput last frame — a stop triggers on the had-input → released EDGE only,
+	 *  so external shoves at speed with no prior input can't start a run-out. */
+	bool bHadMovementInputLastFrame = false;
 
 	/** Fires when PhysicsBumper overlaps a PhysicsBody. Applies BumperPushForce on authority. */
 	UFUNCTION()

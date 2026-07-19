@@ -355,8 +355,17 @@ void ACatBase::Move(const FInputActionValue& Value)
 			return;
 		}
 
-		AddMovementInput(ForwardDirection, MoveInput.Y);
-		AddMovementInput(RightDirection,   MoveInput.X);
+		// Post-plant re-acceleration ramp: right after a weighty stop's plant, a fresh
+		// press scales 0→1 over the remaining window instead of instantly cancelling
+		// the halt. Input magnitude scales CMC acceleration, so this is an accel ease-in.
+		float InputScale = 1.0f;
+		if (StopReaccelTimer > 0.0f && StopReaccelDuration > KINDA_SMALL_NUMBER)
+		{
+			InputScale = 1.0f - (StopReaccelTimer / StopReaccelDuration);
+		}
+
+		AddMovementInput(ForwardDirection, MoveInput.Y * InputScale);
+		AddMovementInput(RightDirection,   MoveInput.X * InputScale);
 	}
 }
 
@@ -625,6 +634,143 @@ void ACatBase::ApplyPivotBraking(bool bApply)
 void ACatBase::Server_SetPivotBraking_Implementation(bool bApply)
 {
 	ApplyPivotBraking(bApply);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Weighty Stop (M2 part 2b, weighty-movement pass) ──────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Releasing input at speed swaps the CMC's braking model for the duration of the
+// stop. Default braking is friction-dominated (GroundFriction 5 × factor 2 → a
+// ~60 ms exponential decay constant): a sprint halts in ~52 cm and a trot in
+// ~29 cm — quick, light, and barely gait-differentiated, because exponential
+// decay compresses entry-speed differences. A CONSTANT deceleration instead makes
+// stop distance v²/2a, so the sprint run-out naturally carries ~3× the trot's
+// from one knob. The cat keeps striding down through the gait blendspace as
+// speed bleeds (a natural run-out stop — no skid clip exists yet; that's the M5
+// batch), the accel-lean spring braces the body, and at the plant the
+// landing-cushion spring takes a kick while the camera stop-settle fires on its
+// own. Local owner drives everything; only the braking swap touches the server.
+
+void ACatBase::UpdateWeightyStop()
+{
+	const float DeltaTime = DeltaTimeCached;
+	StopReaccelTimer = FMath::Max(StopReaccelTimer - DeltaTime, 0.0f);
+
+	const bool bGrounded = MovementStage == ECatMovementStage::OnGround
+		&& JumpPhase == ECatJumpPhase::None;
+
+	if (!bIsStopping)
+	{
+		// Entry: the had-input → released edge while grounded at gait speed. The pivot
+		// gate matters because its input suppression zeroes acceleration, which would
+		// otherwise read as a release right as the pivot plants.
+		const bool bReleasedAtSpeed = bEnableWeightyStops
+			&& !bIsPivoting
+			&& !bIsGrabbing
+			&& bGrounded
+			&& bHadMovementInputLastFrame
+			&& !bHasMovementInput
+			&& Speed >= StopMinSpeed;
+		if (bReleasedAtSpeed)
+		{
+			EnterStop();
+		}
+	}
+	else
+	{
+		StopElapsed += DeltaTime;
+
+		// Failsafe: a steep-downhill run-out can outlast any sensible stop.
+		constexpr float StopMaxDuration = 1.2f;
+
+		if (!bEnableWeightyStops || bIsPivoting || bIsGrabbing || !bGrounded
+			|| bHasMovementInput || StopElapsed > StopMaxDuration)
+		{
+			ExitStop(false);   // interrupted — no plant, no ramp
+		}
+		else if (Speed <= StopPlantSpeed)
+		{
+			ExitStop(true);    // run-out complete — plant
+		}
+	}
+
+	bHadMovementInputLastFrame = bHasMovementInput;
+}
+
+void ACatBase::EnterStop()
+{
+	bIsStopping       = true;
+	StopEntrySpeed    = Speed;
+	StopStartLocation = GetActorLocation();
+	StopElapsed       = 0.0f;
+
+	// Predicted braking swap; the server mirrors it so move replay coasts the same.
+	ApplyStopBraking(true);
+	if (!HasAuthority())
+	{
+		Server_SetStopBraking(true);
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Stop ENTER — Speed %.0f"), *GetName(), StopEntrySpeed);
+}
+
+void ACatBase::ExitStop(bool bPlanted)
+{
+	if (!bIsStopping)
+	{
+		return;
+	}
+	bIsStopping = false;
+
+	ApplyStopBraking(false);
+	if (!HasAuthority())
+	{
+		Server_SetStopBraking(false);
+	}
+
+	if (bPlanted)
+	{
+		// Entry-speed scale over the stop→sprint band — a sprint plant hits harder
+		// and guards re-acceleration longer than a bare-minimum trot plant.
+		const float PlantScale = FMath::GetMappedRangeValueClamped(
+			FVector2D(StopMinSpeed, SprintMaxWalkSpeed), FVector2D(0.4f, 1.0f), StopEntrySpeed);
+
+		// Plant dip: additive kick into the landing-cushion spring (pivot pattern —
+		// composes with a same-moment landing kick instead of clobbering it).
+		if (bEnableLandCushion && StopPlantDip > 0.0f)
+		{
+			MeshCushionVelocity -= StopPlantDip * PlantScale * LandCushionFrequency * UE_EULERS_NUMBER;
+		}
+
+		StopReaccelDuration = StopReaccelDelay * PlantScale;
+		StopReaccelTimer    = StopReaccelDuration;
+	}
+
+	// Per-stop spec line: entry speed + run-out distance/duration. These numbers are
+	// the M5 skid-clip authoring spec — read them out of the log after a PIE session.
+	const float RunOutDist = FVector::Dist2D(GetActorLocation(), StopStartLocation);
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Stop %s — entry %.0f cm/s, run-out %.0f cm in %.2f s"),
+		*GetName(), bPlanted ? TEXT("PLANT") : TEXT("ABORT"), StopEntrySpeed, RunOutDist, StopElapsed);
+}
+
+void ACatBase::ApplyStopBraking(bool bApply)
+{
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->bUseSeparateBrakingFriction = bApply;
+		CMC->BrakingFriction             = bApply ? StopBrakingFriction : MovementBrakingFriction;
+		// The restore re-asserts whichever braking should be live: the pivot boost if a
+		// pivot owns the CMC (defensive — the stop exits on the input frame, a pivot
+		// arms ≥ PivotSustainTime later, so overlap shouldn't occur), else gait braking.
+		CMC->BrakingDecelerationWalking  = bApply ? StopBrakingDeceleration
+		                                 : (bIsPivoting ? PivotBrakingDeceleration : MovementBrakingDeceleration);
+	}
+}
+
+void ACatBase::Server_SetStopBraking_Implementation(bool bApply)
+{
+	ApplyStopBraking(bApply);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1303,6 +1449,11 @@ void ACatBase::UpdateAnimationStates()
 		// UpdateTurnInPlace: its SpeedType write gates turn-in-place off, and the shared
 		// interp/RPC block there carries its footwork + yaw to the other machines.
 		UpdateMovingPivot();
+
+		// (f2c) Weighty stop — input release at speed swaps to constant-deceleration
+		// braking for a real run-out + plant. Runs AFTER the pivot: a pivot supersedes,
+		// and its input suppression must not read as a release here.
+		UpdateWeightyStop();
 
 		// (f3) Turn-In-Place — when idle, procedurally rotate the body toward the camera
 		// and drive the BS1_Cat_Turn footwork (sets SpeedType=Turn, bGoTurn, TurnRateAnim).
