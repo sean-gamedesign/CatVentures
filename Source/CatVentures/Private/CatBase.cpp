@@ -337,6 +337,24 @@ void ACatBase::Move(const FInputActionValue& Value)
 		const FVector ForwardDirection = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
 		const FVector RightDirection   = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
 
+		// Cache the world-space steering direction for the moving pivot. Input events
+		// fire before Tick, so UpdateMovingPivot always sees this frame's steer.
+		const FVector WorldInput = ForwardDirection * MoveInput.Y + RightDirection * MoveInput.X;
+		if (WorldInput.SizeSquared() > KINDA_SMALL_NUMBER)
+		{
+			PivotLiveInputDir   = WorldInput.GetSafeNormal();
+			PivotInputStaleTime = 0.0f;
+		}
+
+		// During a pivot the plant owns locomotion: input keeps steering the pivot
+		// target (cache above) but must not feed the CMC — zero acceleration is what
+		// lets friction brake the cat and keeps orient-to-movement inert under the
+		// pivot's SetActorRotation.
+		if (bIsPivoting)
+		{
+			return;
+		}
+
 		AddMovementInput(ForwardDirection, MoveInput.Y);
 		AddMovementInput(RightDirection,   MoveInput.X);
 	}
@@ -423,6 +441,193 @@ void ACatBase::OnSwatMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// ── Moving Pivot (M2 part 2, weighty-movement pass) ───────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// A hard sustained steer at speed (input direction far off the velocity direction —
+// the saturated-lean edge case from the M2 part 1 pass) plants the cat and turns it
+// with the BS1_Cat_Turn footwork instead of letting the orient-to-movement arc swing
+// the body through. While planted: Move() input is suppressed (friction + boosted
+// braking kill the speed), the body rotates toward the live input direction at a
+// capped rate (orient-to-movement is inert at zero acceleration, so SetActorRotation
+// is uncontested — same mechanism as turn-in-place), and the landing-cushion spring
+// takes a plant kick. Footwork + yaw ride the existing turn RPC infrastructure via
+// the shared block in UpdateTurnInPlace; the camera stop-settle fires by itself as
+// the speed collapses through the stopped threshold.
+
+void ACatBase::UpdateMovingPivot()
+{
+	const float DeltaTime = DeltaTimeCached;
+	PivotInputStaleTime += DeltaTime;
+	PivotCooldownTimer   = FMath::Max(PivotCooldownTimer - DeltaTime, 0.0f);
+	PivotTurnRateTarget  = 0.0f;
+
+	const bool bInputFresh = PivotInputStaleTime < 0.15f;
+
+	if (!bIsPivoting)
+	{
+		// ── Arm/detect ────────────────────────────────────────────────
+		FVector Vel = GetVelocity();
+		Vel.Z = 0.0f;
+		FVector InputAccel = GetCharacterMovement()
+			? GetCharacterMovement()->GetCurrentAcceleration() : FVector::ZeroVector;
+		InputAccel.Z = 0.0f;
+
+		float SteerAngle = 0.0f;
+		if (Vel.SizeSquared() >= 100.0f && InputAccel.SizeSquared() >= 1.0f)
+		{
+			const float Dot = FVector::DotProduct(Vel.GetSafeNormal(), InputAccel.GetSafeNormal());
+			SteerAngle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0f, 1.0f)));
+		}
+
+		// Sweep accumulator: how far the input DIRECTION has rotated while the sustain
+		// window runs. A camera sweep keeps rotating the input (that's what holds the
+		// steer angle up against the velocity chase); a direction tap flips once and
+		// then holds constant. This is the sweep-tier discriminator.
+		const float InputYaw = (InputAccel.SizeSquared() >= 1.0f)
+			? InputAccel.Rotation().Yaw : PivotPrevInputYaw;
+		const float InputYawDelta = FMath::Abs(FRotator::NormalizeAxis(InputYaw - PivotPrevInputYaw));
+		PivotPrevInputYaw = InputYaw;
+		if (PivotSustainTimer > 0.0f)
+		{
+			PivotSweepAccumDeg += InputYawDelta;
+		}
+
+		// Speed gates: full PivotMinSpeed only to START the sustain window — the hard
+		// steer itself brakes the cat, so re-checking it every frame voided the trigger
+		// right as the angle peaked (2026-07-18 diag round). Once armed, only a
+		// near-stop cancels.
+		constexpr float PivotKeepArmedMinSpeed = 100.0f;   // cm/s
+		const float RequiredSpeed = (PivotSustainTimer > 0.0f) ? PivotKeepArmedMinSpeed : PivotMinSpeed;
+
+		const bool bEligible = bEnableMovingPivot
+			&& PivotCooldownTimer <= 0.0f
+			&& !bIsGrabbing
+			&& MovementStage == ECatMovementStage::OnGround
+			&& JumpPhase == ECatJumpPhase::None
+			&& Speed >= RequiredSpeed
+			&& bInputFresh;
+		if (!bEligible || SteerAngle < PivotAngleThreshold)
+		{
+			PivotSustainTimer   = 0.0f;
+			PivotSweepAccumDeg  = 0.0f;
+			return;
+		}
+
+		// Sustain filter: a corrective flick crosses the threshold for a frame or two;
+		// a deliberate hard steer holds it.
+		PivotSustainTimer += DeltaTime;
+		if (PivotSustainTimer < PivotSustainTime)
+		{
+			return;
+		}
+
+		// Two-tier fire: a hard reversal (flip tier) is unambiguous; the lower sweep
+		// tier also demands the input DIRECTION rotated during the window, so ordinary
+		// direction taps — which cross the same angle band with a constant input —
+		// keep waiting here until their angle decays and the window resets.
+		if (SteerAngle < PivotFlipAngle && PivotSweepAccumDeg < PivotSweepMinDeg)
+		{
+			return;
+		}
+
+		EnterPivot();
+	}
+
+	// ── Run the plant-and-turn ────────────────────────────────────────
+	if (bIsPivoting)
+	{
+		// Abort: anything that invalidates a grounded plant, or input released.
+		if (!bEnableMovingPivot || bIsGrabbing || !bInputFresh
+			|| MovementStage != ECatMovementStage::OnGround
+			|| JumpPhase != ECatJumpPhase::None)
+		{
+			ExitPivot();
+			return;
+		}
+
+		const float DesiredYaw = PivotLiveInputDir.Rotation().Yaw;
+		const float CurrentYaw = GetActorRotation().Yaw;
+		if (FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - CurrentYaw)) <= PivotExitAngle)
+		{
+			ExitPivot();
+			return;
+		}
+
+		// Same capped-rate shortest-path rotation as turn-in-place; the input direction
+		// is live, so a still-sweeping camera keeps the pivot chasing it.
+		const float NewYaw       = FMath::FixedTurn(CurrentYaw, DesiredYaw, PivotTurnSpeedDegPerSec * DeltaTime);
+		const float AppliedDelta = FRotator::NormalizeAxis(NewYaw - CurrentYaw);
+		SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
+
+		// Scaled by PivotFootworkCap: full-rate pivots sit in the 45-step blend zone
+		// instead of pinning the stride-elevated Move_Turn-90 rim clips (see header).
+		const float AppliedRate = (DeltaTime > KINDA_SMALL_NUMBER) ? AppliedDelta / DeltaTime : 0.0f;
+		PivotTurnRateTarget = FMath::Clamp(AppliedRate / PivotTurnSpeedDegPerSec, -1.0f, 1.0f) * PivotFootworkCap;
+
+		SpeedType = ECatMoveType::Turn;   // footwork state; also gates turn-in-place + lean off
+	}
+}
+
+void ACatBase::EnterPivot()
+{
+	bIsPivoting        = true;
+	PivotSustainTimer  = 0.0f;
+	PivotSweepAccumDeg = 0.0f;
+
+	// Predicted braking boost; the server mirrors it so move replay agrees.
+	ApplyPivotBraking(true);
+	if (!HasAuthority())
+	{
+		Server_SetPivotBraking(true);
+	}
+
+	// Plant dip: additive kick into the landing-cushion spring (composes with a
+	// same-moment landing kick instead of clobbering it), scaled by entry speed
+	// over the trot→sprint band so a sprint plant hits harder than a trot plant.
+	if (bEnableLandCushion)
+	{
+		const float PlantScale = FMath::GetMappedRangeValueClamped(
+			FVector2D(PivotMinSpeed, SprintMaxWalkSpeed), FVector2D(0.5f, 1.0f), Speed);
+		MeshCushionVelocity -= PivotPlantDip * PlantScale * LandCushionFrequency * UE_EULERS_NUMBER;
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot ENTER — Speed %.0f"), *GetName(), Speed);
+}
+
+void ACatBase::ExitPivot()
+{
+	if (!bIsPivoting)
+	{
+		return;
+	}
+
+	bIsPivoting        = false;
+	PivotCooldownTimer = PivotCooldown;
+
+	ApplyPivotBraking(false);
+	if (!HasAuthority())
+	{
+		Server_SetPivotBraking(false);
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot EXIT — Speed %.0f"), *GetName(), Speed);
+}
+
+void ACatBase::ApplyPivotBraking(bool bApply)
+{
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->BrakingDecelerationWalking = bApply ? PivotBrakingDeceleration : MovementBrakingDeceleration;
+	}
+}
+
+void ACatBase::Server_SetPivotBraking_Implementation(bool bApply)
+{
+	ApplyPivotBraking(bApply);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // ── Turn-In-Place (root-motion montages) ──────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 //
@@ -452,7 +657,8 @@ void ACatBase::UpdateTurnInPlace()
 	constexpr float TurnEngageMaxSpeed = 10.0f;   // cm/s
 	const bool bCanTurn = (SpeedType == ECatMoveType::Idle)
 		&& (MovementStage == ECatMovementStage::OnGround)
-		&& (Speed < TurnEngageMaxSpeed);
+		&& (Speed < TurnEngageMaxSpeed)
+		&& !bIsPivoting;   // pivot owns the body + footwork (its SpeedType=Turn also gates this)
 
 	// Hysteresis: a deliberate offset (TurnInPlaceThreshold) engages the turn; it stays
 	// engaged until the body is nearly aligned, so it neither quits short nor chatters at
@@ -489,9 +695,19 @@ void ACatBase::UpdateTurnInPlace()
 
 		SpeedType = ECatMoveType::Turn;   // drive the AnimBP Locomotion Turn state
 	}
+	else if (bIsPivoting)
+	{
+		// Moving pivot (runs earlier this frame): its footwork rides the same
+		// TurnRateAnim interp and turn RPCs as turn-in-place.
+		TargetTurnRate = PivotTurnRateTarget;
+	}
 
-	// Ease the blend param so the footwork fades in/out instead of popping.
-	constexpr float TurnRateInterpSpeed = 10.0f;
+	// Ease the blend param so the footwork fades in/out instead of popping. The pivot
+	// uses a much faster attack: a plant is sudden and rotates hardest on its first
+	// frames — the soft turn-in-place ramp left the footwork near the idle pose for
+	// ~0.25 s while the body whipped (the "skating" in the 2026-07-18 sampler round:
+	// TurnRateAnim 0.08 at pivot entry, ~0.9 only a quarter-second later).
+	const float TurnRateInterpSpeed = bIsPivoting ? 30.0f : 10.0f;
 	TurnRateAnim = FMath::FInterpTo(TurnRateAnim, TargetTurnRate, DeltaTime, TurnRateInterpSpeed);
 
 	// Replicate the turn to other machines via the existing RPC infra: proxies enter the
@@ -503,17 +719,18 @@ void ACatBase::UpdateTurnInPlace()
 	// the 2026-07-06 MP pass: the host saw the client cat's body never rotate). The yaw
 	// therefore rides the turn RPCs explicitly; the server applies it and standard movement
 	// replication carries it on to simulated proxies.
+	const bool bTurnActive = bIsTurningInPlace || bIsPivoting;
 	const float BodyYaw = GetActorRotation().Yaw;
-	if (bGoTurn != bIsTurningInPlace)
+	if (bGoTurn != bTurnActive)
 	{
-		bGoTurn = bIsTurningInPlace;
+		bGoTurn = bTurnActive;
 		LastSentBodyYaw = BodyYaw;
-		if (!HasAuthority()) Server_SetTurnActive(bIsTurningInPlace, BodyYaw);
+		if (!HasAuthority()) Server_SetTurnActive(bTurnActive, BodyYaw);
 	}
 	// Send on rate change OR yaw drift: a saturated full-speed turn holds TurnRateAnim
 	// constant at ±1, so a rate-only throttle would starve the server of yaw mid-turn.
 	if (FMath::Abs(TurnRateAnim - LastSentTurnRateAnim) > 0.05f
-		|| (bIsTurningInPlace && FMath::Abs(FRotator::NormalizeAxis(BodyYaw - LastSentBodyYaw)) > 5.0f))
+		|| (bTurnActive && FMath::Abs(FRotator::NormalizeAxis(BodyYaw - LastSentBodyYaw)) > 5.0f))
 	{
 		LastSentTurnRateAnim = TurnRateAnim;
 		LastSentBodyYaw = BodyYaw;
@@ -1080,6 +1297,12 @@ void ACatBase::UpdateAnimationStates()
 
 		AimPitch = FRotator::NormalizeAxis(GetControlRotation().Pitch);
 		AimPitchClamped = FMath::Clamp(AimPitch, -90.0f, 90.0f);
+
+		// (f2b) Moving pivot — at speed, a hard sustained steer plants the cat and turns
+		// it with footwork (sets SpeedType=Turn + PivotTurnRateTarget). Runs BEFORE
+		// UpdateTurnInPlace: its SpeedType write gates turn-in-place off, and the shared
+		// interp/RPC block there carries its footwork + yaw to the other machines.
+		UpdateMovingPivot();
 
 		// (f3) Turn-In-Place — when idle, procedurally rotate the body toward the camera
 		// and drive the BS1_Cat_Turn footwork (sets SpeedType=Turn, bGoTurn, TurnRateAnim).

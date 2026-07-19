@@ -192,6 +192,81 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Sprint", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
 	float SprintRotationRateYaw = 150.0f;
 
+	// ── Moving Pivot (M2 part 2, weighty-movement pass) ────────────────
+	// A hard sustained steer at speed (input far off the velocity direction) plants
+	// the cat and turns it with BS1_Cat_Turn footwork instead of letting the
+	// orient-to-movement arc swing the body through. Header-only defaults,
+	// live-tunable; the plant itself is cosmetic but the input suppression and
+	// braking boost are movement-affecting (braking mirrored to the server).
+
+	/** Master switch for the moving pivot (plant-and-turn on a hard steer). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot")
+	bool bEnableMovingPivot = true;
+
+	/** SWEEP-tier steering angle (deg, velocity vs input): at or beyond this, a pivot arms IF the
+	 *  input direction has also rotated ≥ PivotSweepMinDeg during the sustain window. Velocity
+	 *  CHASES the input at the CMC rotation rate, so camera sweeps live in the 40–65° band
+	 *  (2026-07-18 diag rounds) — but ordinary 90° direction taps pass through that same band
+	 *  for ~0.2 s, so angle alone can't discriminate; the input-rotation requirement does
+	 *  (a sweep keeps rotating, a tap's input is constant after the flip). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "30.0", ClampMax = "180.0"))
+	float PivotAngleThreshold = 55.0f;
+
+	/** FLIP-tier steering angle (deg): at or beyond this the pivot arms with NO input-rotation
+	 *  requirement — a single hard reversal (S-flick 180) has a constant input direction and
+	 *  must not be filtered by the sweep requirement. Ordinary 90° taps never reach it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "90.0", ClampMax = "180.0"))
+	float PivotFlipAngle = 110.0f;
+
+	/** Minimum input-direction rotation (deg, accumulated over the sustain window) for the
+	 *  sweep tier to fire. Filters direction taps (≈0°) from deliberate camera sweeps — a sweep
+	 *  that can hold the steer angle up must out-rotate the velocity chase, giving ≥ ~18°/0.12 s. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+	float PivotSweepMinDeg = 15.0f;
+
+	/** Minimum ground speed (cm/s) to ARM a pivot — checked only on the first over-threshold
+	 *  frame. Deliberately NOT enforced while the sustain timer runs: a hard steer brakes the
+	 *  cat, so a continuous check voided the trigger right as the angle peaked (diag round). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "1000.0"))
+	float PivotMinSpeed = 240.0f;
+
+	/** Seconds the steering angle must stay past the threshold before the pivot fires. Filters
+	 *  ordinary 90° direction taps (their angle decays below the threshold in ~0.1 s at the
+	 *  trot rotation rate) while a genuinely held hard steer survives it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float PivotSustainTime = 0.12f;
+
+	/** Body rotation rate (deg/s) during the pivot turn. 200 keeps the body inside what the
+	 *  45/90 turn footwork can visually keep up with (270 outran it — sliding feet). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "90.0", ClampMax = "720.0"))
+	float PivotTurnSpeedDegPerSec = 200.0f;
+
+	/** Scale on the pivot's footwork blend param (TurnRateAnim). The A_Cat_Move_Turn clips
+	 *  are the kit's MOVING-turn clips — stride-elevated footwork through their WHOLE range
+	 *  (2026-07-18 paw sampler: paws hover 3–7 cm and never fully plant at any sustained
+	 *  blend position; ground contact −22.5, "planted" paw ≥ −20). There is no cap value
+	 *  that reads planted — lower slides, higher paddles; 0.4 is the accepted interim.
+	 *  Real fix = a dedicated CtrlRig-authored plant-pivot clip (M5 asset batch). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.1", ClampMax = "1.0"))
+	float PivotFootworkCap = 0.4f;
+
+	/** Remaining angle (deg) to the input direction at which the pivot releases and input flows again. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "2.0", ClampMax = "60.0"))
+	float PivotExitAngle = 15.0f;
+
+	/** Seconds after a pivot before another may arm (stops oscillating steers from chaining plants). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float PivotCooldown = 0.3f;
+
+	/** Braking deceleration (cm/s²) while planted — the speed kill. Restored to
+	 *  MovementBrakingDeceleration on exit; mirrored to the server so move replay agrees. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "500.0", ClampMax = "8000.0"))
+	float PivotBrakingDeceleration = 2000.0f;
+
+	/** Plant dip (cm) kicked into the landing-cushion spring on pivot entry, scaled by entry speed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float PivotPlantDip = 5.0f;
+
 	// ── Jump Tuning ───────────────────────────────────────────────────
 
 	/** Initial vertical launch velocity (cm/s). Wired to CMC->JumpZVelocity. */
@@ -528,6 +603,21 @@ protected:
 	/** When idle, procedurally rotates the body toward the camera and drives the BS1_Cat_Turn footwork. */
 	void UpdateTurnInPlace();
 
+	// ── Moving Pivot (M2 part 2) ────────────────────────────────────────
+	/** At speed, detects a hard sustained steer and runs the plant-and-turn. Local owner only;
+	 *  runs BEFORE UpdateTurnInPlace so its SpeedType=Turn write gates turn-in-place off and
+	 *  its footwork target rides the shared TurnRateAnim interp + turn RPC block. */
+	void UpdateMovingPivot();
+
+	/** Pivot entry: suppress input, boost braking (predicted + server RPC), kick the plant dip. */
+	void EnterPivot();
+
+	/** Pivot exit: restore braking, arm the cooldown. Safe to call redundantly. */
+	void ExitPivot();
+
+	/** Applies (true) or restores (false) the pivot braking deceleration on the CMC. */
+	void ApplyPivotBraking(bool bApply);
+
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
 
@@ -637,6 +727,12 @@ protected:
 
 	/** Applies an owning client's in-place body yaw to this (non-locally-controlled) copy. */
 	void ApplyClientTurnYaw(float BodyYaw);
+
+	/** Client → Server: mirror the pivot braking boost so server-side move replay brakes the
+	 *  same as the owning client (the grab drag-settings prediction pattern). Reliable —
+	 *  a lost restore would leave the server braking hard forever. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetPivotBraking(bool bApply);
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
@@ -1001,6 +1097,33 @@ private:
 
 	/** True while a procedural turn-in-place is engaged (hysteresis flag; see UpdateTurnInPlace). */
 	bool bIsTurningInPlace = false;
+
+	// ── Moving Pivot State (local owner only) ──────────────────────────
+
+	/** True while a plant-and-turn pivot is running (input suppressed, body rotating to input). */
+	bool bIsPivoting = false;
+
+	/** Accumulates time the steering angle has been past PivotAngleThreshold. */
+	float PivotSustainTimer = 0.0f;
+
+	/** Time remaining before another pivot may arm. */
+	float PivotCooldownTimer = 0.0f;
+
+	/** This frame's footwork rate target (±1), consumed by the shared TurnRateAnim interp in UpdateTurnInPlace. */
+	float PivotTurnRateTarget = 0.0f;
+
+	/** World-space input direction cached by Move() — the live pivot target (input events fire before Tick). */
+	FVector PivotLiveInputDir = FVector::ZeroVector;
+
+	/** Input-direction yaw last tick (for the sweep accumulator). */
+	float PivotPrevInputYaw = 0.0f;
+
+	/** Accumulated |input-direction yaw change| (deg) while the sustain window runs — the
+	 *  sweep-tier discriminator (taps accumulate ~0, camera sweeps keep adding). */
+	float PivotSweepAccumDeg = 0.0f;
+
+	/** Seconds since Move() last supplied non-zero input; past ~0.15 s the input counts as released. */
+	float PivotInputStaleTime = 1.0f;
 
 	/** Fires when PhysicsBumper overlaps a PhysicsBody. Applies BumperPushForce on authority. */
 	UFUNCTION()
