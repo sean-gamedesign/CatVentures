@@ -355,13 +355,27 @@ void ACatBase::Move(const FInputActionValue& Value)
 			return;
 		}
 
+		// During the start coil the body loads before it launches — same suppression
+		// contract as the pivot: the direction cache above keeps steering live.
+		if (bIsStartCoiling)
+		{
+			return;
+		}
+
+		// Input envelopes — both ease CMC acceleration in by scaling input magnitude.
 		// Post-plant re-acceleration ramp: right after a weighty stop's plant, a fresh
 		// press scales 0→1 over the remaining window instead of instantly cancelling
-		// the halt. Input magnitude scales CMC acceleration, so this is an accel ease-in.
+		// the halt. M4 fresh-input ramp: a plain start from idle eases in over
+		// StartInputRampTime so a keyboard tap doesn't twitch. Overlap takes the
+		// stricter (smaller) scale.
 		float InputScale = 1.0f;
 		if (StopReaccelTimer > 0.0f && StopReaccelDuration > KINDA_SMALL_NUMBER)
 		{
 			InputScale = 1.0f - (StopReaccelTimer / StopReaccelDuration);
+		}
+		if (InputRampTimer > 0.0f && StartInputRampTime > KINDA_SMALL_NUMBER)
+		{
+			InputScale = FMath::Min(InputScale, 1.0f - (InputRampTimer / StartInputRampTime));
 		}
 
 		AddMovementInput(ForwardDirection, MoveInput.Y * InputScale);
@@ -771,6 +785,174 @@ void ACatBase::ApplyStopBraking(bool bApply)
 void ACatBase::Server_SetStopBraking_Implementation(bool bApply)
 {
 	ApplyStopBraking(bApply);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Weighty Start (M2 part 2c, weighty-movement pass) ─────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// The launch-step into a sprint. A fresh sprint start from near-standstill
+// coils for StartCoilTime (Move() suppresses input — the standstill-jump
+// anticipation doctrine; trot starts stay instant for platforming), then
+// bursts: MaxAcceleration × StartBurstAccelMultiplier until the speed punches
+// through StartBurstEndSpeed, after which normal acceleration earns the sprint
+// top end. Pose comes free: the coil kicks a modest cushion load dip, and the
+// burst rails the accel-lean spring forward (the lunge) exactly like the stop
+// rides its release overshoot. Triggers are EDGE-based — a fresh-input edge
+// while sprinting, or a sprint-engage edge while input is fresh — never level:
+// sprinting into a wall collapses Speed under the coil gate with input held,
+// and a level trigger would coil against the wall.
+
+void ACatBase::UpdateWeightyStart()
+{
+	const float DeltaTime = DeltaTimeCached;
+	StartCooldownTimer = FMath::Max(StartCooldownTimer - DeltaTime, 0.0f);
+	InputRampTimer     = FMath::Max(InputRampTimer - DeltaTime, 0.0f);
+
+	const bool bInputFresh = PivotInputStaleTime < 0.15f;
+	const bool bGrounded   = MovementStage == ECatMovementStage::OnGround
+		&& JumpPhase == ECatJumpPhase::None;
+
+	// Trigger edges, evaluated every frame so the last-frame trackers stay current.
+	const bool bFreshInputEdge  = bInputFresh && !bInputWasFreshLastFrame;
+	const bool bSprintOnEdge    = bIsSprinting && !bWasSprintingLastFrame;
+	bInputWasFreshLastFrame = bInputFresh;
+	bWasSprintingLastFrame  = bIsSprinting;
+
+	if (!bIsStartCoiling && !bIsStartBursting)
+	{
+		const bool bEligible = bEnableWeightyStarts
+			&& StartCooldownTimer <= 0.0f
+			&& !bIsPivoting && !bIsStopping && !bIsGrabbing
+			&& bGrounded
+			&& Speed <= StartCoilMaxSpeed
+			&& JumpAnticipationTimer <= 0.0f;   // a jump coil owns the moment
+
+		if (bEligible
+			&& ((bFreshInputEdge && bIsSprinting) || (bSprintOnEdge && bInputFresh)))
+		{
+			// M4 ramp would fight the burst envelope — clear it on the coil path.
+			InputRampTimer = 0.0f;
+			EnterStartCoil();
+		}
+		else if (bFreshInputEdge && StartInputRampTime > 0.0f)
+		{
+			// M4 input shaping: plain fresh start from idle — ease the input in.
+			InputRampTimer = StartInputRampTime;
+		}
+		return;
+	}
+
+	// ── Coil hold ─────────────────────────────────────────────────────
+	if (bIsStartCoiling)
+	{
+		// Abort: released, airborne, grabbed, or a pivot somehow took over. A jump
+		// press also lands here (JumpAnticipationTimer arms) — the jump coil wins.
+		if (!bInputFresh || !bGrounded || bIsGrabbing || bIsPivoting
+			|| JumpAnticipationTimer > 0.0f)
+		{
+			bIsStartCoiling    = false;
+			StartCooldownTimer = 0.4f;
+			UE_LOG(LogCatVentures, Log, TEXT("[%s] Start coil ABORT"), *GetName());
+			return;
+		}
+
+		StartCoilTimer -= DeltaTime;
+		if (StartCoilTimer <= 0.0f)
+		{
+			bIsStartCoiling = false;
+			EnterStartBurst();
+		}
+		return;
+	}
+
+	// ── Burst ─────────────────────────────────────────────────────────
+	if (bIsStartBursting)
+	{
+		StartBurstElapsed += DeltaTime;
+		constexpr float BurstMaxDuration = 0.6f;   // failsafe (uphill, bumped, etc.)
+
+		if (!bInputFresh || !bGrounded || bIsGrabbing || bIsPivoting
+			|| Speed >= StartBurstEndSpeed || StartBurstElapsed > BurstMaxDuration)
+		{
+			EndStartBurst();
+		}
+	}
+}
+
+void ACatBase::EnterStartCoil()
+{
+	StartCoilLocation = GetActorLocation();
+
+	// StartCoilTime 0 = burst-only mode: skip the hold entirely.
+	if (StartCoilTime <= 0.0f)
+	{
+		EnterStartBurst();
+		return;
+	}
+
+	bIsStartCoiling = true;
+	StartCoilTimer  = StartCoilTime;
+
+	// Load dip: the body sinks into the coil (modest — the stop's plant-dip lesson).
+	if (bEnableLandCushion && StartCoilDip > 0.0f)
+	{
+		MeshCushionVelocity -= StartCoilDip * LandCushionFrequency * UE_EULERS_NUMBER;
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Start coil ENTER — Speed %.0f"), *GetName(), Speed);
+}
+
+void ACatBase::EnterStartBurst()
+{
+	bIsStartBursting  = true;
+	StartBurstElapsed = 0.0f;
+
+	// Predicted acceleration boost; the server mirrors it so move replay agrees.
+	ApplyStartBurstAccel(true);
+	if (!HasAuthority())
+	{
+		Server_SetStartBurstAccel(true);
+	}
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Start burst ENTER"), *GetName());
+}
+
+void ACatBase::EndStartBurst()
+{
+	if (!bIsStartBursting)
+	{
+		return;
+	}
+	bIsStartBursting   = false;
+	StartCooldownTimer = 0.4f;
+
+	ApplyStartBurstAccel(false);
+	if (!HasAuthority())
+	{
+		Server_SetStartBurstAccel(false);
+	}
+
+	// Per-start spec line: coil→burst-end distance/duration — the M5 start-clip
+	// authoring spec, read out of the log after a PIE session.
+	const float LaunchDist = FVector::Dist2D(GetActorLocation(), StartCoilLocation);
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Start burst END — Speed %.0f, launch %.0f cm in %.2f s"),
+		*GetName(), Speed, LaunchDist, StartBurstElapsed);
+}
+
+void ACatBase::ApplyStartBurstAccel(bool bApply)
+{
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		CMC->MaxAcceleration = bApply
+			? MovementAcceleration * StartBurstAccelMultiplier
+			: MovementAcceleration;
+	}
+}
+
+void ACatBase::Server_SetStartBurstAccel_Implementation(bool bApply)
+{
+	ApplyStartBurstAccel(bApply);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1454,6 +1636,10 @@ void ACatBase::UpdateAnimationStates()
 		// braking for a real run-out + plant. Runs AFTER the pivot: a pivot supersedes,
 		// and its input suppression must not read as a release here.
 		UpdateWeightyStop();
+
+		// (f2d) Weighty start — a fresh sprint start from near-standstill coils then
+		// bursts (launch-step); also arms the M4 fresh-input ramp for plain starts.
+		UpdateWeightyStart();
 
 		// (f3) Turn-In-Place — when idle, procedurally rotate the body toward the camera
 		// and drive the BS1_Cat_Turn footwork (sets SpeedType=Turn, bGoTurn, TurnRateAnim).

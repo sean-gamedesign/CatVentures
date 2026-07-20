@@ -316,6 +316,56 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "0.5"))
 	float StopReaccelDelay = 0.18f;
 
+	// ── Weighty Start (M2 part 2c, weighty-movement pass) ──────────────
+	// The launch-step into a sprint: a fresh sprint start from near-standstill
+	// COILS for a beat (input suppressed — the jump-anticipation doctrine: a real
+	// input-to-launch delay, standstill-only so trot starts stay instant for
+	// platforming), then BURSTS out with boosted acceleration until it punches
+	// through the trot band; normal acceleration earns the sprint top end. The
+	// accel-lean spring rails forward through the burst (the lunge pose, free) and
+	// the coil takes a small cushion dip (the load). Triggers are EDGE-based —
+	// fresh-input edge while sprinting, or sprint-engage edge while input is fresh
+	// — so sprinting into a wall (speed collapses, input held) can never re-coil.
+	// The accel boost is movement-affecting (mirrored to the server, braking RPC
+	// pattern); the coil suppression is owner input shaping, no replication.
+	// Also home of the M4 input ramp: fresh input from idle eases 0→1 over
+	// StartInputRampTime so keyboard taps don't twitch.
+
+	/** Master switch for the weighty sprint start (coil + acceleration burst). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start")
+	bool bEnableWeightyStarts = true;
+
+	/** Seconds the coil holds (input suppressed, body loading) before the burst releases.
+	 *  0 disables the coil but keeps the burst. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float StartCoilTime = 0.12f;
+
+	/** Max ground speed (cm/s) counting as "standstill" for a coil — above it the cat is
+	 *  already moving and a sprint engage stays instant (moving launch-step = M5 asset). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "0.0", ClampMax = "300.0"))
+	float StartCoilMaxSpeed = 100.0f;
+
+	/** Coil dip (cm) kicked into the landing-cushion spring as the coil loads. Deliberately
+	 *  modest (the stop's plant-dip lesson: big kicks at pose-transition moments read as pops);
+	 *  isolation-probe live and zero it if it fights the burst's accel-lean lunge. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float StartCoilDip = 4.0f;
+
+	/** MaxAcceleration multiplier during the burst — the spring out of the coil. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "1.0", ClampMax = "6.0"))
+	float StartBurstAccelMultiplier = 2.5f;
+
+	/** Speed (cm/s) at which the burst ends and normal acceleration takes over — the
+	 *  launch-step covers the idle→trot band; the sprint top end is earned normally. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "100.0", ClampMax = "1000.0"))
+	float StartBurstEndSpeed = 400.0f;
+
+	/** M4 input shaping: fresh input from idle ramps 0→1 over this window (s) so a keyboard
+	 *  tap doesn't twitch the cat. Skipped on the coil path (the burst is its own envelope);
+	 *  0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float StartInputRampTime = 0.12f;
+
 	// ── Jump Tuning ───────────────────────────────────────────────────
 
 	/** Initial vertical launch velocity (cm/s). Wired to CMC->JumpZVelocity. */
@@ -685,6 +735,23 @@ protected:
 	 *  CMC should be under (pivot boost if one is live, else the normal gait braking). */
 	void ApplyStopBraking(bool bApply);
 
+	// ── Weighty Start (M2 part 2c) ──────────────────────────────────────
+	/** Detects a fresh sprint start from near-standstill and runs the coil → burst. Local
+	 *  owner only; runs after UpdateWeightyStop in the tick. */
+	void UpdateWeightyStart();
+
+	/** Coil entry: suppress input for StartCoilTime, kick the load dip. */
+	void EnterStartCoil();
+
+	/** Burst entry: boost MaxAcceleration (predicted + server RPC). */
+	void EnterStartBurst();
+
+	/** Burst exit: restore MovementAcceleration, log the launch numbers. Safe to call redundantly. */
+	void EndStartBurst();
+
+	/** Applies (true) or restores (false) the burst MaxAcceleration on the CMC. */
+	void ApplyStartBurstAccel(bool bApply);
+
 	/** Fires on IA_Interact Started — server-authoritative trace. */
 	void TriggerInteract();
 
@@ -805,6 +872,12 @@ protected:
 	 *  as the owning client. Reliable — a lost restore would leave the server coasting forever. */
 	UFUNCTION(Server, Reliable)
 	void Server_SetStopBraking(bool bApply);
+
+	/** Client → Server: mirror the start-burst acceleration boost so server-side move replay
+	 *  accelerates the same as the owning client. Reliable — a lost restore would leave the
+	 *  server permanently over-accelerating. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetStartBurstAccel(bool bApply);
 
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
@@ -1220,6 +1293,35 @@ private:
 	/** bHasMovementInput last frame — a stop triggers on the had-input → released EDGE only,
 	 *  so external shoves at speed with no prior input can't start a run-out. */
 	bool bHadMovementInputLastFrame = false;
+
+	// ── Weighty Start State (local owner only) ─────────────────────────
+
+	/** True while the coil holds (input suppressed, StartCoilTimer running). */
+	bool bIsStartCoiling = false;
+
+	/** Seconds remaining of the coil hold. */
+	float StartCoilTimer = 0.0f;
+
+	/** True while the burst acceleration boost is applied. */
+	bool bIsStartBursting = false;
+
+	/** Seconds the burst has been running (failsafe timeout). */
+	float StartBurstElapsed = 0.0f;
+
+	/** World location at coil entry (launch-distance logging — the M5 start-clip spec numbers). */
+	FVector StartCoilLocation = FVector::ZeroVector;
+
+	/** Seconds before another coil may arm (keeps tap-tap sprint presses from chain-coiling). */
+	float StartCooldownTimer = 0.0f;
+
+	/** Move-input freshness last frame (for the fresh-input trigger edge). */
+	bool bInputWasFreshLastFrame = false;
+
+	/** bIsSprinting last frame (for the sprint-engage trigger edge). */
+	bool bWasSprintingLastFrame = false;
+
+	/** Seconds remaining of the M4 fresh-input ramp (consumed by Move alongside the stop's ramp). */
+	float InputRampTimer = 0.0f;
 
 	/** Fires when PhysicsBumper overlaps a PhysicsBody. Applies BumperPushForce on authority. */
 	UFUNCTION()
