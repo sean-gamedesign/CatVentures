@@ -5,6 +5,7 @@
 #include "Misc/Paths.h"
 #include "HAL/PlatformTime.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 
 // ══════════════════════════════════════════════════════════════════════════
 // ── Log tap — process-wide, ref-counted ───────────────────────────────────
@@ -321,4 +322,38 @@ FString UPawPrintSubsystem::DumpToCSV()
 	UE_LOG(LogCatVentures, Log, TEXT("PawPrint dumped %d channels / %s"),
 		ChannelOrder.Num(), *ChannelPath);
 	return ChannelPath;
+}
+
+UPawPrintSubsystem* UPawPrintSubsystem::GetActive()
+{
+	if (!GEngine)
+	{
+		return nullptr;
+	}
+	for (const FWorldContext& Context : GEngine->GetWorldContexts())
+	{
+		if (Context.World()
+			&& (Context.WorldType == EWorldType::PIE || Context.WorldType == EWorldType::Game))
+		{
+			if (UPawPrintSubsystem* Subsystem = Context.World()->GetSubsystem<UPawPrintSubsystem>())
+			{
+				return Subsystem;
+			}
+		}
+	}
+	return nullptr;
+}
+
+TArray<FName> UPawPrintSubsystem::GetCuratedCategories()
+{
+	return {
+		FName(TEXT("LogCatVentures")),
+		FName(TEXT("LogNet")),
+		FName(TEXT("LogNetCore")),
+		FName(TEXT("LogChaos")),
+		FName(TEXT("LogScript")),
+		FName(TEXT("LogBlueprintUserMessages")),
+		FName(TEXT("LogTemp")),
+		FName(TEXT("Cmd")),
+	};
 }

@@ -84,6 +84,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "PawPrint")
 	FString DumpToCSV();
 
+	/** First live PawPrint subsystem across the engine's game/PIE world contexts (null when no
+	 *  session is running). In multi-world PIE this is the first context — the host world. */
+	UFUNCTION(BlueprintCallable, Category = "PawPrint")
+	static UPawPrintSubsystem* GetActive();
+
+	/** Categories the PawPrint window checks by default on first run (full firehose stays
+	 *  available in the list, unchecked). */
+	static TArray<FName> GetCuratedCategories();
+
 private:
 	struct FChannel
 	{

@@ -10,7 +10,13 @@ public class CatVentures : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "OnlineSubsystem", "OnlineSubsystemUtils", "UMG", "Slate", "SlateCore", "GeometryCollectionEngine" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos", "DeveloperSettings" });
+
+		// PawPrint window (editor-only Slate tab) — see PawPrintWindow.cpp
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[] { "WorkspaceMenuStructure", "Settings" });
+		}
 
 		DynamicallyLoadedModuleNames.Add("OnlineSubsystemSteam");
 
