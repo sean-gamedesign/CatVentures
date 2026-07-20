@@ -75,6 +75,7 @@ Source/CatVentures/
     CatPlayerController.h        — Pause menu + client-side match-end cinematics
     CatGameInstance.h            — Steam Online Subsystem session backend
     PauseMenuWidget.h            — Pause menu C++ base
+    PawPrintSubsystem.h          — PawPrint in-memory runtime telemetry (see *PawPrint*)
   Private/
     (matching .cpp for each of the above)
 ```
@@ -214,6 +215,15 @@ C++ session backend only — no UI or `ServerTravel` here. Uses Online Subsystem
 - Session settings use `bUsesPresence`, `bUseLobbiesIfAvailable`, `bAllowJoinViaPresence` (overlay "Join Game"). Overlay invites route through `HandleSessionUserInviteAccepted` → `JoinFoundSession`.
 - `bForceLANMatch` is a debug-only toggle that forces the LAN path. Single shared session name: `"CatVenturesSession"`.
 - **Session UI** lives in `WBP_MainMenu` (host: `HostSession` → on success → `Open Level TestMap_02?listen`; find: busy-guard + timeout safeguard + throbber → `FindSessions(20)`; rows in `WBP_ServerRow` call `JoinFoundSession`).
+
+## PawPrint (runtime telemetry)
+
+**PawPrint** (`UPawPrintSubsystem`, v1 core shipped 2026-07-19, commit `31562cf`) is the in-memory runtime telemetry system — it exists so nobody has to live-monitor a PIE session: everything is captured while the session runs and analyzed after. ("CatTrace" was rejected as a name — "trace" already means line traces AND Unreal Insights Trace; the two-Chaos lesson.)
+
+- **Two capture surfaces:** (1) a **process-wide ref-counted log tap** (`FOutputDevice` on `GLog`, thread-safe, ≤ Verbose) capturing every engine log line with its category — registered once even in multi-world PIE; (2) **named float sample channels** (capped ring buffers, per world). `ACatBase::Tick` feeds a 13-channel set for the locally controlled cat (Speed/SpeedType/JumpPhase/LeanAmount/AccelLean/CushionZ/CamDipZ/TurnRateAnim + stop/coil/burst/pivot/sprint flags). Timebase = real seconds since capture start, shared across both surfaces.
+- **Retrieval:** (a) auto-dump to `Saved/PawPrint/<stamp>_<role>_{channels,log}.csv` per world on teardown (host/client tagged in MP; sample-less transition worlds skip — PIE clients traverse an empty world before ClientTravel); (b) reflected query API (`GetChannelSamples`, `GetCapturedCategories`, `GetCapturedLines` with category filter + incremental poll cursor) — **VibeUE python reaches it live during PIE**: `unreal.find_object(game_world, 'PawPrintSubsystem_0')` (note: `SubsystemBlueprintLibrary` is absent from the VibeUE python surface, and the pawn's cached `PawPrint` pointer is a protected property python can't read — `find_object` on the world is the access path); (c) `DumpToCSV()` on demand.
+- **Diagnostic doctrine:** new per-tick numeric investigation channels belong HERE (add a `SampleChannel` call), not in Verbose logs or bespoke slate samplers. Channels CSV is long-format (`Time,Channel,Value`).
+- **v2 (planned, not built): the PawPrint window** — an Editor Utility Widget in its own floating window: left = auto-populated category checkbox list (curated set checked by default, full firehose available), main = live filtered log view polling `GetCapturedLines` at ~10 Hz, plus a watch pane of live channel values; manual open from a menu entry with a bool setting for auto-open on PIE start.
 
 ## VibeUE (Blueprint/asset editor-control layer)
 
