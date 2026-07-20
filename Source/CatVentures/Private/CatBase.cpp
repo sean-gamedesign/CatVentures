@@ -2,6 +2,7 @@
 
 #include "CatBase.h"
 #include "CatVenturesLog.h"
+#include "PawPrintSubsystem.h"
 #include "CatAnimationTypes.h"
 #include "Net/UnrealNetwork.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -148,6 +149,9 @@ void ACatBase::BeginPlay()
 	}
 	GravityScaleInterp = GravityScaleRising;
 	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
+
+	// PawPrint telemetry sink — null outside game/PIE worlds (subsystem opts out there).
+	PawPrint = GetWorld() ? GetWorld()->GetSubsystem<UPawPrintSubsystem>() : nullptr;
 }
 
 void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
@@ -272,6 +276,32 @@ void ACatBase::Tick(float DeltaTime)
 		UpdateCosmeticInterpolation(DeltaTime);
 		UpdateLandCushion(DeltaTime);   // before foot IK: the IK traces must see the dipped paws
 		UpdateFootIK(DeltaTime);
+	}
+
+	// ── PawPrint telemetry — the locally controlled cat's channel set ──
+	// Every pose-driving scalar the diagnostic sessions kept hand-sampling.
+	if (PawPrint && IsLocallyControlled() && GetNetMode() != NM_DedicatedServer)
+	{
+		static const FName ChSpeed(TEXT("Speed")),           ChSpeedType(TEXT("SpeedType")),
+		                   ChJumpPhase(TEXT("JumpPhase")),   ChLean(TEXT("LeanAmount")),
+		                   ChAccelLean(TEXT("AccelLean")),   ChCushionZ(TEXT("CushionZ")),
+		                   ChCamDipZ(TEXT("CamDipZ")),       ChTurnRate(TEXT("TurnRateAnim")),
+		                   ChStopping(TEXT("bStopping")),    ChCoiling(TEXT("bCoiling")),
+		                   ChBursting(TEXT("bBursting")),    ChPivoting(TEXT("bPivoting")),
+		                   ChSprinting(TEXT("bSprinting"));
+		PawPrint->SampleChannel(ChSpeed,     Speed);
+		PawPrint->SampleChannel(ChSpeedType, static_cast<float>(SpeedType));
+		PawPrint->SampleChannel(ChJumpPhase, static_cast<float>(JumpPhase));
+		PawPrint->SampleChannel(ChLean,      LeanAmount);
+		PawPrint->SampleChannel(ChAccelLean, AccelLeanAmount);
+		PawPrint->SampleChannel(ChCushionZ,  MeshCushionOffset);
+		PawPrint->SampleChannel(ChCamDipZ,   CamDipOffset);
+		PawPrint->SampleChannel(ChTurnRate,  TurnRateAnim);
+		PawPrint->SampleChannel(ChStopping,  bIsStopping ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChCoiling,   bIsStartCoiling ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChBursting,  bIsStartBursting ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChPivoting,  bIsPivoting ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChSprinting, bIsSprinting ? 1.0f : 0.0f);
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────

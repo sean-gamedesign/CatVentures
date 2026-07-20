@@ -16,6 +16,7 @@ class UAnimMontage;
 class UBoxComponent;
 class UPhysicsConstraintComponent;
 class UGeometryCollectionComponent;
+class UPawPrintSubsystem;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMeowDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSwatHitDelegate, AActor*, HitActor, FVector, HitLocation);
@@ -1293,6 +1294,11 @@ private:
 	/** bHasMovementInput last frame — a stop triggers on the had-input → released EDGE only,
 	 *  so external shoves at speed with no prior input can't start a run-out. */
 	bool bHadMovementInputLastFrame = false;
+
+	/** PawPrint telemetry sink (null outside game/PIE worlds). Cached in BeginPlay;
+	 *  the locally controlled cat pushes its channel set every tick. */
+	UPROPERTY(Transient)
+	TObjectPtr<UPawPrintSubsystem> PawPrint = nullptr;
 
 	// ── Weighty Start State (local owner only) ─────────────────────────
 
