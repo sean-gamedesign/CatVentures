@@ -869,6 +869,11 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_SetPivotBraking(bool bApply);
 
+	/** Client → Server: throttled pivot-clip scrub position (the Server_SetTurnRate
+	 *  streaming pattern). Unreliable — loss just holds the last scrub for a frame. */
+	UFUNCTION(Server, Unreliable)
+	void Server_SetPivotProgress(float NewProgress);
+
 	/** Client → Server: mirror the stop braking swap so server-side move replay coasts the same
 	 *  as the owning client. Reliable — a lost restore would leave the server coasting forever. */
 	UFUNCTION(Server, Reliable)
@@ -1039,6 +1044,21 @@ protected:
 	/** True while the cat is performing a turn-in-place (|AimYaw| > 45 while idle on ground). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	bool bGoTurn = false;
+
+	/** True while a moving pivot owns the Turn state — the ABP swaps the BS1_Cat_Turn
+	 *  footwork for the dedicated plant-pivot clip. Owner-predicted; rides the existing
+	 *  Server_SetPivotBraking mirror (fires on exactly the pivot enter/exit edges). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoPivot = false;
+
+	/** 0→1 pivot completion: 1 − (remaining angle / angle latched at entry), clamped
+	 *  monotonic (the live input target can drift — the scrub must never run backward).
+	 *  Scrubs the plant-pivot clip evaluators in the ABP so plant/steps stretch across
+	 *  the whole rotation and the push-off lands exactly at rotation completion,
+	 *  regardless of pivot size (a fixed-time one-shot desynced on ~0.8 s pivots).
+	 *  Owner-computed; streamed via Server_SetPivotProgress (the TurnRateAnim pattern). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float PivotProgress = 0.0f;
 
 	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -1270,6 +1290,12 @@ private:
 
 	/** Seconds since Move() last supplied non-zero input; past ~0.15 s the input counts as released. */
 	float PivotInputStaleTime = 1.0f;
+
+	/** Total |angle| (deg) to the input target, latched at pivot entry — PivotProgress's denominator. */
+	float PivotInitialAngleDeg = 1.0f;
+
+	/** Last PivotProgress sent via Server_SetPivotProgress (throttle: send on Δ ≥ 0.05). */
+	float LastSentPivotProgress = 0.0f;
 
 	// ── Weighty Stop State (local owner only) ──────────────────────────
 

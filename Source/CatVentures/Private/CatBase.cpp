@@ -618,6 +618,20 @@ void ACatBase::UpdateMovingPivot()
 		const float AppliedRate = (DeltaTime > KINDA_SMALL_NUMBER) ? AppliedDelta / DeltaTime : 0.0f;
 		PivotTurnRateTarget = FMath::Clamp(AppliedRate / PivotTurnSpeedDegPerSec, -1.0f, 1.0f) * PivotFootworkCap;
 
+		// Clip scrub: fraction of the REACHABLE rotation done — the pivot exits at
+		// PivotExitAngle remaining, so the clip must complete there (mapping the full
+		// entry angle left the last chunk to snap on the exit frame, 2026-07-20 round).
+		// Monotonic — the live input target can drift and the scrub must never run backward.
+		const float RemainingDeg  = FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - NewYaw));
+		const float ReachableDeg  = FMath::Max(PivotInitialAngleDeg - PivotExitAngle, 1.0f);
+		PivotProgress = FMath::Max(PivotProgress,
+			FMath::Clamp((PivotInitialAngleDeg - RemainingDeg) / ReachableDeg, 0.0f, 1.0f));
+		if (!HasAuthority() && FMath::Abs(PivotProgress - LastSentPivotProgress) >= 0.05f)
+		{
+			LastSentPivotProgress = PivotProgress;
+			Server_SetPivotProgress(PivotProgress);
+		}
+
 		SpeedType = ECatMoveType::Turn;   // footwork state; also gates turn-in-place + lean off
 	}
 }
@@ -625,8 +639,19 @@ void ACatBase::UpdateMovingPivot()
 void ACatBase::EnterPivot()
 {
 	bIsPivoting        = true;
+	bGoPivot           = true;
 	PivotSustainTimer  = 0.0f;
 	PivotSweepAccumDeg = 0.0f;
+
+	// Latch the scrub denominator; floor at 1° so a threshold-grazing entry can't divide by ~0.
+	PivotInitialAngleDeg = FMath::Max(FMath::Abs(FRotator::NormalizeAxis(
+		PivotLiveInputDir.Rotation().Yaw - GetActorRotation().Yaw)), 1.0f);
+	PivotProgress         = 0.0f;
+	LastSentPivotProgress = 0.0f;
+	if (!HasAuthority())
+	{
+		Server_SetPivotProgress(0.0f);
+	}
 
 	// Predicted braking boost; the server mirrors it so move replay agrees.
 	ApplyPivotBraking(true);
@@ -656,7 +681,15 @@ void ACatBase::ExitPivot()
 	}
 
 	bIsPivoting        = false;
+	bGoPivot           = false;
 	PivotCooldownTimer = PivotCooldown;
+
+	// Snap the scrub to the end pose for the blend-out.
+	PivotProgress = 1.0f;
+	if (!HasAuthority())
+	{
+		Server_SetPivotProgress(1.0f);
+	}
 
 	ApplyPivotBraking(false);
 	if (!HasAuthority())
@@ -678,6 +711,12 @@ void ACatBase::ApplyPivotBraking(bool bApply)
 void ACatBase::Server_SetPivotBraking_Implementation(bool bApply)
 {
 	ApplyPivotBraking(bApply);
+	bGoPivot = bApply;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+}
+
+void ACatBase::Server_SetPivotProgress_Implementation(float NewProgress)
+{
+	PivotProgress = NewProgress;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1529,6 +1568,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME(ACatBase, MovementStage);
 	DOREPLIFETIME(ACatBase, JumpPhase);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoPivot, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, PivotProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
