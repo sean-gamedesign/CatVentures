@@ -204,6 +204,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot")
 	bool bEnableMovingPivot = true;
 
+	/** Cosmetic mesh drop (cm) while SpeedType == Turn (turn-in-place AND pivot footwork).
+	 *  The kit turn clips' OUTSIDE forepaw never reaches contact (min hover 3.5–4.3 vs ~2
+	 *  planted stance, measured 2026-07-20) — easing the body down trades that visible
+	 *  hover for slight stance-paw penetration, which doesn't read. 0 disables. Live-tunable.
+	 *  3.5 = Sean-approved live-tune 2026-07-20 (1.8 left the outside paw hovering; known
+	 *  accepted residual: back paws clip the ground a touch, minor rise on close inspection —
+	 *  candidate polish = re-enable upward-only foot IK during Turn to lift the clippers). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Turn", meta = (ClampMin = "0.0", ClampMax = "6.0"))
+	float TurnStanceDrop = 3.5f;
+
+	/** Engage interp speed for the turn stance drop — must beat the ~0.2 s Turn-state blend-in
+	 *  or the first footwork steps play before the body is down (2026-07-20 PIE read).
+	 *  Release always eases out at a gentle 8. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Turn", meta = (ClampMin = "5.0", ClampMax = "60.0"))
+	float TurnStanceDropEngageSpeed = 22.0f;
+
 	/** SWEEP-tier steering angle (deg, velocity vs input): at or beyond this, a pivot arms IF the
 	 *  input direction has also rotated ≥ PivotSweepMinDeg during the sustain window. Velocity
 	 *  CHASES the input at the CMC rotation rate, so camera sweeps live in the 40–65° band
@@ -616,6 +632,9 @@ protected:
 	 *  control-point drops are computed RELATIVE to this so the Spline IK only bends for the
 	 *  fore/aft remainder instead of arching the whole correction. */
 	float MeshGroundConformZ = 0.0f;
+
+	/** Interp state for the TurnStanceDrop ease (0 → −TurnStanceDrop while turning). */
+	float TurnStanceDropZ = 0.0f;
 
 	/** Whole-body slope pitch on the mesh's relative rotation (degrees, interp state).
 	 *  Bending Spine→Spine_3 can't pitch a quadruped — the hips aren't in the chain, so the

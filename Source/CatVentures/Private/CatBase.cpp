@@ -288,7 +288,8 @@ void ACatBase::Tick(float DeltaTime)
 		                   ChCamDipZ(TEXT("CamDipZ")),       ChTurnRate(TEXT("TurnRateAnim")),
 		                   ChStopping(TEXT("bStopping")),    ChCoiling(TEXT("bCoiling")),
 		                   ChBursting(TEXT("bBursting")),    ChPivoting(TEXT("bPivoting")),
-		                   ChSprinting(TEXT("bSprinting"));
+		                   ChSprinting(TEXT("bSprinting")), ChTurnInPlace(TEXT("bTurnInPlace")),
+		                   ChTurnDropZ(TEXT("TurnDropZ"));
 		PawPrint->SampleChannel(ChSpeed,     Speed);
 		PawPrint->SampleChannel(ChSpeedType, static_cast<float>(SpeedType));
 		PawPrint->SampleChannel(ChJumpPhase, static_cast<float>(JumpPhase));
@@ -302,6 +303,8 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChBursting,  bIsStartBursting ? 1.0f : 0.0f);
 		PawPrint->SampleChannel(ChPivoting,  bIsPivoting ? 1.0f : 0.0f);
 		PawPrint->SampleChannel(ChSprinting, bIsSprinting ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChTurnInPlace, bIsTurningInPlace ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChTurnDropZ, TurnStanceDropZ);
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────
@@ -2044,6 +2047,16 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		MeshGroundConformZ = FMath::FInterpTo(MeshGroundConformZ, ConformTarget, DeltaTime, ConformInterpSpeed);
 	}
 
+	// ── (B2) Turn stance drop — ease the body down during turn footwork so the kit
+	// turn clips' non-planting outside forepaw reaches contact (see TurnStanceDrop).
+	// Asymmetric: engage must beat the Turn-state blend-in; release stays gentle.
+	{
+		constexpr float TurnDropReleaseSpeed = 8.0f;
+		const float DropTarget = (SpeedType == ECatMoveType::Turn && bIsOnGround) ? -TurnStanceDrop : 0.0f;
+		const float InterpSpeed = (DropTarget < TurnStanceDropZ) ? TurnStanceDropEngageSpeed : TurnDropReleaseSpeed;
+		TurnStanceDropZ = FMath::FInterpTo(TurnStanceDropZ, DropTarget, DeltaTime, InterpSpeed);
+	}
+
 	// ── (C) Whole-body slope pitch — APPLY only ──────────────────────
 	// MeshSlopePitch is COMPUTED in UpdateFootIK from the paw-floor traces (single source
 	// of truth with the foot conform; runs after this function — 1-frame lag, invisible).
@@ -2054,7 +2067,7 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	// vs applied pitch 19.55). Paw-floor-derived pitch cannot disagree with the stance.
 
 	// Single transform write; skip once fully at rest (avoids per-tick transform writes).
-	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ;
+	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ + TurnStanceDropZ;
 	FVector Rel = MeshComp->GetRelativeLocation();
 	if (FMath::Abs(TotalOffset) < 0.01f && FMath::Abs(MeshSlopePitch) < 0.05f
 		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f))
