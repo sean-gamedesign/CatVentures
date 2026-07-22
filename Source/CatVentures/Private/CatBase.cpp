@@ -2269,7 +2269,21 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 
 		FHitResult Hit;
 		FCollisionQueryParams Params(FName(TEXT("CatFootIK")), /*bTraceComplex*/ false, this);
-		const bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+		bool bHit = World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+
+		// Wall-hit rejection (wall-pin jerk fix): pinned against a wall, the front paws
+		// poke through the face (the body is longer than the capsule) and this trace
+		// STARTS inside the wall's collision — UE reports a start-penetrating hit at the
+		// trace start (~TraceUp above the paw), which railed the offset to
+		// +FootIKTraceUpDistance and the penetration snap applied it in one frame (the
+		// head/shoulder wrench; PawPrint-measured −0.1→+25.0 cm in one sample at wall
+		// contact). A start-penetrating hit carries no floor information, and a
+		// near-vertical surface isn't floor either — treat both as a miss so the paw
+		// rides FK and the chest/incline aggregation sees no valid floor.
+		if (bHit && (Hit.bStartPenetrating || Hit.ImpactNormal.Z < 0.5f))
+		{
+			bHit = false;
+		}
 
 		// Vertical-only correction, KIT MODEL (2026-07-06): the primary term is the pure
 		// TERRAIN DELTA (ground under the paw vs the capsule contact plane) — it depends
@@ -2495,6 +2509,31 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 			const float EaseSpeed = (FMath::Abs(PitchTarget) < FMath::Abs(MeshSlopePitch)) ? 14.0f : 6.0f;
 			MeshSlopePitch = FMath::FInterpTo(MeshSlopePitch, PitchTarget, DeltaTime, EaseSpeed);
 		}
+	}
+
+	// ── PawPrint: foot-IK stack channels (wall-pin jerk investigation) ──
+	// Every head/shoulder-capable output of this function plus the front-paw trace
+	// validity — the wall-pin oscillator must show in one of these, or it's the Leg IK
+	// node's chain-config snap inside the ABP (by elimination).
+	if (PawPrint && IsLocallyControlled())
+	{
+		static const FName ChIKAlpha(TEXT("IK_Alpha")),
+		                   ChIKHandL(TEXT("IK_HandL")),           ChIKHandR(TEXT("IK_HandR")),
+		                   ChIKFootL(TEXT("IK_FootL")),           ChIKFootR(TEXT("IK_FootR")),
+		                   ChIKHandLFloor(TEXT("IK_HandL_Floor")), ChIKHandRFloor(TEXT("IK_HandR_Floor")),
+		                   ChIKChest(TEXT("IK_ChestDropZ")),      ChIKPitch(TEXT("IK_SlopePitch")),
+		                   ChIKInclineF(TEXT("IK_InclineF")),     ChIKHandLRotP(TEXT("IK_HandL_RotPitch"));
+		PawPrint->SampleChannel(ChIKAlpha,      FootIKAlpha);
+		PawPrint->SampleChannel(ChIKHandL,      FootIKOffsetZ_HandL);
+		PawPrint->SampleChannel(ChIKHandR,      FootIKOffsetZ_HandR);
+		PawPrint->SampleChannel(ChIKFootL,      FootIKOffsetZ_FootL);
+		PawPrint->SampleChannel(ChIKFootR,      FootIKOffsetZ_FootR);
+		PawPrint->SampleChannel(ChIKHandLFloor, PawHandL.bValidFloor ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChIKHandRFloor, PawHandR.bValidFloor ? 1.0f : 0.0f);
+		PawPrint->SampleChannel(ChIKChest,      ChestDropZ);
+		PawPrint->SampleChannel(ChIKPitch,      MeshSlopePitch);
+		PawPrint->SampleChannel(ChIKInclineF,   SpineInclineF);
+		PawPrint->SampleChannel(ChIKHandLRotP,  FootIKRot_HandL.Pitch);
 	}
 }
 
