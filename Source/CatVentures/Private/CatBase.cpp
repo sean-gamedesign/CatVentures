@@ -621,14 +621,22 @@ void ACatBase::UpdateMovingPivot()
 		const float AppliedRate = (DeltaTime > KINDA_SMALL_NUMBER) ? AppliedDelta / DeltaTime : 0.0f;
 		PivotTurnRateTarget = FMath::Clamp(AppliedRate / PivotTurnSpeedDegPerSec, -1.0f, 1.0f) * PivotFootworkCap;
 
-		// Clip scrub: fraction of the REACHABLE rotation done — the pivot exits at
-		// PivotExitAngle remaining, so the clip must complete there (mapping the full
-		// entry angle left the last chunk to snap on the exit frame, 2026-07-20 round).
-		// Monotonic — the live input target can drift and the scrub must never run backward.
-		const float RemainingDeg  = FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - NewYaw));
-		const float ReachableDeg  = FMath::Max(PivotInitialAngleDeg - PivotExitAngle, 1.0f);
+		// Clip scrub: accumulated APPLIED rotation over a drift-growing denominator.
+		// The remaining-vs-live-target form stalled during camera sweeps (2026-07-22
+		// PawPrint round: the target drifts as fast as the body chases it → progress
+		// froze at ~0.2 holding a mid-swing paw in the air, then played the back 80%
+		// at ~3× when the camera stopped). The numerator grows at the real turn rate,
+		// so the scrub cannot stall; a drifting target grows the denominator instead,
+		// pacing the footwork over the whole sweep. Exit lands at exactly 1: when
+		// RemainingDeg == PivotExitAngle the denominator equals the numerator.
+		// Monotonic clamp kept — a target drifting faster than the turn rate briefly
+		// grows the denominator faster than the numerator.
+		PivotAccumDeg += FMath::Abs(AppliedDelta);
+		const float RemainingDeg = FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - NewYaw));
+		const float ReachableDeg = FMath::Max3(PivotInitialAngleDeg - PivotExitAngle,
+		                                       PivotAccumDeg + RemainingDeg - PivotExitAngle, 1.0f);
 		PivotProgress = FMath::Max(PivotProgress,
-			FMath::Clamp((PivotInitialAngleDeg - RemainingDeg) / ReachableDeg, 0.0f, 1.0f));
+			FMath::Clamp(PivotAccumDeg / ReachableDeg, 0.0f, 1.0f));
 		if (!HasAuthority() && FMath::Abs(PivotProgress - LastSentPivotProgress) >= 0.05f)
 		{
 			LastSentPivotProgress = PivotProgress;
@@ -649,6 +657,8 @@ void ACatBase::EnterPivot()
 	// Latch the scrub denominator; floor at 1° so a threshold-grazing entry can't divide by ~0.
 	PivotInitialAngleDeg = FMath::Max(FMath::Abs(FRotator::NormalizeAxis(
 		PivotLiveInputDir.Rotation().Yaw - GetActorRotation().Yaw)), 1.0f);
+	PivotAngleDeg         = PivotInitialAngleDeg;
+	PivotAccumDeg         = 0.0f;
 	PivotProgress         = 0.0f;
 	LastSentPivotProgress = 0.0f;
 	if (!HasAuthority())
@@ -660,7 +670,7 @@ void ACatBase::EnterPivot()
 	ApplyPivotBraking(true);
 	if (!HasAuthority())
 	{
-		Server_SetPivotBraking(true);
+		Server_SetPivotBraking(true, PivotAngleDeg);
 	}
 
 	// Plant dip: additive kick into the landing-cushion spring (composes with a
@@ -697,7 +707,7 @@ void ACatBase::ExitPivot()
 	ApplyPivotBraking(false);
 	if (!HasAuthority())
 	{
-		Server_SetPivotBraking(false);
+		Server_SetPivotBraking(false, 0.0f);
 	}
 
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot EXIT — Speed %.0f"), *GetName(), Speed);
@@ -711,10 +721,14 @@ void ACatBase::ApplyPivotBraking(bool bApply)
 	}
 }
 
-void ACatBase::Server_SetPivotBraking_Implementation(bool bApply)
+void ACatBase::Server_SetPivotBraking_Implementation(bool bApply, float EntryAngleDeg)
 {
 	ApplyPivotBraking(bApply);
 	bGoPivot = bApply;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+	if (bApply)
+	{
+		PivotAngleDeg = EntryAngleDeg;   // proxies select the same 90°/180° clip variant
+	}
 }
 
 void ACatBase::Server_SetPivotProgress_Implementation(float NewProgress)
@@ -1573,6 +1587,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, bGoTurn, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoPivot, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, PivotProgress, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, PivotAngleDeg, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -2051,9 +2066,42 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	// turn clips' non-planting outside forepaw reaches contact (see TurnStanceDrop).
 	// Asymmetric: engage must beat the Turn-state blend-in; release stays gentle.
 	{
+		// Pivot crouch drop (cm) by PivotProgress — the authored crouch envelope of the
+		// Pivot90/180 clips (drop = 0.26 + 8.84 × envelope(progress); the clips' spine-
+		// translation base is flattened in Blender so this analytic curve is exact for
+		// BOTH clip lengths, verified 2026-07-22 within 0.15 cm). The clips' Spine
+		// translation is discarded by the skeleton's all-SKELETON translation
+		// retargeting, so the crouch is restored here procedurally; the clip legs were
+		// IK-solved against the crouched hip, so drop + rotation-only pose reproduces
+		// the authored pose exactly. Runs on every machine (bGoPivot and PivotProgress
+		// both replicate COND_SkipOwner).
+		static constexpr float PivotCrouchDrop[11] =
+			{ 0.26f, 1.59f, 2.91f, 3.58f, 3.91f, 4.24f, 4.57f, 5.24f, 6.09f, 6.93f, 7.78f };
+
 		constexpr float TurnDropReleaseSpeed = 8.0f;
-		const float DropTarget = (SpeedType == ECatMoveType::Turn && bIsOnGround) ? -TurnStanceDrop : 0.0f;
-		const float InterpSpeed = (DropTarget < TurnStanceDropZ) ? TurnStanceDropEngageSpeed : TurnDropReleaseSpeed;
+		// While pivoting, track the curve near-directly (it is already smooth and the clip
+		// legs are solved for exactly this value each frame — the engage-speed interp lagged
+		// it by ~1–1.5 cm on fast scrubs, floating all four paws, 2026-07-22 PawPrint round).
+		// The high rate still smooths the enter edge; release keeps the gentle ease.
+		constexpr float PivotDropTrackSpeed = 60.0f;
+		bool bPivotDrop = false;
+		float DropTarget = 0.0f;
+		if (bIsOnGround)
+		{
+			if (bGoPivot && PivotCrouchScale > 0.0f)
+			{
+				const float P = FMath::Clamp(PivotProgress, 0.0f, 1.0f) * 10.0f;
+				const int32 Seg = FMath::Min(FMath::FloorToInt32(P), 9);
+				DropTarget = -FMath::Lerp(PivotCrouchDrop[Seg], PivotCrouchDrop[Seg + 1], P - Seg) * PivotCrouchScale;
+				bPivotDrop = true;
+			}
+			else if (SpeedType == ECatMoveType::Turn)
+			{
+				DropTarget = -TurnStanceDrop;
+			}
+		}
+		const float InterpSpeed = bPivotDrop ? PivotDropTrackSpeed
+			: (DropTarget < TurnStanceDropZ) ? TurnStanceDropEngageSpeed : TurnDropReleaseSpeed;
 		TurnStanceDropZ = FMath::FInterpTo(TurnStanceDropZ, DropTarget, DeltaTime, InterpSpeed);
 	}
 

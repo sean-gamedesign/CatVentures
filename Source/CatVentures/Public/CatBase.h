@@ -204,6 +204,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot")
 	bool bEnableMovingPivot = true;
 
+	/** Scale on the pivot crouch drop — the Blender-authored Pivot90 clips carry their crouch
+	 *  in Spine translation, which the skeleton's all-SKELETON translation retargeting discards
+	 *  at evaluation (measured 2026-07-22: hips pinned at ref 30.17 for every clip). The drop
+	 *  curve sampled from the authored hip restores it procedurally while bGoPivot, composed
+	 *  into the same §B2 transform write as TurnStanceDrop. The clip legs were IK-solved
+	 *  against the crouched hip, so drop + rotation-only pose = the authored pose. 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float PivotCrouchScale = 1.0f;
+
 	/** Cosmetic mesh drop (cm) while SpeedType == Turn (turn-in-place AND pivot footwork).
 	 *  The kit turn clips' OUTSIDE forepaw never reaches contact (min hover 3.5–4.3 vs ~2
 	 *  planted stance, measured 2026-07-20) — easing the body down trades that visible
@@ -253,10 +262,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "0.5"))
 	float PivotSustainTime = 0.12f;
 
-	/** Body rotation rate (deg/s) during the pivot turn. 200 keeps the body inside what the
-	 *  45/90 turn footwork can visually keep up with (270 outran it — sliding feet). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "90.0", ClampMax = "720.0"))
-	float PivotTurnSpeedDegPerSec = 200.0f;
+	/** Body rotation rate (deg/s) during the pivot turn — the master weight-vs-response knob.
+	 *  The scrub ties footfall cadence to this directly: playback speed ≈ rate ÷ ~82 (the
+	 *  Pivot90/180 clips' authored turning rate). 200 played every footfall at ~2.4× — the
+	 *  "tippy-tap" 2026-07-22 PIE read; ~120 ≈ 1.45×; ~80 ≈ authored 1× (90° in ~0.95 s,
+	 *  180° in ~2 s). Live-tunable; mouse flick speed never raises it — the body turns at
+	 *  this rate no matter how hard the camera whips. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "60.0", ClampMax = "720.0"))
+	float PivotTurnSpeedDegPerSec = 120.0f;
 
 	/** Scale on the pivot's footwork blend param (TurnRateAnim). The A_Cat_Move_Turn clips
 	 *  are the kit's MOVING-turn clips — stride-elevated footwork through their WHOLE range
@@ -884,9 +897,10 @@ protected:
 
 	/** Client → Server: mirror the pivot braking boost so server-side move replay brakes the
 	 *  same as the owning client (the grab drag-settings prediction pattern). Reliable —
-	 *  a lost restore would leave the server braking hard forever. */
+	 *  a lost restore would leave the server braking hard forever. EntryAngleDeg carries the
+	 *  latched pivot angle on the enter edge (0 on exit) so proxies select the same clip variant. */
 	UFUNCTION(Server, Reliable)
-	void Server_SetPivotBraking(bool bApply);
+	void Server_SetPivotBraking(bool bApply, float EntryAngleDeg);
 
 	/** Client → Server: throttled pivot-clip scrub position (the Server_SetTurnRate
 	 *  streaming pattern). Unreliable — loss just holds the last scrub for a frame. */
@@ -1070,14 +1084,21 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	bool bGoPivot = false;
 
-	/** 0→1 pivot completion: 1 − (remaining angle / angle latched at entry), clamped
-	 *  monotonic (the live input target can drift — the scrub must never run backward).
-	 *  Scrubs the plant-pivot clip evaluators in the ABP so plant/steps stretch across
-	 *  the whole rotation and the push-off lands exactly at rotation completion,
-	 *  regardless of pivot size (a fixed-time one-shot desynced on ~0.8 s pivots).
+	/** 0→1 pivot completion: accumulated applied rotation / reachable rotation (the
+	 *  denominator grows if the live target drifts — a remaining-angle form stalled
+	 *  mid-clip during camera sweeps), clamped monotonic. Scrubs the plant-pivot clip
+	 *  evaluators in the ABP so plant/steps stretch across the whole rotation and the
+	 *  push-off lands exactly at rotation completion, regardless of pivot size (a
+	 *  fixed-time one-shot desynced on ~0.8 s pivots).
 	 *  Owner-computed; streamed via Server_SetPivotProgress (the TurnRateAnim pattern). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float PivotProgress = 0.0f;
+
+	/** Pivot rotation size (deg) latched at entry — the ABP selects the 90° vs 180° plant-pivot
+	 *  clip variant on it (latched, not live: the denominator grows on camera sweeps and a
+	 *  mid-pivot clip switch would pop). Rides the Server_SetPivotBraking enter edge. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float PivotAngleDeg = 0.0f;
 
 	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -1315,6 +1336,10 @@ private:
 
 	/** Last PivotProgress sent via Server_SetPivotProgress (throttle: send on Δ ≥ 0.05). */
 	float LastSentPivotProgress = 0.0f;
+
+	/** Rotation (deg) actually applied so far this pivot — the scrub numerator. Grows at the
+	 *  real turn rate, so the scrub cannot stall when a sweeping camera drags the target. */
+	float PivotAccumDeg = 0.0f;
 
 	// ── Weighty Stop State (local owner only) ──────────────────────────
 
