@@ -2,6 +2,7 @@
 
 #include "CatBase.h"
 #include "CatVenturesLog.h"
+#include "CatTraversalComponent.h"
 #include "PawPrintSubsystem.h"
 #include "CatAnimationTypes.h"
 #include "Net/UnrealNetwork.h"
@@ -53,6 +54,8 @@ ACatBase::ACatBase()
 	// GrabConstraint is created dynamically in Server_Grab_Implementation — not a CDO subobject.
 
 	GrabTargetLocation = CreateDefaultSubobject<USceneComponent>(TEXT("GrabTargetLocation"));
+
+	Traversal = CreateDefaultSubobject<UCatTraversalComponent>(TEXT("Traversal"));
 	GrabTargetLocation->SetupAttachment(GetMesh(), TEXT("socket_mouth"));
 	// Push the hold point 80 cm forward in mouth-socket space so the held object sits
 	// in front of the cat's capsule rather than pressing against it.
@@ -308,6 +311,8 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChTurnDropZ, TurnStanceDropZ);
 		PawPrint->SampleChannel(ChSkidProgress, bGoSkid ? SkidProgress : 0.0f);
 		PawPrint->SampleChannel(ChStartProgress, bGoStartStep ? StartProgress : 0.0f);
+		static const FName ChMantleProgress(TEXT("MantleProgress"));
+		PawPrint->SampleChannel(ChMantleProgress, bGoMantle ? MantleProgress : 0.0f);
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────
@@ -394,6 +399,13 @@ void ACatBase::Move(const FInputActionValue& Value)
 		// During the start coil the body loads before it launches — same suppression
 		// contract as the pivot: the direction cache above keeps steering live.
 		if (bIsStartCoiling)
+		{
+			return;
+		}
+
+		// During a traversal takeover the component owns the capsule; CMC input
+		// would fight the curve (Flying mode + AddMovementInput = drift).
+		if (Traversal && Traversal->IsMantling())
 		{
 			return;
 		}
@@ -1124,6 +1136,20 @@ void ACatBase::Server_SetStartStep_Implementation(bool bActive)
 	bGoStartStep = bActive;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
 }
 
+void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget)
+{
+	if (Traversal)
+	{
+		Traversal->StartMantle(InStart, InTarget);
+	}
+}
+
+void ACatBase::SetMantleAnimState(bool bActive, float Progress)
+{
+	bGoMantle      = bActive;
+	MantleProgress = Progress;
+}
+
 void ACatBase::Server_SetStartProgress_Implementation(float NewProgress)
 {
 	StartProgress = NewProgress;
@@ -1695,6 +1721,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, SkidProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoStartStep, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, StartProgress, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoMantle, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, MantleProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -3072,6 +3100,17 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		// NormalizedFallSpeed is updated continuously above (before the switch).
 		// The ANIM Land phase can start earlier via the landing predictor below.
 		UpdateLandPrediction();
+		// Safety net (the Launch/Apex cases have the same): grounded WITHOUT a
+		// Landed() impact — a movement-mode switch put us on the floor (traversal
+		// takeover restore, future teleports). A normal landing never hits this
+		// (Landed() fires during the CMC move and sets Land before this tick).
+		if (bIsOnGround && JumpPhase == ECatJumpPhase::Fall)
+		{
+			bFallPending = false;
+			FallTransitionHoldTimer = 0.0f;
+			NormalizedFallSpeed = 0.0f;
+			SetJumpPhase(ECatJumpPhase::None);
+		}
 		break;
 	}
 	case ECatJumpPhase::Land:

@@ -43,6 +43,10 @@ class CATVENTURES_API ACatBase : public ACharacter
 {
 	GENERATED_BODY()
 
+	// The traversal component is an extension of the character (owns traversal verbs'
+	// movement takeovers) — it reaches the mantle mirror RPC and anim-state setters.
+	friend class UCatTraversalComponent;
+
 public:
 	ACatBase();
 
@@ -554,6 +558,11 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
 	TObjectPtr<USceneComponent> GrabTargetLocation;
 
+	/** Traversal verbs (mantle first; wall bounce/scramble/fence trot/curtain climb later).
+	 *  Owns its verbs' movement takeovers — the one CMC apply/restore point for traversal. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Traversal")
+	TObjectPtr<class UCatTraversalComponent> Traversal;
+
 	/** Radius (cm) of the mouth sphere trace used to detect grabbable objects. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "5.0"))
 	float GrabTraceRadius = 35.0f;
@@ -954,6 +963,18 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_SetStartStep(bool bActive);
 
+	/** Client → Server: mirror the mantle takeover (the grab pattern) — the server drives
+	 *  its own copy deterministically from the same start/target. */
+	UFUNCTION(Server, Reliable)
+	void Server_StartMantle(FVector_NetQuantize InStart, FVector_NetQuantize InTarget);
+
+	/** Written by the traversal component on owner and server; replicated to proxies. */
+	void SetMantleAnimState(bool bActive, float Progress);
+
+	/** Accessors for the traversal component's detection gates. */
+	bool IsGrabbing() const { return bIsGrabbing; }
+	bool HasMovementInput() const { return bHasMovementInput; }
+
 	/** Client → Server: throttled start-step scrub position. Unreliable — loss holds a frame. */
 	UFUNCTION(Server, Unreliable)
 	void Server_SetStartProgress(float NewProgress);
@@ -1153,6 +1174,17 @@ protected:
 	 *  Owner-computed; streamed via Server_SetSkidProgress. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float SkidProgress = 0.0f;
+
+	/** True while the traversal component's mantle owns the character — the ABP plays the
+	 *  clamber clip scrubbed by MantleProgress (placeholder anim until the clip lands).
+	 *  Owner + server both write it from their own mantle drive (deterministic from the
+	 *  RPC'd start/target — no progress streaming); proxies read the replicated values. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoMantle = false;
+
+	/** 0→1 mantle completion along the takeover curve. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float MantleProgress = 0.0f;
 
 	/** True while a sprint start (coil + burst) drives the Start state — the ABP plays the
 	 *  start-step clip scrubbed by StartProgress. Rides Server_SetStartStep on the edges. */
