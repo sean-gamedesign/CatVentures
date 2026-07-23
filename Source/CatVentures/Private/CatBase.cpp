@@ -289,7 +289,7 @@ void ACatBase::Tick(float DeltaTime)
 		                   ChStopping(TEXT("bStopping")),    ChCoiling(TEXT("bCoiling")),
 		                   ChBursting(TEXT("bBursting")),    ChPivoting(TEXT("bPivoting")),
 		                   ChSprinting(TEXT("bSprinting")), ChTurnInPlace(TEXT("bTurnInPlace")),
-		                   ChTurnDropZ(TEXT("TurnDropZ"));
+		                   ChTurnDropZ(TEXT("TurnDropZ")),  ChSkidProgress(TEXT("SkidProgress"));
 		PawPrint->SampleChannel(ChSpeed,     Speed);
 		PawPrint->SampleChannel(ChSpeedType, static_cast<float>(SpeedType));
 		PawPrint->SampleChannel(ChJumpPhase, static_cast<float>(JumpPhase));
@@ -305,6 +305,7 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChSprinting, bIsSprinting ? 1.0f : 0.0f);
 		PawPrint->SampleChannel(ChTurnInPlace, bIsTurningInPlace ? 1.0f : 0.0f);
 		PawPrint->SampleChannel(ChTurnDropZ, TurnStanceDropZ);
+		PawPrint->SampleChannel(ChSkidProgress, bGoSkid ? SkidProgress : 0.0f);
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────
@@ -781,6 +782,19 @@ void ACatBase::UpdateWeightyStop()
 	{
 		StopElapsed += DeltaTime;
 
+		// Skid-clip scrub: fraction of the reachable speed collapse (linear in time under
+		// the constant-decel run-out). Monotonic — downhill wiggle must not run it backward.
+		if (bGoSkid && StopEntrySpeed > KINDA_SMALL_NUMBER)
+		{
+			const float Raw = (1.0f - Speed / StopEntrySpeed) / SkidReachableFrac;
+			SkidProgress = FMath::Max(SkidProgress, FMath::Clamp(Raw, 0.0f, 1.0f));
+			if (!HasAuthority() && FMath::Abs(SkidProgress - LastSentSkidProgress) >= 0.05f)
+			{
+				LastSentSkidProgress = SkidProgress;
+				Server_SetSkidProgress(SkidProgress);
+			}
+		}
+
 		// Failsafe: a steep-downhill run-out can outlast any sensible stop.
 		constexpr float StopMaxDuration = 1.2f;
 
@@ -805,14 +819,25 @@ void ACatBase::EnterStop()
 	StopStartLocation = GetActorLocation();
 	StopElapsed       = 0.0f;
 
+	// Sprint-band stops drive the Skid state; trot-band stops keep the plain gait run-out.
+	bGoSkid = StopEntrySpeed >= SkidMinEntrySpeed;
+	SkidProgress         = 0.0f;
+	LastSentSkidProgress = 0.0f;
+	SkidReachableFrac    = FMath::Max(1.0f - StopPlantSpeed / FMath::Max(StopEntrySpeed, 1.0f), 0.1f);
+	if (bGoSkid && !HasAuthority())
+	{
+		Server_SetSkidProgress(0.0f);
+	}
+
 	// Predicted braking swap; the server mirrors it so move replay coasts the same.
 	ApplyStopBraking(true);
 	if (!HasAuthority())
 	{
-		Server_SetStopBraking(true);
+		Server_SetStopBraking(true, bGoSkid);
 	}
 
-	UE_LOG(LogCatVentures, Log, TEXT("[%s] Stop ENTER — Speed %.0f"), *GetName(), StopEntrySpeed);
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Stop ENTER — Speed %.0f%s"), *GetName(), StopEntrySpeed,
+		bGoSkid ? TEXT(" (skid)") : TEXT(""));
 }
 
 void ACatBase::ExitStop(bool bPlanted)
@@ -823,10 +848,22 @@ void ACatBase::ExitStop(bool bPlanted)
 	}
 	bIsStopping = false;
 
+	// Plant = clip completed, snap the scrub for the settle; abort = freeze where it was
+	// so the blend-out leaves from the pose the skid actually reached.
+	if (bGoSkid && bPlanted)
+	{
+		SkidProgress = 1.0f;
+		if (!HasAuthority())
+		{
+			Server_SetSkidProgress(1.0f);
+		}
+	}
+	bGoSkid = false;
+
 	ApplyStopBraking(false);
 	if (!HasAuthority())
 	{
-		Server_SetStopBraking(false);
+		Server_SetStopBraking(false, false);
 	}
 
 	if (bPlanted)
@@ -868,9 +905,15 @@ void ACatBase::ApplyStopBraking(bool bApply)
 	}
 }
 
-void ACatBase::Server_SetStopBraking_Implementation(bool bApply)
+void ACatBase::Server_SetStopBraking_Implementation(bool bApply, bool bSkid)
 {
 	ApplyStopBraking(bApply);
+	bGoSkid = bApply && bSkid;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+}
+
+void ACatBase::Server_SetSkidProgress_Implementation(float NewProgress)
+{
+	SkidProgress = NewProgress;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1588,6 +1631,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, bGoPivot, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, PivotProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, PivotAngleDeg, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoSkid, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, SkidProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -2078,31 +2123,60 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		static constexpr float PivotCrouchDrop[11] =
 			{ 0.26f, 1.59f, 2.91f, 3.58f, 3.91f, 4.24f, 4.57f, 5.24f, 6.09f, 6.93f, 7.78f };
 
+		// Skid crouch drop (cm) by SkidProgress — the authored brace envelope of the skid-stop
+		// clip (rise into the plant → hold through the slide → release into the settle);
+		// same retargeting doctrine as the pivot table above. Peak 7.8 matches the Land_run
+		// source brace — shallower left the pitched pelvis's hind sockets beyond leg reach.
+		static constexpr float SkidCrouchDrop[11] =
+			{ 0.00f, 4.59f, 7.42f, 7.80f, 7.80f, 7.80f, 7.80f, 7.80f, 5.46f, 3.12f, 0.78f };
+
 		constexpr float TurnDropReleaseSpeed = 8.0f;
-		// While pivoting, track the curve near-directly (it is already smooth and the clip
-		// legs are solved for exactly this value each frame — the engage-speed interp lagged
-		// it by ~1–1.5 cm on fast scrubs, floating all four paws, 2026-07-22 PawPrint round).
-		// The high rate still smooths the enter edge; release keeps the gentle ease.
-		constexpr float PivotDropTrackSpeed = 60.0f;
-		bool bPivotDrop = false;
+		// While a scrub owns the drop, track the curve near-directly (it is already smooth and
+		// the clip legs are solved for exactly this value each frame — the engage-speed interp
+		// lagged it by ~1–1.5 cm on fast scrubs, floating all four paws, 2026-07-22 PawPrint
+		// round). The high rate still smooths the enter edge; release keeps the gentle ease.
+		constexpr float CurveDropTrackSpeed = 60.0f;
+		auto SampleDropTable = [](const float (&Table)[11], float Progress)
+		{
+			const float P = FMath::Clamp(Progress, 0.0f, 1.0f) * 10.0f;
+			const int32 Seg = FMath::Min(FMath::FloorToInt32(P), 9);
+			return FMath::Lerp(Table[Seg], Table[Seg + 1], P - Seg);
+		};
+		bool bCurveDrop = false;
 		float DropTarget = 0.0f;
 		if (bIsOnGround)
 		{
 			if (bGoPivot && PivotCrouchScale > 0.0f)
 			{
-				const float P = FMath::Clamp(PivotProgress, 0.0f, 1.0f) * 10.0f;
-				const int32 Seg = FMath::Min(FMath::FloorToInt32(P), 9);
-				DropTarget = -FMath::Lerp(PivotCrouchDrop[Seg], PivotCrouchDrop[Seg + 1], P - Seg) * PivotCrouchScale;
-				bPivotDrop = true;
+				DropTarget = -SampleDropTable(PivotCrouchDrop, PivotProgress) * PivotCrouchScale;
+				bCurveDrop = true;
+			}
+			else if (bGoSkid && SkidCrouchScale > 0.0f)
+			{
+				DropTarget = -SampleDropTable(SkidCrouchDrop, SkidProgress) * SkidCrouchScale;
+				bCurveDrop = true;
 			}
 			else if (SpeedType == ECatMoveType::Turn)
 			{
 				DropTarget = -TurnStanceDrop;
 			}
 		}
-		const float InterpSpeed = bPivotDrop ? PivotDropTrackSpeed
-			: (DropTarget < TurnStanceDropZ) ? TurnStanceDropEngageSpeed : TurnDropReleaseSpeed;
-		TurnStanceDropZ = FMath::FInterpTo(TurnStanceDropZ, DropTarget, DeltaTime, InterpSpeed);
+		// Sustained curve mode tracks EXACTLY — the clip legs are solved for the table
+		// value at this frame's progress, so any lag is a paw float/penetration (the
+		// speed-60 interp still lagged 0.3–0.95 cm on the skid's fast rise, PawPrint
+		// 2026-07-22 evening round). Both tables start ≈0 at progress 0, so the first
+		// curve frame has no edge to smooth; the interp covers enter/exit only.
+		if (bCurveDrop && bCurveDropWasActive)
+		{
+			TurnStanceDropZ = DropTarget;
+		}
+		else
+		{
+			const float InterpSpeed = bCurveDrop ? CurveDropTrackSpeed
+				: (DropTarget < TurnStanceDropZ) ? TurnStanceDropEngageSpeed : TurnDropReleaseSpeed;
+			TurnStanceDropZ = FMath::FInterpTo(TurnStanceDropZ, DropTarget, DeltaTime, InterpSpeed);
+		}
+		bCurveDropWasActive = bCurveDrop;
 	}
 
 	// ── (C) Whole-body slope pitch — APPLY only ──────────────────────

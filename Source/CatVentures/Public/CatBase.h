@@ -332,6 +332,19 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "200.0"))
 	float StopPlantSpeed = 80.0f;
 
+	/** Minimum entry speed (cm/s) for a run-out to play the skid-stop CLIP (Skid state) instead
+	 *  of the plain gait run-out. Sprint-band only by default — trot stops staying visually
+	 *  ordinary is a design decision (differentiation lives at sprint). Live-tunable. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "300.0", ClampMax = "700.0"))
+	float SkidMinEntrySpeed = 500.0f;
+
+	/** Scale on the skid crouch drop — same doctrine as PivotCrouchScale: the skid clip's brace
+	 *  crouch lives in Spine translation, which the skeleton's all-SKELETON translation
+	 *  retargeting discards; the §B2 envelope (rise→hold→release, peak 7.8 cm) restores it
+	 *  synced to SkidProgress. The clip legs were IK-solved against the crouched hip. 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Stop", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float SkidCrouchScale = 1.0f;
+
 	/** Plant dip (cm) kicked into the landing-cushion spring, scaled by the stop's entry speed.
 	 *  SHIPS 0 (2026-07-19 isolation probe): the kick read as a funky spine pop at the halt —
 	 *  at 10 it slammed the spring's clamp, and even moderate values fight the accel-lean
@@ -649,6 +662,10 @@ protected:
 	/** Interp state for the TurnStanceDrop ease (0 → −TurnStanceDrop while turning). */
 	float TurnStanceDropZ = 0.0f;
 
+	/** True when last frame's §B2 drop came from a scrub curve (pivot/skid) — sustained
+	 *  curve mode tracks the table exactly; interp smooths only the enter/exit edges. */
+	bool bCurveDropWasActive = false;
+
 	/** Whole-body slope pitch on the mesh's relative rotation (degrees, interp state).
 	 *  Bending Spine→Spine_3 can't pitch a quadruped — the hips aren't in the chain, so the
 	 *  bend kinks at the spine root (the "weird back arch"). Pitching the whole mesh aligns
@@ -908,9 +925,16 @@ protected:
 	void Server_SetPivotProgress(float NewProgress);
 
 	/** Client → Server: mirror the stop braking swap so server-side move replay coasts the same
-	 *  as the owning client. Reliable — a lost restore would leave the server coasting forever. */
+	 *  as the owning client. Reliable — a lost restore would leave the server coasting forever.
+	 *  bSkid carries the skid-clip engage on the enter edge (sprint-band stops only) so proxies
+	 *  enter the Skid state too. */
 	UFUNCTION(Server, Reliable)
-	void Server_SetStopBraking(bool bApply);
+	void Server_SetStopBraking(bool bApply, bool bSkid);
+
+	/** Client → Server: throttled skid-clip scrub position (the Server_SetPivotProgress
+	 *  streaming pattern). Unreliable — loss just holds the last scrub for a frame. */
+	UFUNCTION(Server, Unreliable)
+	void Server_SetSkidProgress(float NewProgress);
 
 	/** Client → Server: mirror the start-burst acceleration boost so server-side move replay
 	 *  accelerates the same as the owning client. Reliable — a lost restore would leave the
@@ -1099,6 +1123,20 @@ protected:
 	 *  mid-pivot clip switch would pop). Rides the Server_SetPivotBraking enter edge. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float PivotAngleDeg = 0.0f;
+
+	/** True while a sprint-band weighty stop drives the Skid state — the ABP swaps the gait
+	 *  run-out for the skid-stop clip. Trot-band stops keep the plain gait run-out (their
+	 *  imperceptibility is a design decision). Rides the Server_SetStopBraking enter edge. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoSkid = false;
+
+	/** 0→1 skid completion: (1 − Speed/entry) / (1 − plant/entry) — linear in time under the
+	 *  stop's constant decel, exactly 1 at the plant (reachable-mapped so the clip tail can't
+	 *  snap; the pivot lesson). Clamped monotonic; frozen (not snapped) on an abort so the
+	 *  blend-out leaves from the pose the skid was actually in.
+	 *  Owner-computed; streamed via Server_SetSkidProgress. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float SkidProgress = 0.0f;
 
 	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -1348,6 +1386,12 @@ private:
 
 	/** Ground speed when the run-out began — scales the plant dip and the re-accel ramp. */
 	float StopEntrySpeed = 0.0f;
+
+	/** Skid scrub denominator latched at stop entry: 1 − StopPlantSpeed/StopEntrySpeed. */
+	float SkidReachableFrac = 1.0f;
+
+	/** Last SkidProgress sent via Server_SetSkidProgress (throttle: send on Δ ≥ 0.05). */
+	float LastSentSkidProgress = 0.0f;
 
 	/** World location where the run-out began (distance logging — the M5 skid-clip spec numbers). */
 	FVector StopStartLocation = FVector::ZeroVector;
