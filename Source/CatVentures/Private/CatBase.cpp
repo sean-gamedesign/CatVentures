@@ -289,7 +289,8 @@ void ACatBase::Tick(float DeltaTime)
 		                   ChStopping(TEXT("bStopping")),    ChCoiling(TEXT("bCoiling")),
 		                   ChBursting(TEXT("bBursting")),    ChPivoting(TEXT("bPivoting")),
 		                   ChSprinting(TEXT("bSprinting")), ChTurnInPlace(TEXT("bTurnInPlace")),
-		                   ChTurnDropZ(TEXT("TurnDropZ")),  ChSkidProgress(TEXT("SkidProgress"));
+		                   ChTurnDropZ(TEXT("TurnDropZ")),  ChSkidProgress(TEXT("SkidProgress")),
+		                   ChStartProgress(TEXT("StartProgress"));
 		PawPrint->SampleChannel(ChSpeed,     Speed);
 		PawPrint->SampleChannel(ChSpeedType, static_cast<float>(SpeedType));
 		PawPrint->SampleChannel(ChJumpPhase, static_cast<float>(JumpPhase));
@@ -306,6 +307,7 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChTurnInPlace, bIsTurningInPlace ? 1.0f : 0.0f);
 		PawPrint->SampleChannel(ChTurnDropZ, TurnStanceDropZ);
 		PawPrint->SampleChannel(ChSkidProgress, bGoSkid ? SkidProgress : 0.0f);
+		PawPrint->SampleChannel(ChStartProgress, bGoStartStep ? StartProgress : 0.0f);
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────
@@ -982,9 +984,15 @@ void ACatBase::UpdateWeightyStart()
 		{
 			bIsStartCoiling    = false;
 			StartCooldownTimer = 0.4f;
+			SetStartStepActive(false, /*bSnapProgress=*/false);   // freeze — blend out from the actual pose
 			UE_LOG(LogCatVentures, Log, TEXT("[%s] Start coil ABORT"), *GetName());
 			return;
 		}
+
+		// Clip scrub, coil phase: timer fraction over the clip's authored coil portion.
+		StartProgress = FMath::Max(StartProgress,
+			StartClipCoilFrac * (1.0f - StartCoilTimer / FMath::Max(StartCoilTime, KINDA_SMALL_NUMBER)));
+		StreamStartProgress();
 
 		StartCoilTimer -= DeltaTime;
 		if (StartCoilTimer <= 0.0f)
@@ -1001,6 +1009,11 @@ void ACatBase::UpdateWeightyStart()
 		StartBurstElapsed += DeltaTime;
 		constexpr float BurstMaxDuration = 0.6f;   // failsafe (uphill, bumped, etc.)
 
+		// Clip scrub, burst phase: the launch pose tracks the physical acceleration.
+		StartProgress = FMath::Max(StartProgress, StartClipCoilFrac + (1.0f - StartClipCoilFrac)
+			* FMath::Clamp(Speed / FMath::Max(StartBurstEndSpeed, 1.0f), 0.0f, 1.0f));
+		StreamStartProgress();
+
 		if (!bInputFresh || !bGrounded || bIsGrabbing || bIsPivoting
 			|| Speed >= StartBurstEndSpeed || StartBurstElapsed > BurstMaxDuration)
 		{
@@ -1009,9 +1022,41 @@ void ACatBase::UpdateWeightyStart()
 	}
 }
 
+void ACatBase::SetStartStepActive(bool bActive, bool bSnapProgress)
+{
+	bGoStartStep = bActive;
+	if (bSnapProgress)
+	{
+		StartProgress = 1.0f;
+		if (!HasAuthority())
+		{
+			Server_SetStartProgress(1.0f);
+		}
+	}
+	if (!HasAuthority())
+	{
+		Server_SetStartStep(bActive);
+	}
+}
+
+void ACatBase::StreamStartProgress()
+{
+	if (!HasAuthority() && FMath::Abs(StartProgress - LastSentStartProgress) >= 0.05f)
+	{
+		LastSentStartProgress = StartProgress;
+		Server_SetStartProgress(StartProgress);
+	}
+}
+
 void ACatBase::EnterStartCoil()
 {
 	StartCoilLocation = GetActorLocation();
+
+	// Clip scrub arm (the skid pattern) — before the burst-only early-out so the clip
+	// plays either way (burst-only starts scrub from the clip's burst portion).
+	StartProgress          = 0.0f;
+	LastSentStartProgress  = 0.0f;
+	SetStartStepActive(true, /*bSnapProgress=*/false);
 
 	// StartCoilTime 0 = burst-only mode: skip the hold entirely.
 	if (StartCoilTime <= 0.0f)
@@ -1023,8 +1068,9 @@ void ACatBase::EnterStartCoil()
 	bIsStartCoiling = true;
 	StartCoilTimer  = StartCoilTime;
 
-	// Load dip: the body sinks into the coil (modest — the stop's plant-dip lesson).
-	if (bEnableLandCushion && StartCoilDip > 0.0f)
+	// The authored §B2 crouch replaces the springy coil dip — both at once would
+	// double-dip the load.
+	if (bEnableLandCushion && StartCoilDip > 0.0f && StartCrouchScale <= 0.0f)
 	{
 		MeshCushionVelocity -= StartCoilDip * LandCushionFrequency * UE_EULERS_NUMBER;
 	}
@@ -1056,6 +1102,10 @@ void ACatBase::EndStartBurst()
 	bIsStartBursting   = false;
 	StartCooldownTimer = 0.4f;
 
+	// Reached the burst end speed = launch complete → snap the scrub for the blend-out;
+	// any abort freezes it instead (blend out from the pose the launch actually reached).
+	SetStartStepActive(false, /*bSnapProgress=*/Speed >= StartBurstEndSpeed);
+
 	ApplyStartBurstAccel(false);
 	if (!HasAuthority())
 	{
@@ -1067,6 +1117,16 @@ void ACatBase::EndStartBurst()
 	const float LaunchDist = FVector::Dist2D(GetActorLocation(), StartCoilLocation);
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Start burst END — Speed %.0f, launch %.0f cm in %.2f s"),
 		*GetName(), Speed, LaunchDist, StartBurstElapsed);
+}
+
+void ACatBase::Server_SetStartStep_Implementation(bool bActive)
+{
+	bGoStartStep = bActive;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+}
+
+void ACatBase::Server_SetStartProgress_Implementation(float NewProgress)
+{
+	StartProgress = NewProgress;
 }
 
 void ACatBase::ApplyStartBurstAccel(bool bApply)
@@ -1633,6 +1693,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, PivotAngleDeg, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoSkid, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, SkidProgress, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoStartStep, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, StartProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -2154,6 +2216,17 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 			else if (bGoSkid && SkidCrouchScale > 0.0f)
 			{
 				DropTarget = -SampleDropTable(SkidCrouchDrop, SkidProgress) * SkidCrouchScale;
+				bCurveDrop = true;
+			}
+			else if (bGoStartStep && StartCrouchScale > 0.0f)
+			{
+				// Start-step coil load: rise into the loaded coil by the clip's coil
+				// portion, HELD through the push (the extension pose needs a low pelvis
+				// with planted hinds), released at the stride handoff. Matches the
+				// authored envelope exactly.
+				static constexpr float StartCrouchDrop[11] =
+					{ 0.00f, 1.88f, 3.75f, 4.50f, 4.20f, 3.80f, 3.20f, 2.00f, 0.80f, 0.15f, 0.00f };
+				DropTarget = -SampleDropTable(StartCrouchDrop, StartProgress) * StartCrouchScale;
 				bCurveDrop = true;
 			}
 			else if (SpeedType == ECatMoveType::Turn)

@@ -403,6 +403,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "100.0", ClampMax = "1000.0"))
 	float StartBurstEndSpeed = 400.0f;
 
+	/** Scale on the start-step coil crouch drop (§B2 envelope synced to StartProgress, peak
+	 *  4.5 cm at the loaded coil, released as the launch rises — same retargeting doctrine as
+	 *  the pivot/skid tables). When > 0 it REPLACES the springy StartCoilDip cushion kick
+	 *  (authored crouch + spring kick would double-dip). 0 disables and restores the kick. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Start", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float StartCrouchScale = 1.0f;
+
 	/** M4 input shaping: fresh input from idle ramps 0→1 over this window (s) so a keyboard
 	 *  tap doesn't twitch the cat. Skipped on the coil path (the burst is its own envelope);
 	 *  0 disables. */
@@ -942,6 +949,15 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_SetStartBurstAccel(bool bApply);
 
+	/** Client → Server: start-step clip engage edges (the skid pattern — coil enter has no
+	 *  existing mirror RPC to ride, the burst one fires 0.12 s too late for the coil pose). */
+	UFUNCTION(Server, Reliable)
+	void Server_SetStartStep(bool bActive);
+
+	/** Client → Server: throttled start-step scrub position. Unreliable — loss holds a frame. */
+	UFUNCTION(Server, Unreliable)
+	void Server_SetStartProgress(float NewProgress);
+
 	// ══════════════════════════════════════════════════════════════════
 	// ── Replicated Gameplay State (server-authoritative) ────────────────
 	// ══════════════════════════════════════════════════════════════════
@@ -1137,6 +1153,18 @@ protected:
 	 *  Owner-computed; streamed via Server_SetSkidProgress. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float SkidProgress = 0.0f;
+
+	/** True while a sprint start (coil + burst) drives the Start state — the ABP plays the
+	 *  start-step clip scrubbed by StartProgress. Rides Server_SetStartStep on the edges. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoStartStep = false;
+
+	/** 0→1 start-step completion: the coil hold maps to the clip's coil portion
+	 *  (StartClipCoilFrac) by timer, the burst maps the remainder by Speed/StartBurstEndSpeed —
+	 *  the launch pose tracks the physical acceleration. Snap-1 at burst end, frozen on abort.
+	 *  Owner-computed; streamed via Server_SetStartProgress. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float StartProgress = 0.0f;
 
 	/** Procedural lean amount during locomotion (-1 = banking left, +1 = banking right). Drives Modify Bone Roll. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
@@ -1379,6 +1407,17 @@ private:
 	 *  real turn rate, so the scrub cannot stall when a sweeping camera drags the target. */
 	float PivotAccumDeg = 0.0f;
 
+	/** Fraction of the start-step clip timeline occupied by the authored coil — the coil
+	 *  timer maps onto it, the burst maps onto the remainder. Must match the authored clip
+	 *  (coil keypose at frame 5 of 16 ≈ 0.24 of the 0.5 s clip). */
+	static constexpr float StartClipCoilFrac = 0.24f;
+
+	/** Arm/disarm the start-step clip scrub on both machines; optionally snap progress to 1. */
+	void SetStartStepActive(bool bActive, bool bSnapProgress);
+
+	/** Throttled owner→server StartProgress stream (send on Δ ≥ 0.05). */
+	void StreamStartProgress();
+
 	// ── Weighty Stop State (local owner only) ──────────────────────────
 
 	/** True while a stop run-out is active (constant-deceleration braking applied). */
@@ -1392,6 +1431,9 @@ private:
 
 	/** Last SkidProgress sent via Server_SetSkidProgress (throttle: send on Δ ≥ 0.05). */
 	float LastSentSkidProgress = 0.0f;
+
+	/** Last StartProgress sent via Server_SetStartProgress (throttle: send on Δ ≥ 0.05). */
+	float LastSentStartProgress = 0.0f;
 
 	/** World location where the run-out began (distance logging — the M5 skid-clip spec numbers). */
 	FVector StopStartLocation = FVector::ZeroVector;
