@@ -28,6 +28,7 @@ enum class ECatTraversalState : uint8
 enum class EWallAttachEnd : uint8
 {
 	Kick,       // consumed by a wall bounce — the intended exit
+	Mantled,    // a ledge came into band while clinging; the mantle took over
 	Timeout,    // WallClingMaxTime elapsed
 	WallLost,   // the held face is no longer under the trace
 	Grounded,   // landed while attached
@@ -74,9 +75,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle")
 	bool bEnableMantle = true;
 
-	/** Forward chest-probe reach (uu) — how far ahead a wall can be caught. */
+	/** Chest-probe reach (uu) — how far away a ledge can be caught. ONE ray, aimed
+	 *  down the cat's HEADING (held input, else actual travel) rather than actor
+	 *  forward or radially.
+	 *
+	 *  Both alternatives were tried on 2026-07-25 and both are wrong. Forward-only
+	 *  loses ledges the cat is drifting toward but not squarely facing — air control
+	 *  and camera-relative input pull heading and facing apart constantly, and the
+	 *  cling (4 rays, no input gate) would grab those walls instead, reading as "the
+	 *  mantle just stopped working". Radial over-corrects: combined with a
+	 *  directionless input gate it fired on walls beside and behind the cat, ~15x the
+	 *  mantle rate. Aiming by heading is the narrow answer to the actual question —
+	 *  "is there a ledge where I am going" — and it is why the intent test is the
+	 *  probe direction itself rather than a filter applied afterward. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "20.0", ClampMax = "100.0"))
 	float MantleReachDistance = 45.0f;
+
+	/** Travel speed (cm/s) below which motion no longer counts as a heading when no
+	 *  input is held. Raise to demand more commitment before a ledge catches; the cat
+	 *  then needs the stick, not just drift, to mantle. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.0", ClampMax = "300.0"))
+	float MantleMinApproachSpeed = 20.0f;
 
 	/** Ledge-lip height band ABOVE the capsule bottom (uu). Below min a step-up handles
 	 *  it; above max the wall is a scramble/climb candidate, not a mantle. */
@@ -212,6 +231,24 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.1", ClampMax = "5.0"))
 	float WallClingMaxTime = 1.4f;
 
+	/** Vertical speed (cm/s, either sign) above which the cling defers to a mantle the
+	 *  cat is already closing on.
+	 *
+	 *  The lip band is measured from the capsule bottom, so it is a window the cat
+	 *  passes THROUGH, and either direction of travel can be closing on it:
+	 *      rising  + LipTooHigh -> the rise walks the lip down into band
+	 *      falling + LipTooLow  -> the fall walks the lip up into band
+	 *  In both cases the cling's CATCH beat pins Vz to 0 and cancels exactly the
+	 *  motion that was about to arm the mantle. Shipping only the rising half (the
+	 *  first pass) left the overshoot case wide open — a sprint jump that clears the
+	 *  ledge reads LipTooLow on the way down and got caught on that very frame
+	 *  (2026-07-25 telemetry: 650 cm/s jump, one frame of LipTooLow at 16.220, cling
+	 *  START at 16.220, then 1.4 s of sliding past the ledge to a timeout).
+	 *  Deliberately narrow: a wall with no ledge reports NoWall/NoLip and still
+	 *  catches normally, so chimney bouncing is untouched. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "400.0"))
+	float WallClingLedgeSuppressSpeed = 50.0f;
+
 	/** Cooldown (s) before another attach may start. Backstop for the one frame after a
 	 *  kick where velocity has not yet flipped away from the wall. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -246,10 +283,15 @@ private:
 	/** Airborne ledge detection for the locally controlled cat; starts the mantle on a hit. */
 	void TryDetectMantle();
 
-	/** Shared radial wall probe (the traversal detection library — mantle uses the
-	 *  forward ray, the bounce uses all four). Returns the NEAREST wall-like hit. */
+	/** Shared radial wall probe (the traversal detection library). Rays fan out from
+	 *  BasisDir at 90° steps; zero BasisDir means actor forward. The bounce and the
+	 *  cling take all four from forward — they answer "is there a wall near me". The
+	 *  mantle takes ONE along the heading — it answers "is there a ledge where I am
+	 *  going", which is a different question and must not be widened into the first
+	 *  (2026-07-25: four rays plus a directionless input gate made it fire ~15x too
+	 *  often). Returns the NEAREST wall-like hit. */
 	bool ProbeWalls(float Reach, int32 NumDirections, FVector& OutPoint, FVector& OutNormal,
-	                bool& bOutAnyHit) const;
+	                bool& bOutAnyHit, const FVector& BasisDir = FVector::ZeroVector) const;
 
 	/** Why the last mantle-detection frame bailed — logged on CHANGE only (a sustained
 	 *  reject would otherwise be a per-frame firehose) and pushed to the PawPrint

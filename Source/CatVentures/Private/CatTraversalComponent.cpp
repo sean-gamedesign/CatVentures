@@ -42,6 +42,7 @@ const TCHAR* UCatTraversalComponent::WallAttachEndToString(EWallAttachEnd R)
 	switch (R)
 	{
 	case EWallAttachEnd::Kick:     return TEXT("kick");
+	case EWallAttachEnd::Mantled:  return TEXT("mantled");
 	case EWallAttachEnd::Timeout:  return TEXT("timeout");
 	case EWallAttachEnd::WallLost: return TEXT("wall lost");
 	case EWallAttachEnd::Grounded: return TEXT("grounded");
@@ -80,7 +81,7 @@ void UCatTraversalComponent::NoteReject(ETraversalReject R)
 // wall-like hit; bOutAnyHit distinguishes "nothing there" from "hit something flat",
 // which is the difference between two very different reject reasons.
 bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
-	FVector& OutPoint, FVector& OutNormal, bool& bOutAnyHit) const
+	FVector& OutPoint, FVector& OutNormal, bool& bOutAnyHit, const FVector& BasisDir) const
 {
 	bOutAnyHit = false;
 	const ACatBase* Cat = GetCat();
@@ -89,7 +90,7 @@ bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
 		return false;
 	}
 
-	FVector Fwd = Cat->GetActorForwardVector();
+	FVector Fwd = BasisDir.IsNearlyZero() ? Cat->GetActorForwardVector() : BasisDir;
 	Fwd.Z = 0.0f;
 	if (!Fwd.Normalize())
 	{
@@ -166,6 +167,24 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (TraversalState == ECatTraversalState::WallAttach)
 	{
 		DriveWallAttach(DeltaTime);
+		// Keep hunting for a ledge WHILE clinging. The slide walks the cat down a wall,
+		// which walks any lip above it up into the mantle band — so a cling under a
+		// ledge should become a mantle, not slide past it to a timeout (2026-07-25: a
+		// cling blinded the detector for 1.4 s while doing exactly that, because this
+		// branch used to return immediately). Detection is owner-only as ever; the
+		// mantle mirrors itself to the server through its own RPC. This is also the
+		// mechanism Vertical Scramble's top-out handoff will ride: a scramble is this
+		// same state entered with a rise budget, and at the top the lip enters band.
+		if (TraversalState == ECatTraversalState::WallAttach)
+		{
+			if (ACatBase* AttachedCat = GetCat())
+			{
+				if (AttachedCat->IsLocallyControlled())
+				{
+					TryDetectMantle();
+				}
+			}
+		}
 		return;
 	}
 
@@ -191,37 +210,65 @@ void UCatTraversalComponent::TryDetectMantle()
 	if (!bEnableMantle)                { NoteReject(ETraversalReject::Disabled);    return; }
 	if (CooldownTimer > 0.0f)          { NoteReject(ETraversalReject::Cooldown);    return; }
 
-	// Airborne, deliberate (input held), hands free. All grounded verbs are excluded
-	// by the airborne gate — no CMC precedence overlap with stop/start/pivot.
+	// Airborne, hands free. All grounded verbs are excluded by the airborne gate — no
+	// CMC precedence overlap with stop/start/pivot.
 	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
 	if (!CMC || !CMC->IsFalling())     { NoteReject(ETraversalReject::NotAirborne); return; }
 	if (Cat->IsGrabbing())             { NoteReject(ETraversalReject::Grabbing);    return; }
-	if (!Cat->HasMovementInput())      { NoteReject(ETraversalReject::NoInput);     return; }
 
 	UCapsuleComponent* Capsule = Cat->GetCapsuleComponent();
 	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
 	const FVector Center = Cat->GetActorLocation();
 	const float CapsuleBottomZ = Center.Z - HalfHeight;
-	FVector Fwd = Cat->GetActorForwardVector();
-	Fwd.Z = 0.0f;
-	if (!Fwd.Normalize())              { NoteReject(ETraversalReject::NoFacing);    return; }
 
 	FCollisionQueryParams Params(FName(TEXT("CatMantle")), false, Cat);
 
-	// 1. Chest probe: a wall face ahead (forward ray only — a mantleable ledge is
-	//    always the direction the body is facing).
+	// Heading, not facing: where the cat is GOING is the question a mantle answers.
+	// Held input wins; failing that, actual travel counts (so a stick release mid-arc
+	// does not disarm a ledge you are already sailing at). Actor forward is
+	// deliberately NOT the fallback — air control and camera-relative input pull the
+	// two apart constantly, and that divergence is what let the cling, which probes
+	// all four ways, grab ledges the forward-only mantle never examined.
+	FVector Heading = FVector::ZeroVector;
+	if (Cat->PivotInputStaleTime < 0.15f && !Cat->PivotLiveInputDir.IsNearlyZero())
+	{
+		Heading = Cat->PivotLiveInputDir;
+	}
+	else
+	{
+		const FVector HorizVel(CMC->Velocity.X, CMC->Velocity.Y, 0.0f);
+		if (HorizVel.SizeSquared() >= FMath::Square(MantleMinApproachSpeed))
+		{
+			Heading = HorizVel;
+		}
+	}
+	Heading.Z = 0.0f;
+	if (!Heading.Normalize())          { NoteReject(ETraversalReject::NoInput);     return; }
+
+	// 1. Chest probe: ONE ray down the heading. Aiming the probe by intent is what
+	//    keeps this tight — a radial probe plus a directionless "any input" gate
+	//    fired on walls beside and behind the cat (2026-07-25, ~15x the mantle rate).
+	//    It also dodges the nearest-hit selection trap: with four rays the probe could
+	//    hand back a side wall while the cat was heading at the front one.
 	FVector WallPoint, WallNormal;
 	bool bAnyHit = false;
-	if (!ProbeWalls(MantleReachDistance, /*NumDirections=*/1, WallPoint, WallNormal, bAnyHit))
+	if (!ProbeWalls(MantleReachDistance, /*NumDirections=*/1, WallPoint, WallNormal,
+			bAnyHit, Heading))
 	{
 		NoteReject(bAnyHit ? ETraversalReject::WallTooFlat : ETraversalReject::NoWall);
 		return;
 	}
 
+	// Measure along the WALL, not the body — the caught face need not be the one the
+	// cat faces, since the probe followed the heading.
+	FVector IntoWall = -WallNormal;
+	IntoWall.Z = 0.0f;
+	if (!IntoWall.Normalize())         { NoteReject(ETraversalReject::WallTooFlat);  return; }
+
 	// 2. Lip probe: floor within the mantleable band past the wall face.
 	const FVector LipStart(
-		WallPoint.X + Fwd.X * MantleForwardClearance,
-		WallPoint.Y + Fwd.Y * MantleForwardClearance,
+		WallPoint.X + IntoWall.X * MantleForwardClearance,
+		WallPoint.Y + IntoWall.Y * MantleForwardClearance,
 		CapsuleBottomZ + MantleMaxLedgeHeight + 10.0f);
 	FHitResult LipHit;
 	if (!GetWorld()->LineTraceSingleByChannel(LipHit, LipStart,
@@ -242,7 +289,7 @@ void UCatTraversalComponent::TryDetectMantle()
 	if (LedgeHeight > MantleMaxLedgeHeight) { NoteReject(ETraversalReject::LipTooHigh); return; }
 
 	// 3. Headroom: the landing spot must fit the capsule.
-	const FVector Target = LipHit.ImpactPoint + Fwd * 12.0f
+	const FVector Target = LipHit.ImpactPoint + IntoWall * 12.0f
 		+ FVector(0, 0, HalfHeight + 2.0f);
 	FHitResult RoomHit;
 	if (GetWorld()->LineTraceSingleByChannel(RoomHit, Target,
@@ -253,6 +300,15 @@ void UCatTraversalComponent::TryDetectMantle()
 	}
 
 	NoteReject(ETraversalReject::None);
+
+	// A ledge outranks the wall below it — including a wall already being held. Release
+	// first: StartMantle refuses to stack on a live takeover, and leaving the attach set
+	// would strand bGoWallAttach and skip the server's release mirror.
+	if (IsWallAttached())
+	{
+		EndWallAttach(EWallAttachEnd::Mantled);
+	}
+
 	StartMantle(Center, Target);
 	if (!Cat->HasAuthority())
 	{
@@ -309,6 +365,19 @@ void UCatTraversalComponent::TryWallCling()
 	}
 	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
 	if (!CMC || !CMC->IsFalling())
+	{
+		return;
+	}
+
+	// Never cancel motion that is closing on the mantle band. TryDetectMantle ran this
+	// same tick, so LastReject is current: a lip reject means a real ledge is there and
+	// only its height disqualified it — and height is what the vertical motion is
+	// fixing, from whichever side. Catching here would pin Vz to 0 and kill it.
+	const float Vz = CMC->Velocity.Z;
+	const bool bClosingOnBand =
+		   (LastReject == ETraversalReject::LipTooHigh && Vz >  WallClingLedgeSuppressSpeed)
+		|| (LastReject == ETraversalReject::LipTooLow  && Vz < -WallClingLedgeSuppressSpeed);
+	if (bClosingOnBand)
 	{
 		return;
 	}
@@ -611,6 +680,18 @@ void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& 
 	MantleElapsed  = 0.0f;
 	const float Height = FMath::Max(InTarget.Z - InStart.Z, 0.0f);
 	MantleDuration = MantleBaseDuration + Height * MantleDurationPerCm;
+
+	// Face the ledge. Since the chest probe went radial the caught face is often not
+	// the one the body faces, and the clamber clip is authored as a straight-ahead
+	// pull-up — without this a sideways catch plays it crabbing. Derived from the
+	// start→target vector rather than the normal so the owner and the server (which
+	// receives only those two points) turn identically.
+	FVector Facing = InTarget - InStart;
+	Facing.Z = 0.0f;
+	if (Facing.Normalize())
+	{
+		Cat->SetActorRotation(FRotator(0.0f, Facing.Rotation().Yaw, 0.0f));
+	}
 
 	// The single CMC takeover point for this component: Flying kills gravity while
 	// the curve owns the capsule; the restore lives in EndMantle and nowhere else.

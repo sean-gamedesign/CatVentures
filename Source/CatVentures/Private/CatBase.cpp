@@ -408,7 +408,9 @@ void ACatBase::Move(const FInputActionValue& Value)
 		// would fight the curve (Flying mode + AddMovementInput = drift). The wall
 		// attach zeroes horizontal velocity every frame anyway, but suppressing here
 		// stops air control fighting it — and the direction cache above stays live,
-		// which is exactly what DriveWallAttach reads for its steer-away release.
+		// which is what TryDetectMantle reads as its heading while the cat clings
+		// (horizontal velocity is zero there, so input is the only heading source —
+		// this is what lets a cling turn into a mantle when a lip enters band).
 		if (Traversal && (Traversal->IsMantling() || Traversal->IsWallAttached()))
 		{
 			return;
