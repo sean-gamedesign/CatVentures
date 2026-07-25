@@ -2,12 +2,129 @@
 
 #include "CatBase.h"
 #include "CatVenturesLog.h"
+#include "PawPrintSubsystem.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 
 UCatTraversalComponent::UCatTraversalComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Detection library (shared by every traversal verb) ────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+const TCHAR* UCatTraversalComponent::RejectToString(ETraversalReject R)
+{
+	switch (R)
+	{
+	case ETraversalReject::None:        return TEXT("armed");
+	case ETraversalReject::Disabled:    return TEXT("disabled");
+	case ETraversalReject::Cooldown:    return TEXT("cooldown");
+	case ETraversalReject::NotAirborne: return TEXT("not airborne");
+	case ETraversalReject::Grabbing:    return TEXT("grabbing");
+	case ETraversalReject::NoInput:     return TEXT("no movement input");
+	case ETraversalReject::NoFacing:    return TEXT("no facing");
+	case ETraversalReject::NoWall:      return TEXT("no wall in reach");
+	case ETraversalReject::WallTooFlat: return TEXT("surface too flat (not a wall)");
+	case ETraversalReject::NoLip:       return TEXT("no lip past the wall face");
+	case ETraversalReject::LipNotFloor: return TEXT("lip surface too steep to stand on");
+	case ETraversalReject::LipTooLow:   return TEXT("ledge below the band");
+	case ETraversalReject::LipTooHigh:  return TEXT("ledge above the band");
+	case ETraversalReject::NoHeadroom:  return TEXT("no headroom at the landing spot");
+	default:                            return TEXT("?");
+	}
+}
+
+const TCHAR* UCatTraversalComponent::WallAttachEndToString(EWallAttachEnd R)
+{
+	switch (R)
+	{
+	case EWallAttachEnd::Kick:     return TEXT("kick");
+	case EWallAttachEnd::Timeout:  return TEXT("timeout");
+	case EWallAttachEnd::WallLost: return TEXT("wall lost");
+	case EWallAttachEnd::Grounded: return TEXT("grounded");
+	case EWallAttachEnd::Grabbed:  return TEXT("grabbed");
+	case EWallAttachEnd::Remote:   return TEXT("remote");
+	case EWallAttachEnd::Aborted:  return TEXT("aborted");
+	default:                       return TEXT("?");
+	}
+}
+
+// Sustained rejects are the common case (you spend whole jumps not near a ledge), so
+// logging every frame would drown the category. Log on CHANGE; sample the channel every
+// frame so a PIE session leaves a reject histogram rather than an impression.
+void UCatTraversalComponent::NoteReject(ETraversalReject R)
+{
+	ACatBase* Cat = GetCat();
+	if (R != LastReject)
+	{
+		if (R != ETraversalReject::None)
+		{
+			UE_LOG(LogCatVentures, Verbose, TEXT("[%s] Traversal detect — %s"),
+				Cat ? *Cat->GetName() : TEXT("?"), RejectToString(R));
+		}
+		LastReject = R;
+	}
+	if (Cat && Cat->PawPrint)
+	{
+		static const FName ChReject(TEXT("MantleReject"));
+		Cat->PawPrint->SampleChannel(ChReject, static_cast<float>(R));
+	}
+}
+
+// Radial chest probe. NumDirections 1 = forward only (the mantle: a ledge is always
+// ahead of the facing); 4 = forward/right/back/left (the bounce: the wall can be on
+// either side — that is what makes chimney climbing work). Returns the NEAREST
+// wall-like hit; bOutAnyHit distinguishes "nothing there" from "hit something flat",
+// which is the difference between two very different reject reasons.
+bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
+	FVector& OutPoint, FVector& OutNormal, bool& bOutAnyHit) const
+{
+	bOutAnyHit = false;
+	const ACatBase* Cat = GetCat();
+	if (!Cat || !GetWorld())
+	{
+		return false;
+	}
+
+	FVector Fwd = Cat->GetActorForwardVector();
+	Fwd.Z = 0.0f;
+	if (!Fwd.Normalize())
+	{
+		return false;
+	}
+
+	const FVector Center = Cat->GetActorLocation();
+	FCollisionQueryParams Params(FName(TEXT("CatTraversalWall")), false, Cat);
+
+	bool bFound = false;
+	float BestDistSq = TNumericLimits<float>::Max();
+	for (int32 i = 0; i < FMath::Max(NumDirections, 1); ++i)
+	{
+		const FVector Dir = Fwd.RotateAngleAxis(90.0f * i, FVector::UpVector);
+		FHitResult Hit;
+		if (!GetWorld()->LineTraceSingleByChannel(Hit, Center, Center + Dir * Reach,
+			ECC_Visibility, Params))
+		{
+			continue;
+		}
+		bOutAnyHit = true;
+		if (Hit.ImpactNormal.Z >= 0.5f)   // floor/ramp, not a wall face
+		{
+			continue;
+		}
+		const float DistSq = FVector::DistSquared(Center, Hit.ImpactPoint);
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			OutPoint   = Hit.ImpactPoint;
+			OutNormal  = Hit.ImpactNormal;
+			bFound     = true;
+		}
+	}
+	return bFound;
 }
 
 ACatBase* UCatTraversalComponent::GetCat() const
@@ -20,11 +137,35 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	CooldownTimer = FMath::Max(CooldownTimer - DeltaTime, 0.0f);
+	CooldownTimer           = FMath::Max(CooldownTimer - DeltaTime, 0.0f);
+	WallBounceCooldownTimer = FMath::Max(WallBounceCooldownTimer - DeltaTime, 0.0f);
+
+	// Rebound window closes on its own timer, or early once the cat is back on the
+	// ground (lateral air friction is meaningless there, and leaving it overridden
+	// would strand the CMC on a wall-bounce value — the restore-precedence trap).
+	if (WallBounceReboundTimer > 0.0f)
+	{
+		WallBounceReboundTimer -= DeltaTime;
+		const ACatBase* Cat = GetCat();
+		const UCharacterMovementComponent* CMC = Cat ? Cat->GetCharacterMovement() : nullptr;
+		if (WallBounceReboundTimer <= 0.0f || (CMC && CMC->IsMovingOnGround()))
+		{
+			EndReboundWindow();
+		}
+	}
+
+	WallAttachCooldownTimer = FMath::Max(WallAttachCooldownTimer - DeltaTime, 0.0f);
 
 	if (TraversalState == ECatTraversalState::Mantle)
 	{
 		DriveMantle(DeltaTime);
+		return;
+	}
+	// Runs on the owner AND the server copy (the RPC mirrors the entry, both then
+	// constrain velocity from the same deterministic profile — the mantle pattern).
+	if (TraversalState == ECatTraversalState::WallAttach)
+	{
+		DriveWallAttach(DeltaTime);
 		return;
 	}
 
@@ -34,24 +175,28 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (Cat && Cat->IsLocallyControlled())
 	{
 		TryDetectMantle();
+		// After the mantle probe: a reachable ledge always outranks sticking to the
+		// wall below it (TryDetectMantle leaves TraversalState set, which gates this).
+		TryWallCling();
 	}
 }
 
 void UCatTraversalComponent::TryDetectMantle()
 {
 	ACatBase* Cat = GetCat();
-	if (!bEnableMantle || !Cat || CooldownTimer > 0.0f)
+	if (!Cat)
 	{
 		return;
 	}
+	if (!bEnableMantle)                { NoteReject(ETraversalReject::Disabled);    return; }
+	if (CooldownTimer > 0.0f)          { NoteReject(ETraversalReject::Cooldown);    return; }
 
 	// Airborne, deliberate (input held), hands free. All grounded verbs are excluded
 	// by the airborne gate — no CMC precedence overlap with stop/start/pivot.
 	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
-	if (!CMC || !CMC->IsFalling() || Cat->IsGrabbing() || !Cat->HasMovementInput())
-	{
-		return;
-	}
+	if (!CMC || !CMC->IsFalling())     { NoteReject(ETraversalReject::NotAirborne); return; }
+	if (Cat->IsGrabbing())             { NoteReject(ETraversalReject::Grabbing);    return; }
+	if (!Cat->HasMovementInput())      { NoteReject(ETraversalReject::NoInput);     return; }
 
 	UCapsuleComponent* Capsule = Cat->GetCapsuleComponent();
 	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
@@ -59,41 +204,42 @@ void UCatTraversalComponent::TryDetectMantle()
 	const float CapsuleBottomZ = Center.Z - HalfHeight;
 	FVector Fwd = Cat->GetActorForwardVector();
 	Fwd.Z = 0.0f;
-	if (!Fwd.Normalize())
-	{
-		return;
-	}
+	if (!Fwd.Normalize())              { NoteReject(ETraversalReject::NoFacing);    return; }
 
 	FCollisionQueryParams Params(FName(TEXT("CatMantle")), false, Cat);
 
-	// 1. Chest probe: a wall face ahead.
-	FHitResult WallHit;
-	if (!GetWorld()->LineTraceSingleByChannel(WallHit, Center,
-			Center + Fwd * MantleReachDistance, ECC_Visibility, Params)
-		|| WallHit.ImpactNormal.Z >= 0.5f)
+	// 1. Chest probe: a wall face ahead (forward ray only — a mantleable ledge is
+	//    always the direction the body is facing).
+	FVector WallPoint, WallNormal;
+	bool bAnyHit = false;
+	if (!ProbeWalls(MantleReachDistance, /*NumDirections=*/1, WallPoint, WallNormal, bAnyHit))
 	{
+		NoteReject(bAnyHit ? ETraversalReject::WallTooFlat : ETraversalReject::NoWall);
 		return;
 	}
 
 	// 2. Lip probe: floor within the mantleable band past the wall face.
 	const FVector LipStart(
-		WallHit.ImpactPoint.X + Fwd.X * MantleForwardClearance,
-		WallHit.ImpactPoint.Y + Fwd.Y * MantleForwardClearance,
+		WallPoint.X + Fwd.X * MantleForwardClearance,
+		WallPoint.Y + Fwd.Y * MantleForwardClearance,
 		CapsuleBottomZ + MantleMaxLedgeHeight + 10.0f);
 	FHitResult LipHit;
 	if (!GetWorld()->LineTraceSingleByChannel(LipHit, LipStart,
 			LipStart - FVector(0, 0, MantleMaxLedgeHeight - MantleMinLedgeHeight + 20.0f),
-			ECC_Visibility, Params)
-		|| LipHit.ImpactNormal.Z <= 0.7f)
+			ECC_Visibility, Params))
 	{
+		NoteReject(ETraversalReject::NoLip);
+		return;
+	}
+	if (LipHit.ImpactNormal.Z <= 0.7f)
+	{
+		NoteReject(ETraversalReject::LipNotFloor);
 		return;
 	}
 
 	const float LedgeHeight = LipHit.ImpactPoint.Z - CapsuleBottomZ;
-	if (LedgeHeight < MantleMinLedgeHeight || LedgeHeight > MantleMaxLedgeHeight)
-	{
-		return;
-	}
+	if (LedgeHeight < MantleMinLedgeHeight) { NoteReject(ETraversalReject::LipTooLow);  return; }
+	if (LedgeHeight > MantleMaxLedgeHeight) { NoteReject(ETraversalReject::LipTooHigh); return; }
 
 	// 3. Headroom: the landing spot must fit the capsule.
 	const FVector Target = LipHit.ImpactPoint + Fwd * 12.0f
@@ -102,14 +248,353 @@ void UCatTraversalComponent::TryDetectMantle()
 	if (GetWorld()->LineTraceSingleByChannel(RoomHit, Target,
 			Target + FVector(0, 0, HalfHeight), ECC_Visibility, Params))
 	{
+		NoteReject(ETraversalReject::NoHeadroom);
 		return;
 	}
 
+	NoteReject(ETraversalReject::None);
 	StartMantle(Center, Target);
 	if (!Cat->HasAuthority())
 	{
 		Cat->Server_StartMantle(Center, Target);
 	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Wall Bounce (verb 2) ──────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// A jump press while airborne next to a wall kicks off it instead of doing
+// nothing. Unlike the mantle this is NOT a takeover — no movement mode change,
+// no CMC apply/restore, no traversal state: it is a single LaunchCharacter
+// impulse that hands straight back to the falling physics. That is deliberate,
+// and it is why the bounce can safely interrupt anything.
+//
+// The radial probe (4 rays) is what separates this from the mantle's forward
+// ray: pressed into a corner or a chimney, the wall you want to kick is rarely
+// the one you are facing. Repeated bounces off alternating normals give chimney
+// climbing for free.
+//
+// MP = the established prediction pattern: the owner launches immediately and
+// mirrors the WALL NORMAL to the server, which launches its own copy from the
+// same normal. The normal (not the resulting velocity) is the mirrored value so
+// both machines derive the launch from the same tuning knobs.
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Wall Attach — the shared cling / scramble state ───────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Three vertical phases from one set of entry parameters:
+//   RISE  (scramble only, RiseSpeed > 0) — Vz eases RiseSpeed → 0 over RiseTime
+//   CATCH (RiseTime..+WallClingCatchTime) — Vz pinned to 0: the "stick"
+//   SLIDE (after that)                    — Vz held at −WallClingSlideSpeed
+// A cling enters with RiseSpeed 0 and starts at CATCH; a scramble enters with a
+// budget and decays through zero into the SAME slide. Same exits either way.
+//
+// Deliberately a per-tick velocity CONSTRAINT rather than a movement-mode takeover:
+// the cat stays in MOVE_Falling, so Landed(), the jump SM, the landing cushion and
+// foot IK all continue to behave, and the state can be entered or dropped on any
+// frame without a CMC apply/restore pair to get wrong.
+
+void UCatTraversalComponent::TryWallCling()
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat || !bEnableWallCling || WallAttachCooldownTimer > 0.0f)
+	{
+		return;
+	}
+	if (IsMantling() || IsWallAttached() || Cat->IsGrabbing())
+	{
+		return;
+	}
+	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
+	if (!CMC || !CMC->IsFalling())
+	{
+		return;
+	}
+
+	FVector WallPoint, WallNormal;
+	bool bAnyHit = false;
+	if (!ProbeWalls(WallClingReach, /*NumDirections=*/4, WallPoint, WallNormal, bAnyHit))
+	{
+		return;
+	}
+
+	// Must be CLOSING on the wall. This is also the anti-re-stick guard: immediately
+	// after a kick the cat is travelling away from the wall it left, so that wall fails
+	// here by construction and only the wall being approached can catch.
+	FVector HorizVel = CMC->Velocity;
+	HorizVel.Z = 0.0f;
+	if (FVector::DotProduct(HorizVel, -WallNormal) < WallClingMinApproachSpeed)
+	{
+		return;
+	}
+
+	StartWallAttach(WallNormal, /*RiseSpeed=*/0.0f, /*RiseTime=*/0.0f);
+	if (!Cat->HasAuthority())
+	{
+		Cat->Server_SetWallAttach(true, WallNormal, 0.0f, 0.0f);
+	}
+}
+
+void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float RiseSpeed, float RiseTime)
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat || TraversalState != ECatTraversalState::None)
+	{
+		return;   // a mantle outranks an attach; never stack takeovers
+	}
+
+	FVector N = WallNormal;
+	N.Z = 0.0f;
+	if (!N.Normalize())
+	{
+		return;
+	}
+
+	TraversalState  = ECatTraversalState::WallAttach;
+	AttachNormal    = N;
+	AttachElapsed   = 0.0f;
+	AttachRiseSpeed = RiseSpeed;
+	AttachRiseTime  = RiseTime;
+	Cat->SetWallAttachAnimState(true);
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach START — normal (%.2f, %.2f)%s"),
+		*Cat->GetName(), N.X, N.Y,
+		RiseSpeed > 0.0f ? TEXT(" [scramble]") : TEXT(" [cling]"));
+}
+
+void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
+{
+	ACatBase* Cat = GetCat();
+	UCharacterMovementComponent* CMC = Cat ? Cat->GetCharacterMovement() : nullptr;
+	if (!Cat || !CMC)
+	{
+		EndWallAttach(EWallAttachEnd::Aborted);
+		return;
+	}
+
+	AttachElapsed += DeltaTime;
+
+	// ── Exits ────────────────────────────────────────────────────────
+	// NOTE: steering away is NOT an exit. See EndWallAttach's comment — the wall the
+	// player aims at sits along the held wall's normal, so an away-release fired on the
+	// frame intent was expressed and ate the kick.
+	if (Cat->IsGrabbing())
+	{
+		EndWallAttach(EWallAttachEnd::Grabbed);
+		return;
+	}
+	if (CMC->IsMovingOnGround())
+	{
+		EndWallAttach(EWallAttachEnd::Grounded);
+		return;
+	}
+	if (AttachElapsed > WallClingMaxTime)
+	{
+		EndWallAttach(EWallAttachEnd::Timeout);
+		return;
+	}
+
+	// The wall must still be there — trace straight at the face we are holding.
+	{
+		FHitResult Hit;
+		FCollisionQueryParams Params(FName(TEXT("CatWallAttach")), false, Cat);
+		const FVector Center = Cat->GetActorLocation();
+		if (!GetWorld()->LineTraceSingleByChannel(Hit, Center,
+				Center - AttachNormal * (WallClingReach + 10.0f), ECC_Visibility, Params)
+			|| Hit.ImpactNormal.Z >= 0.5f)
+		{
+			EndWallAttach(EWallAttachEnd::WallLost);
+			return;
+		}
+	}
+
+	// ── Vertical profile: rise → catch → slide ───────────────────────
+	float VzTarget;
+	if (AttachRiseSpeed > 0.0f && AttachElapsed < AttachRiseTime)
+	{
+		VzTarget = AttachRiseSpeed * (1.0f - AttachElapsed / FMath::Max(AttachRiseTime, KINDA_SMALL_NUMBER));
+	}
+	else if (AttachElapsed < AttachRiseTime + WallClingCatchTime)
+	{
+		VzTarget = 0.0f;
+	}
+	else
+	{
+		VzTarget = -WallClingSlideSpeed;
+	}
+
+	// Hold the profile and kill horizontal drift: the cat is stuck to the face, so the
+	// into-wall component would grind through it and the tangential component would slide
+	// it along a wall it is supposed to be gripping.
+	FVector Vel = CMC->Velocity;
+	Vel.X = 0.0f;
+	Vel.Y = 0.0f;
+	Vel.Z = VzTarget;
+	CMC->Velocity = Vel;
+
+	// Face the wall (cosmetic; orient-to-movement is inert at zero horizontal velocity).
+	Cat->SetActorRotation(FRotator(0.0f, (-AttachNormal).Rotation().Yaw, 0.0f));
+
+	if (Cat->PawPrint)
+	{
+		static const FName ChAttach(TEXT("WallAttachPhase"));
+		const float Phase = (AttachRiseSpeed > 0.0f && AttachElapsed < AttachRiseTime) ? 1.0f
+			: (AttachElapsed < AttachRiseTime + WallClingCatchTime) ? 2.0f : 3.0f;
+		Cat->PawPrint->SampleChannel(ChAttach, Phase);
+	}
+}
+
+void UCatTraversalComponent::EndWallAttach(EWallAttachEnd Reason)
+{
+	if (TraversalState != ECatTraversalState::WallAttach)
+	{
+		return;
+	}
+	TraversalState = ECatTraversalState::None;
+	WallAttachCooldownTimer = WallAttachCooldown;
+
+	if (ACatBase* Cat = GetCat())
+	{
+		Cat->SetWallAttachAnimState(false);
+		// Per-attach spec line — hold duration is the authoring spec for the cling clip
+		// (and later the scramble loop's length). The reason makes a cling that let go
+		// on its own distinguishable from one the player kicked out of.
+		UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach END — held %.2f s (%s)"),
+			*Cat->GetName(), AttachElapsed, WallAttachEndToString(Reason));
+		if (!Cat->HasAuthority())
+		{
+			Cat->Server_SetWallAttach(false, FVector::ZeroVector, 0.0f, 0.0f);
+		}
+	}
+	AttachNormal = FVector::ZeroVector;
+}
+
+void UCatTraversalComponent::EndReboundWindow()
+{
+	WallBounceReboundTimer = 0.0f;
+	WallBounceReboundDir   = FVector::ZeroVector;
+	if (ACatBase* Cat = GetCat())
+	{
+		if (UCharacterMovementComponent* CMC = Cat->GetCharacterMovement())
+		{
+			CMC->FallingLateralFriction = Cat->MovementFallingLateralFriction;
+		}
+	}
+}
+
+bool UCatTraversalComponent::TryWallBounce()
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat || !bEnableWallBounce)
+	{
+		return false;
+	}
+	if (WallBounceCooldownTimer > 0.0f || IsMantling() || Cat->IsGrabbing())
+	{
+		return false;
+	}
+	const UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
+	if (!CMC || !CMC->IsFalling())
+	{
+		return false;   // grounded presses are ordinary jumps
+	}
+
+	FVector WallNormal;
+	if (IsWallAttached())
+	{
+		// Clinging: kick off the face we are HOLDING, not whatever the radial probe
+		// finds. In a chimney both walls are usually in reach, so re-probing here could
+		// kick off the wrong one — and the whole point of the cling is that the player
+		// chooses the moment, having already chosen the wall.
+		WallNormal = AttachNormal;
+		EndWallAttach(EWallAttachEnd::Kick);
+	}
+	else
+	{
+		FVector WallPoint;
+		bool bAnyHit = false;
+		if (!ProbeWalls(WallBounceReach, /*NumDirections=*/4, WallPoint, WallNormal, bAnyHit))
+		{
+			return false;
+		}
+	}
+
+	DoWallBounce(WallNormal);
+	if (!Cat->HasAuthority())
+	{
+		Cat->Server_WallBounce(WallNormal);
+	}
+	return true;
+}
+
+void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat)
+	{
+		return;
+	}
+
+	FVector Lateral = WallNormal;
+	Lateral.Z = 0.0f;
+	if (!Lateral.Normalize())
+	{
+		return;
+	}
+
+	const FVector Launch = Lateral * WallBounceLateralSpeed
+		+ FVector::UpVector * WallBounceVerticalSpeed;
+
+	// Override both planes: a bounce should feel decisive, not additive to whatever
+	// the fall had accumulated (an additive kick off a fast fall barely registers).
+	Cat->LaunchCharacter(Launch, /*bXYOverride=*/true, /*bZOverride=*/true);
+
+	if (bWallBounceReorientBody)
+	{
+		Cat->SetActorRotation(FRotator(0.0f, Lateral.Rotation().Yaw, 0.0f));
+	}
+
+	// Re-enter the Launch phase so the jump SM plays the launch pose again — the Fall
+	// case has no "started rising" edge of its own, so without this the cat would sail
+	// back up still in the fall pose. JumpAirTime resets because JumpRiseProgress scrubs
+	// the launch clip by it; a bounce late in a long fall would otherwise start the clip
+	// already finished. bLeftGroundByJumping stays true — a bounce is not a ledge-walk,
+	// so it must not hand back coyote time.
+	Cat->JumpAirTime = 0.0f;
+	Cat->SetJumpPhase(ECatJumpPhase::Launch);
+
+	// SNAP the gravity interpolator to the rising value (2026-07-24). UpdateJumpGravity
+	// already does this on ground phases "so the next airborne jump starts from the
+	// correct baseline, not a stale fall value" — a wall bounce is a mid-air relaunch,
+	// the one case that comment never had to cover. Without the snap the interpolator is
+	// still near GravityScaleFalling 5.5 and takes ~0.1 s to ramp down, so the first
+	// third of every kick's rise is fought by 2-3x the intended gravity: PawPrint
+	// measured apex at +0.22 s instead of the +0.32 s a 620 launch should give, cutting
+	// peak height ~98 -> ~60 cm. In a chimney that made each cycle net roughly zero —
+	// the "fighting the mechanic to keep the cat going up" read (Sean, 2026-07-24).
+	Cat->GravityScaleInterp = Cat->GravityScaleRising;
+	if (UCharacterMovementComponent* CMC = Cat->GetCharacterMovement())
+	{
+		CMC->GravityScale = Cat->GravityScaleRising;
+
+		// Rebound window: drop lateral air friction so the kick actually carries.
+		if (WallBounceReboundTime > 0.0f)
+		{
+			CMC->FallingLateralFriction = WallBounceReboundLateralFriction;
+		}
+	}
+	WallBounceReboundTimer = WallBounceReboundTime;
+	WallBounceReboundDir   = Lateral;
+
+	WallBounceCooldownTimer = WallBounceCooldown;
+
+	// Per-bounce spec line (the stop/start/mantle log doctrine) — these numbers are the
+	// authoring spec for the real plant-and-spring clip in the traversal batch.
+	UE_LOG(LogCatVentures, Log,
+		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up"),
+		*Cat->GetName(), Lateral.X, Lateral.Y, WallBounceLateralSpeed, WallBounceVerticalSpeed);
 }
 
 void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& InTarget)

@@ -91,7 +91,7 @@ ACatBase::ACatBase()
 		CMC->GravityScale                = GravityScaleRising;
 		CMC->JumpZVelocity               = JumpLaunchVelocity;
 		CMC->AirControl                  = JumpAirControl;
-		CMC->FallingLateralFriction      = 3.0f;
+		CMC->FallingLateralFriction      = MovementFallingLateralFriction;
 	}
 
 	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
@@ -149,6 +149,7 @@ void ACatBase::BeginPlay()
 		CMC->JumpZVelocity  = JumpLaunchVelocity;
 		CMC->AirControl     = JumpAirControl;
 		CMC->GravityScale   = GravityScaleRising;
+		CMC->FallingLateralFriction = MovementFallingLateralFriction;
 	}
 	GravityScaleInterp = GravityScaleRising;
 	JumpMaxHoldTime = JumpMaxHoldTimeTuning;
@@ -404,8 +405,11 @@ void ACatBase::Move(const FInputActionValue& Value)
 		}
 
 		// During a traversal takeover the component owns the capsule; CMC input
-		// would fight the curve (Flying mode + AddMovementInput = drift).
-		if (Traversal && Traversal->IsMantling())
+		// would fight the curve (Flying mode + AddMovementInput = drift). The wall
+		// attach zeroes horizontal velocity every frame anyway, but suppressing here
+		// stops air control fighting it — and the direction cache above stays live,
+		// which is exactly what DriveWallAttach reads for its steer-away release.
+		if (Traversal && (Traversal->IsMantling() || Traversal->IsWallAttached()))
 		{
 			return;
 		}
@@ -426,8 +430,25 @@ void ACatBase::Move(const FInputActionValue& Value)
 			InputScale = FMath::Min(InputScale, 1.0f - (InputRampTimer / StartInputRampTime));
 		}
 
-		AddMovementInput(ForwardDirection, MoveInput.Y * InputScale);
-		AddMovementInput(RightDirection,   MoveInput.X * InputScale);
+		// Wall-bounce rebound window: reaching a wall REQUIRES holding input into it, and
+		// that same held input then accelerates the cat straight back at the wall it just
+		// kicked off — measured at ~-70 cm/s over the first 0.2 s, against a rebound that
+		// is itself decaying. Cancel only the INTO-THE-WALL component for the window, so
+		// steering along the wall or away from it still works (a blanket input lock would
+		// fix the rebound by removing the air control Sean is asking for more of).
+		FVector AppliedInput = WorldInput * InputScale;
+		if (Traversal && Traversal->IsRebounding())
+		{
+			const FVector Away = Traversal->GetReboundDirection();
+			const float IntoWall = FVector::DotProduct(AppliedInput, -Away);
+			if (IntoWall > 0.0f)
+			{
+				AppliedInput += Away * IntoWall;
+			}
+		}
+		// Single accumulate — APawn::AddMovementInput sums Direction*Scale into
+		// ControlInputVector, so this is identical to the two per-axis calls it replaces.
+		AddMovementInput(AppliedInput, 1.0f);
 	}
 }
 
@@ -1144,6 +1165,36 @@ void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FV
 	}
 }
 
+void ACatBase::Server_WallBounce_Implementation(FVector_NetQuantizeNormal WallNormal)
+{
+	if (Traversal)
+	{
+		Traversal->DoWallBounce(WallNormal);
+	}
+}
+
+void ACatBase::Server_SetWallAttach_Implementation(bool bActive, FVector_NetQuantizeNormal WallNormal,
+                                                   float RiseSpeed, float RiseTime)
+{
+	if (!Traversal)
+	{
+		return;
+	}
+	if (bActive)
+	{
+		Traversal->StartWallAttach(WallNormal, RiseSpeed, RiseTime);
+	}
+	else
+	{
+		Traversal->EndWallAttach(EWallAttachEnd::Remote);
+	}
+}
+
+void ACatBase::SetWallAttachAnimState(bool bActive)
+{
+	bGoWallAttach = bActive;
+}
+
 void ACatBase::SetMantleAnimState(bool bActive, float Progress)
 {
 	bGoMantle      = bActive;
@@ -1723,6 +1774,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, StartProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoMantle, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, MantleProgress, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoWallAttach, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -2815,6 +2867,15 @@ void ACatBase::OnJumpInputPressed()
 	// right now (airborne beyond the coyote window), the buffer lets Landed() re-fire it.
 	JumpBufferTimer = JumpBufferTime;
 
+	// A jump press while airborne next to a wall is a WALL BOUNCE, not a dead input.
+	// Checked before the coyote/anticipation paths: airborne-and-at-a-wall is
+	// unambiguous, and the bounce consumes the buffer so it can't also queue a jump.
+	if (Traversal && Traversal->TryWallBounce())
+	{
+		JumpBufferTimer = 0.0f;
+		return;
+	}
+
 	// Standstill anticipation (2026-07-06, Sean: "all 4 legs/body coil downward and then
 	// the up happens"): a grounded, near-stationary jump plays the authored crouch for
 	// JumpAnticipationDuration before the physics launch. Running jumps stay instant —
@@ -2978,9 +3039,19 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 	// (covers taps eaten by a same-frame release, land-recovery, and cooldown). OnJumped
 	// clears the buffer on success, so exactly one jump fires per press. Held off while
 	// the anticipation coil is playing.
-	if (JumpBufferTimer > 0.0f && JumpAnticipationTimer <= 0.0f && IsLocallyControlled() && CanJump())
+	if (JumpBufferTimer > 0.0f && JumpAnticipationTimer <= 0.0f && IsLocallyControlled())
 	{
-		Jump();
+		// Wall bounce gets the same buffer grace as a landing: a press made just before
+		// the cat reaches the wall still kicks. Tried first — CanJump() is false while
+		// airborne, so the bounce would otherwise never see a buffered press.
+		if (Traversal && Traversal->TryWallBounce())
+		{
+			JumpBufferTimer = 0.0f;
+		}
+		else if (CanJump())
+		{
+			Jump();
+		}
 	}
 
 	// ── Air time accumulation ────────────────────────────────────────

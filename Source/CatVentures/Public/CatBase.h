@@ -185,6 +185,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "60.0", ClampMax = "1080.0"))
 	float MovementRotationRateYaw = 360.0f;
 
+	/** Lateral (horizontal) friction applied while airborne. UE's default is 0; this ships 3.0,
+	 *  which decays horizontal air speed with a ~0.33 s time constant. Was a bare constructor
+	 *  write until 2026-07-24 — exposed (and added to the BeginPlay re-apply list) when the
+	 *  wall bounce showed it eating two thirds of the kick inside 0.2 s. The wall bounce
+	 *  temporarily overrides it during its rebound window; this is the value restored after. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning", meta = (ClampMin = "0.0", ClampMax = "8.0"))
+	float MovementFallingLateralFriction = 3.0f;
+
 	// ── Sprint Gait (M1, weighty-movement pass) ────────────────────────
 	// W alone = trot at MovementMaxWalkSpeed; W+Shift = sprint. The weight comes
 	// from differentiation: the sprint turns wider and reads as a distinct gait.
@@ -968,6 +976,24 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_StartMantle(FVector_NetQuantize InStart, FVector_NetQuantize InTarget);
 
+	/** Client → Server: mirror a wall bounce. The WALL NORMAL is what crosses the wire,
+	 *  not the resulting velocity, so both machines derive the launch from the same
+	 *  tuning knobs (the pivot-braking mirror pattern). Reliable — a dropped bounce
+	 *  would desync the arc for the whole airborne span. */
+	UFUNCTION(Server, Reliable)
+	void Server_WallBounce(FVector_NetQuantizeNormal WallNormal);
+
+	/** Client → Server: mirror both edges of a wall attach (cling or scramble). The server
+	 *  runs the same deterministic vertical profile from the same entry parameters, so no
+	 *  progress streaming is needed — the mantle model. Reliable: a dropped enter would
+	 *  leave the server falling while the owner hangs, and a dropped exit would strand it. */
+	UFUNCTION(Server, Reliable)
+	void Server_SetWallAttach(bool bActive, FVector_NetQuantizeNormal WallNormal,
+	                          float RiseSpeed, float RiseTime);
+
+	/** Written by the traversal component on owner and server; replicated to proxies. */
+	void SetWallAttachAnimState(bool bActive);
+
 	/** Written by the traversal component on owner and server; replicated to proxies. */
 	void SetMantleAnimState(bool bActive, float Progress);
 
@@ -1185,6 +1211,12 @@ protected:
 	/** 0→1 mantle completion along the takeover curve. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float MantleProgress = 0.0f;
+
+	/** True while the traversal component holds the cat against a wall (cling or scramble).
+	 *  Owner + server both write it from their own attach drive; proxies read the replicated
+	 *  value. No ABP consumer yet — the wall-hug clip is traversal-batch work. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoWallAttach = false;
 
 	/** True while a sprint start (coil + burst) drives the Start state — the ABP plays the
 	 *  start-step clip scrubbed by StartProgress. Rides Server_SetStartStep on the edges. */
