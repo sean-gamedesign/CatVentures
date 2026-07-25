@@ -81,7 +81,8 @@ void UCatTraversalComponent::NoteReject(ETraversalReject R)
 // wall-like hit; bOutAnyHit distinguishes "nothing there" from "hit something flat",
 // which is the difference between two very different reject reasons.
 bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
-	FVector& OutPoint, FVector& OutNormal, bool& bOutAnyHit, const FVector& BasisDir) const
+	FVector& OutPoint, FVector& OutNormal, bool& bOutAnyHit, const FVector& BasisDir,
+	FHitResult* OutHit) const
 {
 	bOutAnyHit = false;
 	const ACatBase* Cat = GetCat();
@@ -123,6 +124,10 @@ bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
 			OutPoint   = Hit.ImpactPoint;
 			OutNormal  = Hit.ImpactNormal;
 			bFound     = true;
+			if (OutHit)
+			{
+				*OutHit = Hit;   // the scramble needs the actor/component for its surface gate
+			}
 		}
 	}
 	return bFound;
@@ -156,6 +161,18 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	}
 
 	WallAttachCooldownTimer = FMath::Max(WallAttachCooldownTimer - DeltaTime, 0.0f);
+
+	// Landing clears a spent wall: the timeout only has to survive the fall it caused.
+	if (!SpentWallNormal.IsZero())
+	{
+		const ACatBase* GroundCheckCat = GetCat();
+		const UCharacterMovementComponent* GroundCheckCMC =
+			GroundCheckCat ? GroundCheckCat->GetCharacterMovement() : nullptr;
+		if (GroundCheckCMC && GroundCheckCMC->IsMovingOnGround())
+		{
+			SpentWallNormal = FVector::ZeroVector;
+		}
+	}
 
 	if (TraversalState == ECatTraversalState::Mantle)
 	{
@@ -193,9 +210,11 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	ACatBase* Cat = GetCat();
 	if (Cat && Cat->IsLocallyControlled())
 	{
+		// Precedence, highest first. A reachable ledge beats climbing the wall under it;
+		// a climbable wall run at speed beats merely hanging on it. Each starts a
+		// traversal state, which gates the ones below (they check TraversalState).
 		TryDetectMantle();
-		// After the mantle probe: a reachable ledge always outranks sticking to the
-		// wall below it (TryDetectMantle leaves TraversalState set, which gates this).
+		TryDetectScramble();
 		TryWallCling();
 	}
 }
@@ -352,6 +371,133 @@ void UCatTraversalComponent::TryDetectMantle()
 // foot IK all continue to behave, and the state can be entered or dropped on any
 // frame without a CMC apply/restore pair to get wrong.
 
+bool UCatTraversalComponent::IsScrambleSurface(const FHitResult& Hit) const
+{
+	if (const AActor* HitActor = Hit.GetActor())
+	{
+		if (HitActor->ActorHasTag(ScrambleSurfaceTag))
+		{
+			return true;
+		}
+	}
+	if (const UPrimitiveComponent* HitComp = Hit.GetComponent())
+	{
+		if (HitComp->ComponentHasTag(ScrambleSurfaceTag))
+		{
+			return true;
+		}
+	}
+
+	// Volume override: inside a tagged volume every wall climbs, so a shaft can be
+	// blocked out without touching the meshes in it.
+	if (const ACatBase* Cat = GetCat())
+	{
+		TArray<AActor*> Overlapping;
+		Cat->GetOverlappingActors(Overlapping);
+		for (const AActor* A : Overlapping)
+		{
+			if (A && A->ActorHasTag(ScrambleVolumeTag))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void UCatTraversalComponent::TryDetectScramble()
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat || !bEnableWallScramble || TraversalState != ECatTraversalState::None)
+	{
+		return;
+	}
+	if (WallAttachCooldownTimer > 0.0f || Cat->IsGrabbing())
+	{
+		return;
+	}
+	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
+	if (!CMC)
+	{
+		return;
+	}
+
+	// The run-up IS the entry: gate on closing speed, not on the sprint flag, so the
+	// climb height scales continuously with how hard the cat arrived.
+	const FVector HorizVel(CMC->Velocity.X, CMC->Velocity.Y, 0.0f);
+	const float EntrySpeed = HorizVel.Size();
+	if (EntrySpeed < ScrambleMinEntrySpeed)
+	{
+		return;
+	}
+
+	FVector WallPoint, WallNormal;
+	bool bAnyHit = false;
+	FHitResult WallHit;
+	if (!ProbeWalls(ScrambleReach, /*NumDirections=*/1, WallPoint, WallNormal, bAnyHit,
+			HorizVel, &WallHit))
+	{
+		return;
+	}
+	if (FVector::DotProduct(HorizVel, -WallNormal) < ScrambleMinEntrySpeed)
+	{
+		return;   // skimming along the face, not running into it
+	}
+	if (!SpentWallNormal.IsZero()
+		&& FVector::DotProduct(WallNormal, SpentWallNormal) > 0.9f)
+	{
+		return;   // this face just timed out; leave it before climbing it again
+	}
+	if (!IsScrambleSurface(WallHit))
+	{
+		return;   // not every wall is climbable — level authoring decides
+	}
+
+	// Tall enough to be worth climbing. A low block is a mantle, and the mantle
+	// detector already had first refusal this tick.
+	{
+		// Start OUTSIDE the face and trace inward. Starting inside the geometry returns
+		// a start-penetrating hit with a garbage normal — the same trap that railed the
+		// foot IK at wall contact (2026-07-21).
+		FCollisionQueryParams Params(FName(TEXT("CatScrambleHeight")), false, Cat);
+		const FVector HighStart = WallPoint + WallNormal * 20.0f
+			+ FVector(0, 0, ScrambleMinWallHeight);
+		FHitResult HighHit;
+		if (!GetWorld()->LineTraceSingleByChannel(HighHit, HighStart,
+				HighStart - WallNormal * 40.0f, ECC_Visibility, Params)
+			|| HighHit.bStartPenetrating || HighHit.ImpactNormal.Z >= 0.5f)
+		{
+			return;
+		}
+	}
+
+	// Rise budget from entry speed — a harder run-up climbs higher. Height gained is
+	// RiseSpeed × RiseTime / 2, since DriveWallAttach decays the budget linearly.
+	const float RiseSpeed = FMath::GetMappedRangeValueClamped(
+		FVector2D(ScrambleMinEntrySpeed, ScrambleEntrySpeedForMaxRise),
+		FVector2D(ScrambleRiseSpeedMin, ScrambleRiseSpeedMax), EntrySpeed);
+
+	// Entering from the ground: hand the capsule to falling physics first, or the
+	// attach's own grounded exit would fire on its very first drive tick.
+	if (CMC->IsMovingOnGround())
+	{
+		CMC->SetMovementMode(MOVE_Falling);
+	}
+
+	StartWallAttach(WallNormal, RiseSpeed, ScrambleRiseTime);
+	if (!Cat->HasAuthority())
+	{
+		Cat->Server_SetWallAttach(true, WallNormal, RiseSpeed, ScrambleRiseTime);
+	}
+
+	// Per-scramble spec line: entry speed → climb height is the authoring spec for the
+	// scramble loop clip (traversal batch).
+	UE_LOG(LogCatVentures, Log,
+		TEXT("[%s] Scramble START — entry %.0f cm/s, rise %.0f cm/s over %.2f s (~%.0f uu)"),
+		*Cat->GetName(), EntrySpeed, RiseSpeed, ScrambleRiseTime,
+		RiseSpeed * ScrambleRiseTime * 0.5f);
+}
+
 void UCatTraversalComponent::TryWallCling()
 {
 	ACatBase* Cat = GetCat();
@@ -399,6 +545,14 @@ void UCatTraversalComponent::TryWallCling()
 		return;
 	}
 
+	// A face that just timed out stays spent until the cat leaves it — held input plus
+	// air control would otherwise re-grip it within a couple of frames.
+	if (!SpentWallNormal.IsZero()
+		&& FVector::DotProduct(WallNormal, SpentWallNormal) > 0.9f)
+	{
+		return;
+	}
+
 	StartWallAttach(WallNormal, /*RiseSpeed=*/0.0f, /*RiseTime=*/0.0f);
 	if (!Cat->HasAuthority())
 	{
@@ -426,6 +580,7 @@ void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float Ri
 	AttachElapsed   = 0.0f;
 	AttachRiseSpeed = RiseSpeed;
 	AttachRiseTime  = RiseTime;
+	AttachStartZ    = Cat->GetActorLocation().Z;
 	Cat->SetWallAttachAnimState(true);
 
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach START — normal (%.2f, %.2f)%s"),
@@ -459,7 +614,10 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 		EndWallAttach(EWallAttachEnd::Grounded);
 		return;
 	}
-	if (AttachElapsed > WallClingMaxTime)
+	// The cap budgets the HANGING portion, so it starts after the rise. Charging a
+	// scramble's climb against a cling's budget left only 0.7 s of slide and dumped the
+	// cat mid-wall (2026-07-25). A cling has RiseTime 0, so its 1.4 s is unchanged.
+	if (AttachElapsed > AttachRiseTime + WallClingMaxTime)
 	{
 		EndWallAttach(EWallAttachEnd::Timeout);
 		return;
@@ -509,9 +667,11 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 	if (Cat->PawPrint)
 	{
 		static const FName ChAttach(TEXT("WallAttachPhase"));
+		static const FName ChClimb(TEXT("WallAttachClimb"));
 		const float Phase = (AttachRiseSpeed > 0.0f && AttachElapsed < AttachRiseTime) ? 1.0f
 			: (AttachElapsed < AttachRiseTime + WallClingCatchTime) ? 2.0f : 3.0f;
 		Cat->PawPrint->SampleChannel(ChAttach, Phase);
+		Cat->PawPrint->SampleChannel(ChClimb, Cat->GetActorLocation().Z - AttachStartZ);
 	}
 }
 
@@ -524,14 +684,20 @@ void UCatTraversalComponent::EndWallAttach(EWallAttachEnd Reason)
 	TraversalState = ECatTraversalState::None;
 	WallAttachCooldownTimer = WallAttachCooldown;
 
+	// A timeout means "this face is spent" — remember it so the held input that got the
+	// cat here cannot immediately re-grip it. Cleared on ground / kick / mantle.
+	SpentWallNormal = (Reason == EWallAttachEnd::Timeout) ? AttachNormal : FVector::ZeroVector;
+
 	if (ACatBase* Cat = GetCat())
 	{
 		Cat->SetWallAttachAnimState(false);
 		// Per-attach spec line — hold duration is the authoring spec for the cling clip
 		// (and later the scramble loop's length). The reason makes a cling that let go
 		// on its own distinguishable from one the player kicked out of.
-		UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach END — held %.2f s (%s)"),
-			*Cat->GetName(), AttachElapsed, WallAttachEndToString(Reason));
+		UE_LOG(LogCatVentures, Log,
+			TEXT("[%s] Wall attach END — held %.2f s, climbed %.0f uu (%s)"),
+			*Cat->GetName(), AttachElapsed, Cat->GetActorLocation().Z - AttachStartZ,
+			WallAttachEndToString(Reason));
 		if (!Cat->HasAuthority())
 		{
 			Cat->Server_SetWallAttach(false, FVector::ZeroVector, 0.0f, 0.0f);
@@ -612,6 +778,10 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
 	{
 		return;
 	}
+
+	// Kicking off is a deliberate departure — whatever face was spent is forgiven, which
+	// is what keeps a chimney (alternating normals) working after any timeout.
+	SpentWallNormal = FVector::ZeroVector;
 
 	const FVector Launch = Lateral * WallBounceLateralSpeed
 		+ FVector::UpVector * WallBounceVerticalSpeed;

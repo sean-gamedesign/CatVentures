@@ -254,6 +254,77 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float WallAttachCooldown = 0.12f;
 
+	// ── Vertical Scramble (verb 3) ──────────────────────────────────────
+	// Run at a tall climbable wall fast enough and the cat scrambles UP it: the same
+	// WallAttach state entered with a rise budget instead of a downward slide, so it
+	// inherits every exit for free — jump kicks off, the budget decays into the cling's
+	// slide, and a lip entering band at the top hands off to the mantle (that handoff
+	// is the "detection runs during an attach" path added 2026-07-25).
+	//
+	// Unlike every other traversal verb this one is GATED BY LEVEL AUTHORING (Sean's
+	// call): not every wall is climbable. Two sources, OR'd — a tag on the actor or
+	// component for per-surface precision, and a tagged volume for "everything in this
+	// shaft climbs" without touching meshes. The CLING is deliberately left ungated, so
+	// an ordinary wall still means hang-and-kick and only a marked wall means climb.
+
+	/** Master switch for the vertical scramble. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble")
+	bool bEnableWallScramble = true;
+
+	/** Tag marking a climbable surface. Put it on the ACTOR or on an individual
+	 *  primitive COMPONENT — component tags let one mesh of a multi-part actor climb
+	 *  while the rest do not. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble")
+	FName ScrambleSurfaceTag = FName(TEXT("Scrambleable"));
+
+	/** Tag marking a volume inside which EVERY wall is climbable. Broad override for
+	 *  blocking out a climbable shaft or alley without tagging individual meshes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble")
+	FName ScrambleVolumeTag = FName(TEXT("ScrambleZone"));
+
+	/** Probe reach (uu) for finding a climbable wall. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "20.0", ClampMax = "100.0"))
+	float ScrambleReach = 46.0f;
+
+	/** Closing speed (cm/s) toward the wall required to start a climb. Sits in the
+	 *  sprint band so a walk into a wall just stops — the run-up IS the entry. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "0.0", ClampMax = "800.0"))
+	float ScrambleMinEntrySpeed = 450.0f;
+
+	/** Unbroken wall face (uu) required above the contact point. Stops a run-up at a
+	 *  low block — that is a mantle, and the mantle detector gets first refusal anyway. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "40.0", ClampMax = "400.0"))
+	float ScrambleMinWallHeight = 120.0f;
+
+	/** Initial climb speed (cm/s), mapped from entry speed across the band below and
+	 *  decaying linearly to zero over ScrambleRiseTime — so height gained is
+	 *  RiseSpeed × RiseTime / 2 and a faster run-up climbs higher. Gait
+	 *  differentiation for free, the same trick the weighty stops use. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "100.0", ClampMax = "1500.0"))
+	float ScrambleRiseSpeedMin = 500.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "100.0", ClampMax = "1500.0"))
+	float ScrambleRiseSpeedMax = 775.0f;
+
+	/** Entry speed at which the rise budget reaches ScrambleRiseSpeedMax (sprint top). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "100.0", ClampMax = "1200.0"))
+	float ScrambleEntrySpeedForMaxRise = 650.0f;
+
+	/** Seconds the rise budget takes to decay to zero. Height scales with BOTH this and
+	 *  the speed, so prefer lengthening the climb over speeding it up — a short fast
+	 *  burst reads as a pop, a longer decay reads as clawing up the wall. Note
+	 *  WallClingMaxTime is charged from the END of this, so lengthening the climb does
+	 *  not eat the hang budget.
+	 *
+	 *  Tuning history (all Sean PIE reads, measured not estimated — the achieved climb
+	 *  tracks RiseSpeed × RiseTime / 2 within ~4%, since Vz is rewritten every frame and
+	 *  gravity only gets one frame to bite): 750 over 0.55 s = ~200 uu peak, too low;
+	 *  900 over 0.85 s = ~370 uu peak, too high; ships 775 over 0.75 s = ~290 uu peak.
+	 *  Height was taken out of the DURATION rather than the speed — a slower climb over
+	 *  the same 0.85 s read sluggish, where a shorter one stays punchy. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "0.1", ClampMax = "2.0"))
+	float ScrambleRiseTime = 0.75f;
+
 	/** Begin a wall attach. RiseSpeed/RiseTime are the SCRAMBLE parameters (0/0 = cling):
 	 *  vertical velocity eases RiseSpeed → 0 across RiseTime, then the catch, then the
 	 *  slide. Owner on detection; server via ACatBase::Server_SetWallAttach. */
@@ -291,7 +362,16 @@ private:
 	 *  (2026-07-25: four rays plus a directionless input gate made it fire ~15x too
 	 *  often). Returns the NEAREST wall-like hit. */
 	bool ProbeWalls(float Reach, int32 NumDirections, FVector& OutPoint, FVector& OutNormal,
-	                bool& bOutAnyHit, const FVector& BasisDir = FVector::ZeroVector) const;
+	                bool& bOutAnyHit, const FVector& BasisDir = FVector::ZeroVector,
+	                FHitResult* OutHit = nullptr) const;
+
+	/** Run-at-a-climbable-wall detection; starts a scramble on a hit. Local owner only. */
+	void TryDetectScramble();
+
+	/** Is this surface climbable? Tag on the hit actor OR the hit component, or the cat
+	 *  standing inside a volume tagged ScrambleVolumeTag. Evaluated only after a wall
+	 *  probe has already hit, so the overlap query is rare rather than per-frame. */
+	bool IsScrambleSurface(const FHitResult& Hit) const;
 
 	/** Why the last mantle-detection frame bailed — logged on CHANGE only (a sustained
 	 *  reject would otherwise be a per-frame firehose) and pushed to the PawPrint
@@ -349,4 +429,16 @@ private:
 	float   AttachRiseSpeed = 0.0f;                 // >0 = scramble entry
 	float   AttachRiseTime  = 0.0f;
 	float   WallAttachCooldownTimer = 0.0f;
+
+	/** Normal of the wall a timeout just released, so the same face cannot be re-gripped
+	 *  immediately. Without this the timeout meant nothing: the player is still holding
+	 *  into the wall, air control supplies closing speed, and the cat re-attached ~0.12 s
+	 *  later — the "detaches and then reattaches" hitch. Cleared once the cat is grounded,
+	 *  kicks off, or mantles, so a chimney (alternating normals) is unaffected. */
+	FVector SpentWallNormal = FVector::ZeroVector;
+
+	/** Actor Z at attach start — the climb height actually achieved, which is the number
+	 *  the rise budget must be tuned against (the intended figure is arithmetic, the
+	 *  achieved one is what gravity and the CMC actually delivered). */
+	float   AttachStartZ = 0.0f;
 };
