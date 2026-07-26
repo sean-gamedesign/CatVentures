@@ -218,6 +218,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "300.0"))
 	float WallClingMinApproachSpeed = 20.0f;
 
+	/** dot(input, into-wall) that counts as asking for the wall when there is no closing
+	 *  SPEED to measure — 0.5 is a 60° cone. A wall you are pressed against eats your
+	 *  input, so a standing jump up one produces almost no horizontal velocity (measured
+	 *  9–14 cm/s against a 20 gate) and could never catch. Only honoured while not
+	 *  separating, so it cannot defeat the anti-re-stick guard above. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WallClingPressDot = 0.5f;
+
 	/** The "stick" beat: seconds with vertical velocity pinned to 0 before the slide
 	 *  begins. This is the beat that makes the wall feel grabbed rather than grazed. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -490,6 +498,11 @@ private:
 	void NoteReject(ETraversalReject R);
 
 	ETraversalReject LastReject = ETraversalReject::None;
+
+	/** Height of the last lip the mantle probe measured, above the capsule bottom (uu).
+	 *  The cling reads it to decide whether a rise could ever bring an out-of-band ledge
+	 *  into range, instead of assuming it always will. */
+	float LastLipHeight = 0.0f;
 
 	/** Advance the takeover curve on owner and server alike. */
 	void DriveMantle(float DeltaTime);

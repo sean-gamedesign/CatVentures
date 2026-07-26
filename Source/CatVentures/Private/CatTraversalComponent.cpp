@@ -312,7 +312,10 @@ void UCatTraversalComponent::TryDetectMantle()
 		return;
 	}
 
+	// Remember HOW far out of band, not just that it was: the cling's suppression needs
+	// to know whether a rise could ever close the gap (see WallClingLedgeSuppressSpeed).
 	const float LedgeHeight = LipHit.ImpactPoint.Z - CapsuleBottomZ;
+	LastLipHeight = LedgeHeight;
 	if (LedgeHeight < MantleMinLedgeHeight) { NoteReject(ETraversalReject::LipTooLow);  return; }
 	if (LedgeHeight > MantleMaxLedgeHeight) { NoteReject(ETraversalReject::LipTooHigh); return; }
 
@@ -526,12 +529,28 @@ void UCatTraversalComponent::TryWallCling()
 
 	// Never cancel motion that is closing on the mantle band. TryDetectMantle ran this
 	// same tick, so LastReject is current: a lip reject means a real ledge is there and
-	// only its height disqualified it — and height is what the vertical motion is
-	// fixing, from whichever side. Catching here would pin Vz to 0 and kill it.
+	// only its height disqualified it — and height is what the vertical motion is fixing.
 	const float Vz = CMC->Velocity.Z;
-	const bool bClosingOnBand =
-		   (LastReject == ETraversalReject::LipTooHigh && Vz >  WallClingLedgeSuppressSpeed)
-		|| (LastReject == ETraversalReject::LipTooLow  && Vz < -WallClingLedgeSuppressSpeed);
+	bool bClosingOnBand = false;
+	if (LastReject == ETraversalReject::LipTooHigh && Vz > WallClingLedgeSuppressSpeed)
+	{
+		// ONLY defer if the rise can actually deliver the ledge. The first version
+		// assumed it always would, which is true of a 90 uu ledge and meaningless on a
+		// 400–675 uu wall — and tall walls are exactly the ones worth hanging off. That
+		// unbounded rule suppressed the cling for entire ascents and got nothing back:
+		// measured 2026-07-25, every head-on running jump reported LipTooHigh and never
+		// caught, while a diagonal jump caught fine purely because its reject happened
+		// to be NoInput instead. The cling must not depend on HOW the mantle failed.
+		const float G = FMath::Abs(CMC->GetGravityZ());
+		const float RemainingRise = (G > KINDA_SMALL_NUMBER) ? (Vz * Vz) / (2.0f * G) : 0.0f;
+		bClosingOnBand = (LastLipHeight - MantleMaxLedgeHeight) <= RemainingRise;
+	}
+	else if (LastReject == ETraversalReject::LipTooLow && Vz < -WallClingLedgeSuppressSpeed)
+	{
+		// The falling side needs no bound: a lip below the band is at most
+		// MantleMinLedgeHeight away and a fall closes that in a few frames.
+		bClosingOnBand = true;
+	}
 	if (bClosingOnBand)
 	{
 		return;
@@ -544,12 +563,29 @@ void UCatTraversalComponent::TryWallCling()
 		return;
 	}
 
-	// Must be CLOSING on the wall. This is also the anti-re-stick guard: immediately
-	// after a kick the cat is travelling away from the wall it left, so that wall fails
-	// here by construction and only the wall being approached can catch.
+	// Intent to hold this wall. Closing speed is the primary signal, and it doubles as
+	// the anti-re-stick guard: right after a kick the cat travels AWAY from the wall it
+	// left, so that wall fails by construction and only the wall being approached wins.
+	//
+	// But a wall you are already pressed against EATS your input — the capsule cannot
+	// advance, so there is no closing velocity to measure even though the player is
+	// plainly asking for the wall. A standing jump up a wall measured 9–14 cm/s against
+	// a 20 gate and could never catch (2026-07-25). Same lesson the mantle detector
+	// taught the same day: intent and velocity disagree when something is in the way.
+	// So held input counts too — gated on NOT separating, which is what preserves the
+	// anti-re-stick guard, since a kick leaves at ~420 and fails that outright.
 	FVector HorizVel = CMC->Velocity;
 	HorizVel.Z = 0.0f;
-	if (FVector::DotProduct(HorizVel, -WallNormal) < WallClingMinApproachSpeed)
+	const float ClosingSpeed = FVector::DotProduct(HorizVel, -WallNormal);
+	bool bWantsWall = ClosingSpeed >= WallClingMinApproachSpeed;
+	if (!bWantsWall)
+	{
+		const bool bPressingIn = Cat->PivotInputStaleTime < 0.15f
+			&& FVector::DotProduct(Cat->PivotLiveInputDir, -WallNormal) >= WallClingPressDot;
+		const bool bNotSeparating = ClosingSpeed > -WallClingMinApproachSpeed;
+		bWantsWall = bPressingIn && bNotSeparating;
+	}
+	if (!bWantsWall)
 	{
 		return;
 	}
