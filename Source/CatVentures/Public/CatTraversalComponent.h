@@ -37,6 +37,7 @@ enum class EWallAttachEnd : uint8
 	Aborted,    // lost the pawn/CMC — should not happen in practice
 };
 
+
 /**
  * Traversal component — owns the wall-detection trace library and every traversal
  * verb's movement takeover (growth-watch decision: new large systems live in
@@ -325,6 +326,87 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "0.1", ClampMax = "2.0"))
 	float ScrambleRiseTime = 0.75f;
 
+	// ── Balance assist (verb 4, and deliberately NOT a verb) ────────────
+	// Walking a fence rail or a block-wall top is NOT a mode. It began as one — speed
+	// clamped to a creep, input projected onto the edge, position magnetised to the
+	// centreline — and the telemetry indicted it: 97% of frames pinned within 3 uu of
+	// centre at a mean speed of 96. Sean: "it's not like I'm playing a balancing game,
+	// it's just locking the cat into a forward or backward slow walk." The mode took
+	// away speed, steering and lateral position and gave nothing back.
+	//
+	// What ships instead is an ASSIST with no state at all: detect a narrow surface,
+	// apply a gentle lateral correction, and otherwise leave the cat entirely alone.
+	// Three things fall out of that.
+	//   1. NO REPLICATION SURFACE. The correction derives purely from world geometry and
+	//      the pawn's own position, so owner and server compute it identically — no RPC,
+	//      no mirrored enter/exit edges, none of the "dropped edge strands the server"
+	//      failure mode every other verb had to design around.
+	//   2. IT COMPOSES. Sprinting along a wall, skidding to a stop on one, pivoting on
+	//      one all just work, using systems already tuned. The mode had to suppress all
+	//      four by clamping speed under their entry thresholds — which was also the only
+	//      place a traversal verb contended with the grounded CMC precedence chain.
+	//   3. FALLING OFF IS TEXTURE, not a tax. It costs a climb back up, occasionally.
+	// The assist must stay well under the cat's own lateral authority (~50 uu/s against
+	// a 400 walk) or it is just the rail again with extra steps.
+
+	/** Master switch for the balance assist. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance")
+	bool bEnableBalanceAssist = true;
+
+	/** Half-width (uu) of the lateral scan. MUST clear half of FenceMaxSurfaceWidth by a
+	 *  healthy drift margin: the flank samples have to fall past the surface even when
+	 *  the cat is walking well off the centreline, or a flank lands ON the surface, the
+	 *  "both sides dropping" test fails, and balance mode rejects. Shipped 45 against a
+	 *  60 max width — incoherent, since a 60-wide surface spans ±30 and left only 15 uu
+	 *  of margin; drifting ~23 off a 45-wide rail was enough to break detection
+	 *  (2026-07-25). Keep this at roughly FenceMaxSurfaceWidth × 1.3 or more. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "10.0", ClampMax = "200.0"))
+	float FenceProbeHalfWidth = 80.0f;
+
+	/** Samples across the scan (odd, so one lands on the centre). More samples resolve
+	 *  the supported span and therefore the centreline more precisely — and the scan is
+	 *  wide, so a coarse step would quantise the magnet's target badly. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "3", ClampMax = "21"))
+	int32 FenceProbeSamples = 13;
+
+	/** Widest supported span (uu) that still counts as a balance surface. Above this the
+	 *  cat is just on a wide ledge and walks normally. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "5.0", ClampMax = "150.0"))
+	float FenceMaxSurfaceWidth = 60.0f;
+
+	/** How far the ground must fall away past the edge (uu) to count as a drop rather
+	 *  than a step down. Stops a kerb or a low step reading as a fence. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "20.0", ClampMax = "400.0"))
+	float FenceMinDropDepth = 60.0f;
+
+	/** Centreline pull: lateral correction speed per uu of offset (1/s), capped by
+	 *  FenceAssistMaxSpeed. Deliberately far under the cat's own lateral authority so
+	 *  steering off a fence always wins — this catches drift, it does not hold a line. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "0.0", ClampMax = "20.0"))
+	float FenceAssistStrength = 4.0f;
+
+	/** Hard cap (uu/s) on the correction. Against a 400 walk this is the difference
+	 *  between an assist and a rail; the first build capped at 60 and pinned the cat
+	 *  within 3 uu of centre 97% of the time. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "0.0", ClampMax = "300.0"))
+	float FenceAssistMaxSpeed = 50.0f;
+
+	/** How quickly lateral velocity blends toward the correction. Blended rather than
+	 *  set, so the cat's own sideways motion is never simply erased. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "0.5", ClampMax = "30.0"))
+	float FenceAssistBlendRate = 6.0f;
+
+	/** Scale the assist by how narrow the surface is: full strength on a rail, fading to
+	 *  nothing as the span approaches FenceMaxSurfaceWidth. A wall top wide enough to
+	 *  stand on comfortably should not feel assisted at all. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance")
+	bool bScaleAssistByNarrowness = true;
+
+	/** Radius (uu) of the ring of support samples that derives the surface axis. Wants
+	 *  to sit outside the capsule but well inside the shortest fence worth walking. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Balance", meta = (ClampMin = "10.0", ClampMax = "120.0"))
+	float FenceAxisProbeRadius = 30.0f;
+
 	/** Begin a wall attach. RiseSpeed/RiseTime are the SCRAMBLE parameters (0/0 = cling):
 	 *  vertical velocity eases RiseSpeed → 0 across RiseTime, then the catch, then the
 	 *  slide. Owner on detection; server via ACatBase::Server_SetWallAttach. */
@@ -367,6 +449,25 @@ private:
 
 	/** Run-at-a-climbable-wall detection; starts a scramble on a hit. Local owner only. */
 	void TryDetectScramble();
+
+	/** One downward support sample: is there floor at Probe within FenceMinDropDepth of
+	 *  FloorZ, or has the ground fallen away? */
+	bool IsSupportedAt(const FVector& Probe, float FloorZ) const;
+
+	/** Derives the surface's long axis from a ring of support samples in WORLD
+	 *  directions — deliberately independent of the cat's own rotation. Probing across
+	 *  the actor's right vector instead produced a 1-2 frame enter/exit oscillation,
+	 *  because balance mode rotates the cat and so moved its own probe. */
+	bool FindBalanceAxis(FVector& OutAxis) const;
+
+	/** Scans across the given axis's perpendicular for a narrow supported span. Returns
+	 *  the centre offset (signed, along that perpendicular) and the measured span. */
+	bool ProbeBalanceSurface(const FVector& Axis, float& OutCentreOffset, float& OutSpan) const;
+
+	/** Stateless per-tick balance help on a narrow surface. Owner AND server run it —
+	 *  identical inputs (world geometry + the pawn's position) give identical results,
+	 *  which is why this needs no RPC and cannot desync. */
+	void UpdateBalanceAssist(float DeltaTime);
 
 	/** Is this surface climbable? Tag on the hit actor OR the hit component, or the cat
 	 *  standing inside a volume tagged ScrambleVolumeTag. Evaluated only after a wall

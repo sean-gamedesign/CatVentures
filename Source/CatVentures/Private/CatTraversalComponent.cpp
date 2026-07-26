@@ -217,6 +217,15 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 		TryDetectScramble();
 		TryWallCling();
 	}
+
+	// The balance assist is NOT a verb: no state, no takeover, no replication. It runs
+	// on the owner AND the server because both can derive the identical correction from
+	// world geometry and the pawn's own position — so unlike every verb above it needs
+	// no RPC to stay in agreement, and a dropped packet cannot desync it.
+	if (Cat && (Cat->IsLocallyControlled() || Cat->HasAuthority()))
+	{
+		UpdateBalanceAssist(DeltaTime);
+	}
 }
 
 void UCatTraversalComponent::TryDetectMantle()
@@ -835,6 +844,233 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
 		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up"),
 		*Cat->GetName(), Lateral.X, Lateral.Y, WallBounceLateralSpeed, WallBounceVerticalSpeed);
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Fence Trot (verb 4) ───────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Detection is IMPLICIT and geometric: scan across the cat's right vector and
+// look for a narrow band of support with the ground falling away on both
+// sides. No tags, no volumes — a fence announces itself by being a fence,
+// which is the opposite of the scramble's authored gate (a climbable wall
+// looks exactly like an unclimbable one).
+//
+// Probing across FACING means detection only fires when the cat is already
+// roughly aligned with the surface, which is the behaviour we want: crossing
+// a wall perpendicular should not drop you into balance mode. It also gives
+// the edge axis for free — it IS the facing, once both flanks read as drops.
+
+bool UCatTraversalComponent::IsSupportedAt(const FVector& Probe, float FloorZ) const
+{
+	const ACatBase* Cat = GetCat();
+	if (!Cat || !GetWorld())
+	{
+		return false;
+	}
+	FCollisionQueryParams Params(FName(TEXT("CatFenceSupport")), false, Cat);
+	FHitResult Hit;
+	const bool bHit = GetWorld()->LineTraceSingleByChannel(Hit, Probe,
+		Probe - FVector(0, 0, FenceMinDropDepth + 10.0f), ECC_Visibility, Params);
+	return bHit && (FloorZ - Hit.ImpactPoint.Z) < FenceMinDropDepth;
+}
+
+bool UCatTraversalComponent::FindBalanceAxis(FVector& OutAxis) const
+{
+	const ACatBase* Cat = GetCat();
+	const UCapsuleComponent* Capsule = Cat ? Cat->GetCapsuleComponent() : nullptr;
+	if (!Cat || !Capsule)
+	{
+		return false;
+	}
+
+	// Ring of support samples in WORLD directions. Deriving the axis from geometry
+	// rather than from the cat is the whole point: the first build probed across the
+	// actor's right vector, but entering balance mode rotates the cat (projected input
+	// + a lower yaw rate), which rotated the probe, which failed, which exited, which
+	// turned the cat back — a 1-2 frame enter/exit oscillation (2026-07-25, 120 events
+	// in one session). A detector must never depend on a quantity its own mode changes.
+	const FVector Centre = Cat->GetActorLocation();
+	const float FloorZ = Centre.Z - Capsule->GetScaledCapsuleHalfHeight();
+
+	constexpr int32 Ring = 12;                 // 30° granularity, refined by the mean below
+	double SumX = 0.0, SumY = 0.0;
+	int32 SupportedCount = 0;
+	for (int32 i = 0; i < Ring; ++i)
+	{
+		const float Angle = (2.0f * PI * i) / Ring;
+		const FVector Dir(FMath::Cos(Angle), FMath::Sin(Angle), 0.0f);
+		if (IsSupportedAt(Centre + Dir * FenceAxisProbeRadius, FloorZ))
+		{
+			// Doubled-angle mean: the surface direction is a LINE, not a vector, so
+			// opposite samples must reinforce rather than cancel.
+			SumX += FMath::Cos(2.0f * Angle);
+			SumY += FMath::Sin(2.0f * Angle);
+			++SupportedCount;
+		}
+	}
+
+	// All round = open ground. None = not standing on anything we can read.
+	if (SupportedCount == 0 || SupportedCount >= Ring - 1)
+	{
+		return false;
+	}
+
+	const float AxisAngle = FMath::Atan2(static_cast<float>(SumY), static_cast<float>(SumX)) * 0.5f;
+	OutAxis = FVector(FMath::Cos(AxisAngle), FMath::Sin(AxisAngle), 0.0f);
+	return !OutAxis.IsNearlyZero();
+}
+
+bool UCatTraversalComponent::ProbeBalanceSurface(const FVector& Axis,
+	float& OutCentreOffset, float& OutSpan) const
+{
+	const ACatBase* Cat = GetCat();
+	const UCapsuleComponent* Capsule = Cat ? Cat->GetCapsuleComponent() : nullptr;
+	if (!Cat || !Capsule || !GetWorld())
+	{
+		return false;
+	}
+
+	const FVector Centre = Cat->GetActorLocation();
+	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+
+	// Across the SURFACE's perpendicular, not the cat's — same decoupling as above.
+	FVector Right = FVector::CrossProduct(FVector::UpVector, Axis);
+	Right.Z = 0.0f;
+	if (!Right.Normalize())
+	{
+		return false;
+	}
+
+	const int32 Samples = FMath::Max(FenceProbeSamples, 3);
+
+	// Sample support across the width. "Supported" means floor at roughly the height
+	// the cat is standing at — a deeper hit is the ground far below, i.e. a drop.
+	const float FloorZ = Centre.Z - HalfHeight;
+	TArray<bool, TInlineAllocator<16>> Supported;
+	Supported.SetNum(Samples);
+	for (int32 i = 0; i < Samples; ++i)
+	{
+		const float Alpha  = (Samples == 1) ? 0.5f : static_cast<float>(i) / (Samples - 1);
+		const float Offset = FMath::Lerp(-FenceProbeHalfWidth, FenceProbeHalfWidth, Alpha);
+		Supported[i] = IsSupportedAt(Centre + Right * Offset, FloorZ);
+	}
+
+	// Both flanks must be dropping, or this is a wide ledge / open ground.
+	if (Supported[0] || Supported[Samples - 1])
+	{
+		return false;
+	}
+
+	// The supported run through the middle is the surface. Walk out from the centre so
+	// a second surface elsewhere in the scan (a neighbouring rail) cannot widen it.
+	const int32 Mid = Samples / 2;
+	if (!Supported[Mid])
+	{
+		return false;   // not actually standing on it
+	}
+	int32 Lo = Mid, Hi = Mid;
+	while (Lo > 0 && Supported[Lo - 1])            { --Lo; }
+	while (Hi < Samples - 1 && Supported[Hi + 1])  { ++Hi; }
+
+	const float Step = (2.0f * FenceProbeHalfWidth) / (Samples - 1);
+
+	// Sample indices give the edges only to within one Step, so the centre offset lands
+	// on a Step/2 grid — 6.67 uu with the shipped scan. That quantum is a DEAD ZONE: any
+	// true offset under half of it reports exactly 0 and the assist does nothing at all,
+	// then jumps a whole step. Measured 2026-07-25: 45% of frames reported 0 offset and
+	// 50% reported 6.67, with literally nothing in between, which reads as an assist that
+	// stutters rather than one that is too weak. Bisect the real edges instead — the
+	// transition is bracketed by a known supported/unsupported pair, so a few extra
+	// traces per side buy sub-uu resolution for a continuous correction.
+	auto RefineEdge = [&](int32 SupportedIdx, int32 OutsideIdx) -> float
+	{
+		float In  = -FenceProbeHalfWidth + SupportedIdx * Step;   // known ON the surface
+		float Out = -FenceProbeHalfWidth + OutsideIdx  * Step;    // known past the edge
+		for (int32 It = 0; It < 4; ++It)                          // Step/16 ≈ 0.8 uu
+		{
+			const float Mid = (In + Out) * 0.5f;
+			(IsSupportedAt(Centre + Right * Mid, FloorZ) ? In : Out) = Mid;
+		}
+		return (In + Out) * 0.5f;
+	};
+
+	// Lo/Hi never sit at the scan ends — a supported flank was rejected above — so the
+	// outside neighbours always exist.
+	const float LoEdge = RefineEdge(Lo, Lo - 1);
+	const float HiEdge = RefineEdge(Hi, Hi + 1);
+
+	OutSpan = HiEdge - LoEdge;
+	if (OutSpan > FenceMaxSurfaceWidth)
+	{
+		return false;
+	}
+	OutCentreOffset = (LoEdge + HiEdge) * 0.5f;
+	return true;
+}
+
+void UCatTraversalComponent::UpdateBalanceAssist(float DeltaTime)
+{
+	ACatBase* Cat = GetCat();
+	UCharacterMovementComponent* CMC = Cat ? Cat->GetCharacterMovement() : nullptr;
+	if (!Cat || !CMC || !bEnableBalanceAssist)
+	{
+		return;
+	}
+	// Grounded, and not inside another verb's takeover. No state of its own beyond that.
+	if (!CMC->IsMovingOnGround() || TraversalState != ECatTraversalState::None
+		|| Cat->IsGrabbing())
+	{
+		return;
+	}
+
+	FVector Axis;
+	if (!FindBalanceAxis(Axis))
+	{
+		return;
+	}
+	float CentreOffset = 0.0f, Span = 0.0f;
+	if (!ProbeBalanceSurface(Axis, CentreOffset, Span))
+	{
+		return;
+	}
+
+	FVector Right = FVector::CrossProduct(FVector::UpVector, Axis);
+	Right.Z = 0.0f;
+	if (!Right.Normalize())
+	{
+		return;
+	}
+
+	// Narrower surfaces get more help; a wall top wide enough to stand on comfortably
+	// should not feel assisted at all.
+	float Scale = 1.0f;
+	if (bScaleAssistByNarrowness && FenceMaxSurfaceWidth > KINDA_SMALL_NUMBER)
+	{
+		Scale = 1.0f - FMath::Clamp(Span / FenceMaxSurfaceWidth, 0.0f, 1.0f);
+	}
+
+	// +CentreOffset: the probe reports where the surface centre lies relative to the CAT
+	// along Right, so closing the gap means moving toward it. (The mode shipped with this
+	// inverted and shoved the cat off the rail it was meant to be holding.)
+	const float Target = FMath::Clamp(CentreOffset * FenceAssistStrength,
+		-FenceAssistMaxSpeed, FenceAssistMaxSpeed) * Scale;
+
+	// Blend the lateral component toward the target rather than setting it: the cat's own
+	// sideways motion must never be erased, or this is a rail again. The cap sits far
+	// under the cat's own lateral authority so deliberate steering always wins.
+	const float Lateral = FVector::DotProduct(CMC->Velocity, Right);
+	const float NewLateral = FMath::FInterpTo(Lateral, Target, DeltaTime, FenceAssistBlendRate);
+	CMC->Velocity += Right * (NewLateral - Lateral);
+
+	if (Cat->PawPrint)
+	{
+		static const FName ChOffset(TEXT("FenceOffset"));
+		static const FName ChSpan(TEXT("FenceSpan"));
+		Cat->PawPrint->SampleChannel(ChOffset, CentreOffset);
+		Cat->PawPrint->SampleChannel(ChSpan, Span);
+	}
+}
+
 
 void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& InTarget)
 {
