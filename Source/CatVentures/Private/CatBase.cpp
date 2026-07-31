@@ -131,6 +131,7 @@ void ACatBase::BeginPlay()
 	if (const USkeletalMeshComponent* MeshComp = GetMesh())
 	{
 		MeshCushionBaseZ = MeshComp->GetRelativeLocation().Z;
+		MeshBaseRelLocX  = MeshComp->GetRelativeLocation().X;  // wall-hug slides forward from this
 		MeshBaseRelRot   = MeshComp->GetRelativeRotation();   // the −90° rig yaw; slope pitch composes onto it
 	}
 
@@ -282,6 +283,22 @@ void ACatBase::Tick(float DeltaTime)
 		UpdateFootIK(DeltaTime);
 	}
 
+	// ── Post-mantle anim-hold failsafe ─────────────────────────────────
+	// Landed() is the normal clear; this covers a completed mantle whose landing never
+	// comes (slid off the lip) — after the window the SM falls back through Mantle →
+	// Jump_Fall, which is the correct pose for that outcome anyway. Only ever armed on
+	// the machines that drive the mantle (owner + server); proxies read the replicas.
+	if (MantleAnimHoldTimer > 0.0f)
+	{
+		MantleAnimHoldTimer -= DeltaTime;
+		if (MantleAnimHoldTimer <= 0.0f && bGoMantle)
+		{
+			// Freeze the scrub where it is (1.0) — the Mantle state's blend-out still
+			// evaluates the clip, and a reset-to-0 snaps the pose back to the hang.
+			SetMantleAnimState(false, MantleProgress);
+		}
+	}
+
 	// ── PawPrint telemetry — the locally controlled cat's channel set ──
 	// Every pose-driving scalar the diagnostic sessions kept hand-sampling.
 	if (PawPrint && IsLocallyControlled() && GetNetMode() != NM_DedicatedServer)
@@ -314,6 +331,40 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChStartProgress, bGoStartStep ? StartProgress : 0.0f);
 		static const FName ChMantleProgress(TEXT("MantleProgress"));
 		PawPrint->SampleChannel(ChMantleProgress, bGoMantle ? MantleProgress : 0.0f);
+		static const FName ChWallHug(TEXT("WallHugSlide")), ChAnimJumpPhase(TEXT("AnimJumpPhase"));
+		PawPrint->SampleChannel(ChWallHug, WallHugForward);
+		PawPrint->SampleChannel(ChAnimJumpPhase, static_cast<float>(AnimJumpPhase));
+
+		// Live paw-contact gap while mantling: min distance from any paw to the nearest
+		// surface (short down + forward traces per paw). This is the number Sean's eye
+		// measures when he says "paws aren't connected" — the offline contact sweep can
+		// only check the canonical composition, not a specific in-game mantle (2026-07-31).
+		if (bGoMantle)
+		{
+			static const FName ChMantlePawGap(TEXT("MantlePawGapMin"));
+			static const FName PawBones[4] = { FName(TEXT("Hand_L")), FName(TEXT("Hand_R")),
+			                                   FName(TEXT("Foot_L")), FName(TEXT("Foot_R")) };
+			float MinGap = 50.0f;
+			if (const USkeletalMeshComponent* MeshComp = GetMesh())
+			{
+				FCollisionQueryParams GapParams(FName(TEXT("CatMantlePawGap")), false, this);
+				const FVector Fwd = GetActorForwardVector();
+				for (const FName& Bone : PawBones)
+				{
+					const FVector P = MeshComp->GetBoneLocation(Bone);
+					FHitResult GapHit;
+					if (GetWorld()->LineTraceSingleByChannel(GapHit, P, P - FVector(0, 0, 25.0f), ECC_Visibility, GapParams))
+					{
+						MinGap = FMath::Min(MinGap, GapHit.Distance);
+					}
+					if (GetWorld()->LineTraceSingleByChannel(GapHit, P, P + Fwd * 25.0f, ECC_Visibility, GapParams))
+					{
+						MinGap = FMath::Min(MinGap, GapHit.Distance);
+					}
+				}
+			}
+			PawPrint->SampleChannel(ChMantlePawGap, MinGap);
+		}
 	}
 
 	// ── Camera weight (M3) + pitch clamping (local player only) ────────
@@ -1203,6 +1254,13 @@ void ACatBase::SetMantleAnimState(bool bActive, float Progress)
 	MantleProgress = Progress;
 }
 
+void ACatBase::BeginMantleAnimHold()
+{
+	bGoMantle           = true;
+	MantleProgress      = 1.0f;
+	MantleAnimHoldTimer = 0.5f;
+}
+
 void ACatBase::Server_SetStartProgress_Implementation(float NewProgress)
 {
 	StartProgress = NewProgress;
@@ -1776,6 +1834,8 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, StartProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoMantle, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, MantleProgress, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bMantleVault, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, MantleLedgeHeight, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoWallAttach, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
@@ -2251,6 +2311,65 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		MeshGroundConformZ = FMath::FInterpTo(MeshGroundConformZ, ConformTarget, DeltaTime, ConformInterpSpeed);
 	}
 
+	// ── (B3) Wall-hug conform (2026-07-30) — the §B role rotated 90°. While attached to
+	// a wall (cling/scramble) or mantling, the capsule sits wherever the attach caught it
+	// (the gap varies per catch) and the skeleton discards body translation, so the wall
+	// clips render a fixed paw plane that floats off the surface. Trace the wall along
+	// actor forward and slide the MESH so the paw plane meets it. Trace-miss decays to 0,
+	// which self-resolves the mantle top-out (the capsule center rises past the lip).
+	{
+		float HugTarget = 0.0f;
+		// During a mantle the hug only serves the wall-face half; releasing it there
+		// (masked by the fast pull) instead of during the calm walk-out killed the
+		// post-mantle backward mesh glide (Sean's "jitter after topping out").
+		const bool bMantleHugPhase = bGoMantle && MantleProgress < 0.5f;
+		// The climb clip's chest/head already ride AT the wall plane, so every uu of
+		// mantle-phase hug is a uu of face interpenetration ("whole front of the cat
+		// clips through the ledge") — cap it hard; the drop tables own paw contact.
+		constexpr float MantleHugCap = 5.0f;
+		if (bEnableWallHug && (bGoWallAttach || bMantleHugPhase) && GetWorld())
+		{
+			const FVector Start = GetActorLocation();
+			const FVector Fwd   = GetActorForwardVector();
+			FHitResult Hit;
+			FCollisionQueryParams Params(FName(TEXT("CatWallHug")), false, this);
+			if (GetWorld()->LineTraceSingleByChannel(Hit, Start,
+					Start + Fwd * (WallHugMaxSlide + 30.0f), ECC_Visibility, Params)
+				&& !Hit.bStartPenetrating          // the 07-21 start-penetrating trap
+				&& Hit.ImpactNormal.Z < 0.5f)      // steeper than ~60° = a wall, not floor
+			{
+				HugTarget = FMath::Clamp(Hit.Distance - WallHugSurfaceBias - WallHugPawPlane,
+				                         0.0f, bMantleHugPhase ? MantleHugCap : WallHugMaxSlide);
+			}
+		}
+		// Corner-flap guard: during a mantle the wall distance is fixed by the takeover,
+		// so LATCH the first computed hug and hold it — at a face's lateral edge the live
+		// trace alternately hits and misses across the corner as the body moves, and the
+		// resulting 0↔target flapping WAS the "jittery" corner mantle (2026-07-31).
+		if (bMantleHugPhase)
+		{
+			if (MantleHugLatch < 0.0f)
+			{
+				MantleHugLatch = HugTarget;
+			}
+			HugTarget = MantleHugLatch;
+		}
+		else if (!bGoMantle)
+		{
+			MantleHugLatch = -1.0f;
+		}
+		// Downward hug moves during a mantle ease at HALF speed: the cling→mantle handoff
+		// sheds the cling's full hug (~14) down to the mantle cap (5), and at full interp
+		// that 9 uu pull-back reads as a hitch right at the takeover start (2026-07-31).
+		const float HugInterp = (bGoMantle && HugTarget < WallHugForward)
+			? WallHugInterpSpeed * 0.5f : WallHugInterpSpeed;
+		WallHugForward = FMath::FInterpTo(WallHugForward, HugTarget, DeltaTime, HugInterp);
+		if (HugTarget == 0.0f && FMath::Abs(WallHugForward) < 0.01f)
+		{
+			WallHugForward = 0.0f;
+		}
+	}
+
 	// ── (B2) Turn stance drop — ease the body down during turn footwork so the kit
 	// turn clips' non-planting outside forepaw reaches contact (see TurnStanceDrop).
 	// Asymmetric: engage must beat the Turn-state blend-in; release stays gentle.
@@ -2288,7 +2407,73 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		};
 		bool bCurveDrop = false;
 		float DropTarget = 0.0f;
-		if (bIsOnGround)
+		// The mantle drop releases through the GENTLE interp for its last 10% (and the
+		// post-exit freeze): tracking the tables' steep settle tail exactly popped the
+		// body up ~7.5 uu in 2–3 frames at the exit (TurnDropZ −7.66 → −0.13 in 0.1 s,
+		// PawPrint 2026-07-31 — the residual end-jitter on running-jump mantles).
+		if (bGoMantle && MantleCrouchScale > 0.0f && MantleProgress < 0.9f)
+		{
+			// Mantle deep-hang (2026-07-30) — the ONLY airborne curve drop, so it sits above
+			// the grounded chain. The source Ledge_Climb_Up pelvis translation dives from
+			// stance 25.8 to 3.9 uu mid-pull (the body hangs low against the wall face while
+			// the root track rises past it) and is discarded by the skeleton's all-SKELETON
+			// translation retargeting — without this valley the tucked hind rotations render
+			// as legs sticking forward at body height (the kangaroo, frame-verified vs the
+			// pack showcase). Sampled from the source IP pelvis at 11 points, scaled to our
+			// pelvis height (30.2/25.8); the capsule curve carries the root track, this
+			// carries the pelvis-local remainder — together they reproduce the authored
+			// world trajectory exactly.
+			// CONTACT-CALIBRATED 2026-07-30 (round 11): the raw source-pelvis sampling left
+			// every paw 5–8.5 uu off both surfaces through progress 0.46–0.69 (Sean's
+			// frame-37 all-airborne catch) — our legs are proportionally shorter than the
+			// pelvis-height ratio assumes, so the body must ride DEEPER than the authored
+			// dive for the paws to reach contact. Each entry = source-pelvis sample + the
+			// measured shortfall of the lowest reachable paw vs a 1.5 uu contact target
+			// (the TurnStanceDrop philosophy). Verified: min paw-surface distance ≤3.4 uu
+			// across the whole mantle, matching the source's own contact profile.
+			// RE-DERIVED 2026-07-31 (round 18): raw source-pelvis samples + ONE smooth
+			// contact hump (amp 3.5, smoothstep 0.25–0.45 in / 0.85–1.0 out) instead of
+			// per-knot exact corrections — the jagged correction envelope rode on top of
+			// the smooth authored pelvis path and pumped the paws ("legs flapping",
+			// measured 2–3× the authored paw wiggle; smoothing recovers ~15–20%).
+			static constexpr float MantleCrouchDrop[11] =
+				{ 0.00f, 3.18f, 13.61f, 23.57f, 28.39f, 23.42f, 16.95f, 10.52f, 6.13f, 3.33f, 0.00f };
+			// Vault bucket (Ledge_050M): crouch-load coil, hop, landing gather — same
+			// contact calibration (its gather window floated up to 8.7 uu uncorrected).
+			// RE-DERIVED 2026-07-31 (round 21, the round-18 recipe): the source's
+			// authored pelvis dive is load-peak 19.6 → hop release to 0 → a GENTLE
+			// landing plateau of ~6.6 — but the per-knot contact calibration had
+			// turned that plateau into a 16.4 spike arriving in 170 ms (2.5× the
+			// authored motion), pumping the body through every vault landing (the
+			// "jitter on all mantles" once vault-for-all shipped); its sharp 0-valley
+			// also made Catmull overshoot NEGATIVE (a mesh pop-UP mid-hop). Now the
+			// authored shape + smooth contact humps (load +2.5, gather +7 peaked
+			// p0.65). Contact cost vs the calibrated knots ≤ ~4 uu, gather only.
+			static constexpr float VaultCrouchDrop[11] =
+				{ 0.00f, 13.50f, 22.00f, 4.00f, 0.50f, 5.50f, 14.00f, 13.00f, 10.00f, 5.00f, 0.00f };
+			// Height-aware: each table is contact-calibrated at ONE height (climb 68,
+			// vault 40); scale toward the actual ledge so bucket-edge heights stay
+			// planted (ledge 47 played the 68-calibrated climb → all paws >25 uu off
+			// every surface for half the mantle — MantlePawGapMin's first catch).
+			const float CalibHeight = bMantleVault ? 40.0f : 68.0f;
+			const float HeightScale = (MantleLedgeHeight > 1.0f)
+				? FMath::Clamp(MantleLedgeHeight / CalibHeight, 0.8f, 1.1f) : 1.0f;
+			// Catmull-Rom through the knots (mantle only): linear segments put a velocity
+			// kink every 85 ms and the smooth clip pose pumps over each one.
+			auto SampleSmooth = [](const float (&Table)[11], float Progress)
+			{
+				const float s = FMath::Clamp(Progress, 0.0f, 1.0f) * 10.0f;
+				const int32 i = FMath::Min(FMath::FloorToInt32(s), 9);
+				const float u = s - i;
+				const float P0 = Table[FMath::Max(i - 1, 0)], P1 = Table[i];
+				const float P2 = Table[i + 1], P3 = Table[FMath::Min(i + 2, 10)];
+				return 0.5f * ((2.f*P1) + (-P0+P2)*u + (2.f*P0-5.f*P1+4.f*P2-P3)*u*u + (-P0+3.f*P1-3.f*P2+P3)*u*u*u);
+			};
+			DropTarget = -SampleSmooth(bMantleVault ? VaultCrouchDrop : MantleCrouchDrop,
+			                           MantleProgress) * MantleCrouchScale * HeightScale;
+			bCurveDrop = true;
+		}
+		else if (bIsOnGround)
 		{
 			if (bGoPivot && PivotCrouchScale > 0.0f)
 			{
@@ -2347,11 +2532,14 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ + TurnStanceDropZ;
 	FVector Rel = MeshComp->GetRelativeLocation();
 	if (FMath::Abs(TotalOffset) < 0.01f && FMath::Abs(MeshSlopePitch) < 0.05f
-		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f))
+		&& FMath::Abs(WallHugForward) < 0.01f
+		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f)
+		&& FMath::IsNearlyEqual(Rel.X, MeshBaseRelLocX, 0.01f))
 	{
 		return;
 	}
 	Rel.Z = MeshCushionBaseZ + TotalOffset;
+	Rel.X = MeshBaseRelLocX + WallHugForward;   // wall-hug: actor-forward slide toward the wall
 	// Slope pitch is about the ACTOR's lateral axis — compose it in parent space ahead of
 	// the rig's authored relative rotation (the −90° yaw), then write both in one call.
 	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
@@ -2501,7 +2689,10 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 	const bool bJustLanded = (TargetAlpha > 0.0f) && (JumpPhase == ECatJumpPhase::Land) && (FootIKAlpha < 1.0f);
 	FootIKAlpha = bJustLanded
 		? 1.0f
-		: FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
+		: bGoMantle
+			? 0.0f   // takeover owns the paws — a walk-up mantle's decaying alpha tail was
+			         // dragging stale ground offsets through the pull-up (PawPrint 2026-07-30)
+			: FMath::FInterpTo(FootIKAlpha, TargetAlpha, DeltaTime, FootIKInterpSpeed);
 
 	// Fully blended out — settle every output to neutral and skip the traces.
 	// EXCEPT when the zero came purely from the speed taper while grounded: the paw
@@ -2914,12 +3105,31 @@ void ACatBase::Landed(const FHitResult& Hit)
 	LandImpactIntensity = FMath::Clamp(ImpactZ / HardLandSpeedThreshold, 0.0f, 1.0f);
 	LandRecoveryTimer = LandRecoveryDuration;
 
+	// Post-mantle anim hold: DON'T clear here. Landing puts Anim_JumpPhase in its
+	// brief Land window, and releasing bGoMantle inside it let the SM race out
+	// through Mantle → Jump_Land — an ~0.08 s crouch-pose flash (the residual end
+	// jitter, PawPrint 2026-07-31). Shortening the timer instead releases the hold
+	// just AFTER the 0.05 recovery expires, so the SM always leaves at phase None
+	// via the clean 0.25 Mantle → Idle/Move blends (Rule_MantleToLand is now
+	// phase == Land only, serving abort-landings).
+	const bool bPostMantleLanding = MantleAnimHoldTimer > 0.0f;
+	if (bPostMantleLanding)
+	{
+		MantleAnimHoldTimer = 0.08f;
+		// The 2 uu settle is not a real fall: the clip's walk-out already IS the
+		// landing. A full recovery window + cushion kick here read as the cat
+		// "bouncing" right after topping out (Sean's frame-19 catch) — collapse both
+		// so the SM can leave for Idle/Move almost immediately and the mesh stays put.
+		LandRecoveryTimer = 0.05f;
+		LandImpactIntensity = 0.0f;
+	}
+
 	// Kick the landing-cushion spring: aim for DipPerImpact × impact speed of body dip.
 	// v = dip × ω × e makes a critically-damped spring peak at ≈ the target dip.
 	// Moving landings get a reduced kick: foot IK is speed-gated off at a run, so a
 	// full dip there would sink the body without planted paws (Land_run's own motion
-	// carries the weight instead).
-	if (bEnableLandCushion)
+	// carries the weight instead). Skipped after a mantle (see above).
+	if (bEnableLandCushion && !bPostMantleLanding)
 	{
 		const float MoveScale = (Speed > 150.0f) ? 0.4f : 1.0f;
 		const float DipTarget = FMath::Min(ImpactZ * LandCushionDipPerImpact, LandCushionMaxDip) * MoveScale;

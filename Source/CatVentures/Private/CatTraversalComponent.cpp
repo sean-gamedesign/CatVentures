@@ -162,6 +162,32 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 
 	WallAttachCooldownTimer = FMath::Max(WallAttachCooldownTimer - DeltaTime, 0.0f);
 
+	// Deferred mantle exit step-out (see EndMantle): input was suppressed through the
+	// exit frame, so the held-input check waits here for the first tick with real
+	// acceleration. Applied along the INPUT direction — the player may already be
+	// steering off the ledge line, and shoving them along the old facing would fight
+	// the stick they are holding.
+	if (MantleExitBoostTimer > 0.0f)
+	{
+		MantleExitBoostTimer -= DeltaTime;
+		if (TraversalState != ECatTraversalState::None)
+		{
+			MantleExitBoostTimer = 0.0f;   // a new verb owns the CMC — stand down
+		}
+		else if (ACatBase* BoostCat = GetCat())
+		{
+			if (UCharacterMovementComponent* BoostCMC = BoostCat->GetCharacterMovement())
+			{
+				const FVector Accel = BoostCMC->GetCurrentAcceleration();
+				if (Accel.SizeSquared2D() > 1.0f && BoostCMC->IsMovingOnGround())
+				{
+					BoostCMC->Velocity = Accel.GetSafeNormal2D() * MantleExitSpeed;
+					MantleExitBoostTimer = 0.0f;
+				}
+			}
+		}
+	}
+
 	// Landing clears a spent wall: the timeout only has to survive the fall it caused.
 	if (!SpentWallNormal.IsZero())
 	{
@@ -319,8 +345,34 @@ void UCatTraversalComponent::TryDetectMantle()
 	if (LedgeHeight < MantleMinLedgeHeight) { NoteReject(ETraversalReject::LipTooLow);  return; }
 	if (LedgeHeight > MantleMaxLedgeHeight) { NoteReject(ETraversalReject::LipTooHigh); return; }
 
+	// 2b. Corner coverage: at the lateral END of a face (inside corners, block edges)
+	// the single heading ray can hit the wall a whisker from its edge, leaving half
+	// the cat overhanging air through the whole climb (Sean's repro 2026-07-31: the
+	// body floats beside the block, paws reach sideways to the lip, and the hug trace
+	// flaps across the corner). Probe the face ± a half-body along the wall tangent;
+	// if exactly one side finds no wall, shift the landing target toward the covered
+	// side — the XY curve then carries the capsule laterally onto the face.
+	FVector CornerShift = FVector::ZeroVector;
+	{
+		constexpr float SideProbe = 12.0f;
+		const FVector Tangent = FVector::CrossProduct(IntoWall, FVector::UpVector).GetSafeNormal();
+		auto SideHasWall = [&](float Sign)
+		{
+			FHitResult SideHit;
+			const FVector Origin = Center + Tangent * (Sign * SideProbe);
+			return GetWorld()->LineTraceSingleByChannel(SideHit, Origin,
+				Origin + IntoWall * MantleReachDistance, ECC_Visibility, Params)
+				&& SideHit.ImpactNormal.Z < 0.5f;
+		};
+		const bool bLeft = SideHasWall(-1.0f), bRight = SideHasWall(1.0f);
+		if (bLeft != bRight)
+		{
+			CornerShift = Tangent * (bLeft ? -SideProbe : SideProbe);
+		}
+	}
+
 	// 3. Headroom: the landing spot must fit the capsule.
-	const FVector Target = LipHit.ImpactPoint + IntoWall * 12.0f
+	const FVector Target = LipHit.ImpactPoint + IntoWall * 12.0f + CornerShift
 		+ FVector(0, 0, HalfHeight + 2.0f);
 	FHitResult RoomHit;
 	if (GetWorld()->LineTraceSingleByChannel(RoomHit, Target,
@@ -1128,12 +1180,20 @@ void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& 
 	// pull-up — without this a sideways catch plays it crabbing. Derived from the
 	// start→target vector rather than the normal so the owner and the server (which
 	// receives only those two points) turn identically.
+	// EASED, not snapped (2026-07-31): the detector aims down the HEADING, which
+	// camera-relative input + air control pull away from the facing, so an oblique
+	// catch teleport-rotated the body in one frame under a camera that doesn't
+	// follow — Sean's camera-positional "scramble" repro. DriveMantle swings the
+	// yaw over the first MantleFaceAlpha of the mantle instead.
+	MantleStartYaw  = Cat->GetActorRotation().Yaw;
+	MantleTargetYaw = MantleStartYaw;
 	FVector Facing = InTarget - InStart;
 	Facing.Z = 0.0f;
 	if (Facing.Normalize())
 	{
-		Cat->SetActorRotation(FRotator(0.0f, Facing.Rotation().Yaw, 0.0f));
+		MantleTargetYaw = Facing.Rotation().Yaw;
 	}
+	const float SnapDeg = FMath::Abs(FMath::FindDeltaAngleDegrees(MantleStartYaw, MantleTargetYaw));
 
 	// The single CMC takeover point for this component: Flying kills gravity while
 	// the curve owns the capsule; the restore lives in EndMantle and nowhere else.
@@ -1142,10 +1202,26 @@ void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& 
 		CMC->StopMovementImmediately();
 		CMC->SetMovementMode(MOVE_Flying);
 	}
+	// Height bucket: latched here so a mid-mantle nothing can switch clips (the
+	// PivotAngleDeg precedent). Owner and server both derive it from the same RPC'd
+	// params; proxies read the replicated bMantleVault. The +3 margin covers the
+	// ~2 uu target float above the lip: a catch at the detection band's very top
+	// measures 71–72 here and slipped past a bare <= 70 into the PARKED climb
+	// composition (Sean's one unreproducible "flapping" mantle, log 2026-07-31 —
+	// ledge 72 [climb] in an otherwise all-vault session).
+	bMantleIsVault = (MantleTarget.Z - MantleStart.Z) <= MantleVaultMaxHeight + 3.0f;
+	Cat->bMantleVault = bMantleIsVault;
+	Cat->MantleLedgeHeight = MantleTarget.Z - MantleStart.Z;
 	Cat->SetMantleAnimState(true, 0.0f);
 
-	UE_LOG(LogCatVentures, Log, TEXT("[%s] Mantle START — ledge %.0f uu, duration %.2f s"),
-		*Cat->GetName(), MantleTarget.Z - MantleStart.Z, MantleDuration);
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Mantle START — ledge %.0f uu, duration %.2f s, face-swing %.0f deg [%s]"),
+		*Cat->GetName(), MantleTarget.Z - MantleStart.Z, MantleDuration, SnapDeg,
+		bMantleIsVault ? TEXT("vault") : TEXT("climb"));
+	if (Cat->PawPrint)
+	{
+		static const FName ChSnap(TEXT("MantleFaceDeg"));
+		Cat->PawPrint->SampleChannel(ChSnap, SnapDeg);
+	}
 }
 
 void UCatTraversalComponent::DriveMantle(float DeltaTime)
@@ -1168,15 +1244,83 @@ void UCatTraversalComponent::DriveMantle(float DeltaTime)
 	MantleElapsed += DeltaTime;
 	const float Alpha = FMath::Clamp(MantleElapsed / FMath::Max(MantleDuration, 0.05f), 0.0f, 1.0f);
 
-	// Vertical-first curve: the pull-up leads (paws hook, body rises), the forward
-	// swing finishes over the lip. Both smoothstepped; windows overlap in the middle.
-	const float ZAlpha  = FMath::SmoothStep(0.0f, 0.55f, Alpha);
-	const float XYAlpha = FMath::SmoothStep(0.35f, 1.0f, Alpha);
+	// Capsule path = the clamber clip's own root track (2026-07-30), sampled from
+	// Cat_Ledge_Climb_Up_RM at 11 points: a near-linear pull-up completing by
+	// progress 0.4, THEN a pure forward walk-out — strictly sequential, no overlap.
+	// The original overlapped smoothsteps fought the clip's choreography (limbs are
+	// authored against exactly this trajectory; §B2's MantleCrouchDrop carries the
+	// pelvis-local remainder). Change these tables only alongside a clip change.
+	static constexpr float MantleRootZ[11] =
+		{ 0.0f, 0.2623f, 0.565f, 0.8319f, 0.9864f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+	static constexpr float MantleRootXY[11] =
+		{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0294f, 0.1968f, 0.3616f, 0.5222f, 0.7042f, 0.9131f, 1.0f };
+	// Vault bucket (Ledge_050M root track): crouch-load holds the start, the hop rises
+	// through the middle while the forward walk runs the WHOLE clip near-linearly.
+	static constexpr float VaultRootZ[11] =
+		{ 0.0f, 0.0f, 0.0f, 0.0f, 0.3445f, 0.6876f, 0.9809f, 1.0f, 1.0f, 1.0f, 1.0f };
+	static constexpr float VaultRootXY[11] =
+		{ 0.0f, 0.088f, 0.1527f, 0.2718f, 0.3813f, 0.4904f, 0.6048f, 0.7174f, 0.8195f, 0.9106f, 1.0f };
+	// Catmull-Rom, not linear: knot-velocity kinks in the capsule path beat against
+	// the smooth clip pose and pump the paws (the "flapping" diagnosis, 2026-07-31).
+	auto SampleCurve = [](const float (&Table)[11], float P)
+	{
+		const float S = FMath::Clamp(P, 0.0f, 1.0f) * 10.0f;
+		const int32 Seg = FMath::Min(FMath::FloorToInt32(S), 9);
+		const float U = S - Seg;
+		const float P0 = Table[FMath::Max(Seg - 1, 0)], P1 = Table[Seg];
+		const float P2 = Table[Seg + 1], P3 = Table[FMath::Min(Seg + 2, 10)];
+		return 0.5f * ((2.f*P1) + (-P0+P2)*U + (2.f*P0-5.f*P1+4.f*P2-P3)*U*U + (-P0+3.f*P1-3.f*P2+P3)*U*U*U);
+	};
+	const float ZAlpha  = SampleCurve(bMantleIsVault ? VaultRootZ  : MantleRootZ,  Alpha);
+	float XYAlpha = SampleCurve(bMantleIsVault ? VaultRootXY : MantleRootXY, Alpha);
+
+	// Body-swing progress (see StartMantle — the oblique-catch snap fix). Used for
+	// the yaw ease below AND to gate the face crossing on big-swing catches: while
+	// the body is still swinging it is SIDEWAYS to the ledge, and a sideways cat is
+	// far longer than the capsule is wide — crossing the face mid-swing buried half
+	// the body in the wall (Sean's 87–92° clip-through repro, 2026-07-31). Normal
+	// catches (face-swing ≤ 35°) are untouched; the gate ramps in by 80°.
+	const float FaceAlpha = FMath::SmoothStep(0.0f, FMath::Max(MantleFaceAlpha, 0.05f), Alpha);
+	const float SwingDeg  = FMath::Abs(FMath::FindDeltaAngleDegrees(MantleStartYaw, MantleTargetYaw));
+	const float SwingGate = FMath::SmoothStep(35.0f, 80.0f, SwingDeg);
+	if (SwingGate > 0.0f)
+	{
+		XYAlpha = FMath::Lerp(XYAlpha, XYAlpha * FaceAlpha, SwingGate);
+	}
+
+	// Climb bucket: close to a standard wall stand-off DURING the rise. Detection arms
+	// up to 45 uu out, but the drop tables/hug are contact-calibrated with the capsule
+	// ~at the face — a far catch left every paw ~20 uu off the wall for the whole pull
+	// (MantlePawGapMin, 2026-07-31: ledge 64, sentinel-pegged progress 0.12–0.53). The
+	// mesh hug can't close it (capped at 5 for chest clipping), so the CAPSULE does:
+	// XY path = catch → 12 uu off the face → over the lip. Derived purely from the
+	// replicated Start/Target, so owner and server stay identical.
+	FVector XYFrom = MantleStart;
+	if (!bMantleIsVault)
+	{
+		// Target sits 12 inside the face along the approach; 24 back = 12 outside it.
+		constexpr float StandoffPullback = 24.0f;
+		FVector Dir = MantleTarget - MantleStart;
+		Dir.Z = 0.0f;
+		const float Dist2D = Dir.Size();
+		if (Dist2D > StandoffPullback)
+		{
+			const FVector Standoff = MantleTarget - (Dir / Dist2D) * StandoffPullback;
+			const float CloseAlpha = FMath::SmoothStep(0.0f, 0.35f, Alpha);
+			XYFrom.X = FMath::Lerp(MantleStart.X, Standoff.X, CloseAlpha);
+			XYFrom.Y = FMath::Lerp(MantleStart.Y, Standoff.Y, CloseAlpha);
+		}
+	}
 	FVector NewLoc;
-	NewLoc.X = FMath::Lerp(MantleStart.X, MantleTarget.X, XYAlpha);
-	NewLoc.Y = FMath::Lerp(MantleStart.Y, MantleTarget.Y, XYAlpha);
+	NewLoc.X = FMath::Lerp(XYFrom.X, MantleTarget.X, XYAlpha);
+	NewLoc.Y = FMath::Lerp(XYFrom.Y, MantleTarget.Y, XYAlpha);
 	NewLoc.Z = FMath::Lerp(MantleStart.Z, MantleTarget.Z, ZAlpha);
 	Cat->SetActorLocation(NewLoc, false);
+
+	// Swing the body onto the ledge line: shortest signed arc, FaceAlpha from above.
+	const float NewYaw = MantleStartYaw
+		+ FMath::FindDeltaAngleDegrees(MantleStartYaw, MantleTargetYaw) * FaceAlpha;
+	Cat->SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
 
 	Cat->SetMantleAnimState(true, Alpha);
 
@@ -1213,12 +1357,35 @@ void UCatTraversalComponent::EndMantle(bool bCompleted)
 			}
 			if (bCompleted)
 			{
-				FVector Fwd = Cat->GetActorForwardVector();
-				Fwd.Z = 0.0f;
-				CMC->Velocity = Fwd.GetSafeNormal() * MantleExitSpeed;
+				// Step-out speed ONLY if the player is actually steering: with no input,
+				// handing 150 forward shoved the cat ~15 cm and braked it dead in 0.1 s —
+				// a physical lurch right as the anim settles (2026-07-30). BUT the check
+				// cannot run HERE: Move() input is suppressed until this very call, so
+				// GetCurrentAcceleration is always zero on the exit frame and the boost
+				// never fired — every mantle ended in a dead stop and running exits
+				// re-accelerated from 0 (the residual "long jump end jitter", PawPrint
+				// 2026-07-31: Speed 0 → ramp on every END). Defer it: arm a short window
+				// and let TickComponent apply the step-out on the first tick that sees
+				// real acceleration (owner input / server replayed moves both qualify).
+				CMC->Velocity = FVector::ZeroVector;
+				MantleExitBoostTimer = 0.12f;
 			}
 		}
-		Cat->SetMantleAnimState(false, 1.0f);
+		if (bCompleted)
+		{
+			// Hold the Mantle anim state through the ~2-uu exit drop so the SM never
+			// flashes Jump_Fall between Mantle and Jump_Land (the land prediction traces
+			// along the mostly-horizontal exit velocity and misses the floor 2 uu below).
+			// Landed() clears it; a 0.5 s failsafe covers a slid-off-the-lip exit.
+			Cat->BeginMantleAnimHold();
+		}
+		else
+		{
+			// Abort: clear immediately but FREEZE the scrub at its last value — the skid
+			// lesson: the blend-out must leave from the pose actually on screen, and a
+			// reset-to-0 (or snap-to-1) here would yank the evaluator mid-blend.
+			Cat->SetMantleAnimState(false, Cat->MantleProgress);
+		}
 
 		// Per-mantle spec line — the clamber-clip authoring numbers (the stop/start
 		// log-line doctrine): ledge height + takeover duration.

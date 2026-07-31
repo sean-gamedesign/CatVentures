@@ -110,17 +110,47 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "5.0", ClampMax = "50.0"))
 	float MantleForwardClearance = 18.0f;
 
-	/** Takeover duration = base + height × per-cm (taller ledges pull longer). */
+	/** Ledges at or below this height (uu) use the VAULT bucket (Ledge_050M: fores plant,
+	 *  quick hind hop) instead of the deep-hang pull-up (Ledge_Climb_Up) — one clip cannot
+	 *  serve both: the pull-up is authored for ~95 uu of climb at our scale and compresses
+	 *  into a bunch at the lip on a knee-high step (frame-verified vs the pack showcase,
+	 *  2026-07-30). Latched at StartMantle into bMantleVault; selects clip, capsule curve
+	 *  and §B2 drop table together. */
+	/** Raised 45 → 55 (2026-07-31): ledge 47 [climb] was the first MantlePawGapMin catch —
+	 *  all four paws >25 uu from every surface for HALF the mantle. The deep-hang climb is
+	 *  calibrated at ~68; 45–55 was a no-man's land where its composition overshoots a short
+	 *  wall. The vault's walk-and-hop scales down to this band gracefully.
+	 *  Raised 55 → 70 (2026-07-31, vault-for-all, Sean's call): a full session split
+	 *  smooth-vs-scramble EXACTLY on the bucket — every [climb] read as leg-flapping, every
+	 *  [vault] read smooth — so the vault composition now covers the whole detection band
+	 *  and the deep-hang climb is parked until the per-height clip round (Ledge_100M). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "25.0", ClampMax = "70.0"))
+	float MantleVaultMaxHeight = 70.0f;
+
+	/** Takeover duration = base + height × per-cm (taller ledges pull longer).
+	 *  Raised twice on Sean's feel passes (2026-07-30: 0.35/0.0015 → 0.5/0.0025 → 0.65/0.003):
+	 *  a 68 uu climb now runs ~0.85 s ≈ 1.5× the authored clip rate, a 28 uu vault
+	 *  ~0.73 s — same ratio both buckets. Much below ~1.3× reads rushed; much above
+	 *  ~1 s of control lock starts fighting the platforming. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.1", ClampMax = "1.5"))
-	float MantleBaseDuration = 0.35f;
+	float MantleBaseDuration = 0.65f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.0", ClampMax = "0.01"))
-	float MantleDurationPerCm = 0.0015f;
+	float MantleDurationPerCm = 0.003f;
 
 	/** Forward speed handed to the CMC at mantle exit — a soft step-out, the gait
 	 *  earns the rest (the start-burst boundary lesson: bake no lunge). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.0", ClampMax = "400.0"))
 	float MantleExitSpeed = 150.0f;
+
+	/** Fraction of the mantle over which the body EASES to face the ledge. StartMantle
+	 *  used to snap the yaw in one frame — the probe aims down the HEADING, which
+	 *  camera-relative input + air control pull well away from the facing, so an
+	 *  oblique catch teleport-rotated the cat under a camera that doesn't follow
+	 *  (Sean's camera-positional "scramble" repro, 2026-07-31). ~0.3 of a 0.85 s
+	 *  mantle ≈ a 0.25 s swing onto the ledge line. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float MantleFaceAlpha = 0.3f;
 
 	/** Re-mantle cooldown (s). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Mantle", meta = (ClampMin = "0.0", ClampMax = "2.0"))
@@ -518,6 +548,26 @@ private:
 	FVector MantleTarget = FVector::ZeroVector;
 	float MantleDuration = 0.4f;
 	float MantleElapsed = 0.0f;
+
+	/** Height bucket latched at StartMantle (mirrors ACatBase::bMantleVault). */
+	bool bMantleIsVault = false;
+
+	/** Yaw ease latched at StartMantle (the oblique-catch snap fix, 2026-07-31):
+	 *  each machine latches its OWN current yaw and eases to the shared ledge-facing
+	 *  yaw over MantleFaceAlpha of the mantle — a few degrees of transient owner/server
+	 *  divergence that converges by construction. */
+	float MantleStartYaw = 0.0f;
+	float MantleTargetYaw = 0.0f;
+
+	/** Deferred exit step-out: EndMantle used to read GetCurrentAcceleration on the
+	 *  exit frame, but Move() input is suppressed until the mantle ends, so the
+	 *  acceleration was ALWAYS zero and MantleExitSpeed never applied — every mantle
+	 *  ended in a dead stop and running exits re-accelerated from 0 (the "jitter at
+	 *  the end of the long jump", PawPrint 2026-07-31: Speed 0 → ramp on every END).
+	 *  The window lets input flow for a tick or two; the first tick with real
+	 *  acceleration gets the step-out along the INPUT direction. */
+	float MantleExitBoostTimer = 0.0f;
+
 	float CooldownTimer = 0.0f;
 
 	/** Seconds before another wall bounce may fire (separate from the mantle cooldown —

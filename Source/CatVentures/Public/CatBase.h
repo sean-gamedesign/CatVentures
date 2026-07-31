@@ -686,6 +686,22 @@ protected:
 	/** Interp state for the TurnStanceDrop ease (0 → −TurnStanceDrop while turning). */
 	float TurnStanceDropZ = 0.0f;
 
+	/** Wall-hug conform state — mesh rel-X (actor-forward) slide toward the attached wall,
+	 *  and the mesh's authored relative X captured in BeginPlay to offset from. */
+	float WallHugForward = 0.0f;
+	float MeshBaseRelLocX = 0.0f;
+
+	/** Mantle-phase hug latch (−1 = unset): the hug value is frozen at mantle start so a
+	 *  corner-straddling trace can't flap the mesh (see the corner-flap guard in §B3). */
+	float MantleHugLatch = -1.0f;
+
+	/** Post-mantle anim hold (s): bGoMantle stays true with MantleProgress pinned at 1 through
+	 *  the ~2-uu exit drop, so the anim SM goes Mantle → Jump_Land directly instead of flashing
+	 *  Jump_Fall for the 2–3 frames the land prediction can't cover (its trace runs along the
+	 *  mostly-horizontal exit velocity and misses the floor 2 uu below — PawPrint 2026-07-30).
+	 *  Cleared by Landed(); this timer is the slid-off-the-lip failsafe. */
+	float MantleAnimHoldTimer = 0.0f;
+
 	/** True when last frame's §B2 drop came from a scrub curve (pivot/skid) — sustained
 	 *  curve mode tracks the table exactly; interp smooths only the enter/exit edges. */
 	bool bCurveDropWasActive = false;
@@ -997,6 +1013,10 @@ protected:
 	/** Written by the traversal component on owner and server; replicated to proxies. */
 	void SetMantleAnimState(bool bActive, float Progress);
 
+	/** Completed-mantle handoff: keep the Mantle anim state alive (progress pinned 1) until
+	 *  the real landing clears it — see MantleAnimHoldTimer. Called from EndMantle. */
+	void BeginMantleAnimHold();
+
 	/** Accessors for the traversal component's detection gates. */
 	bool IsGrabbing() const { return bIsGrabbing; }
 	bool HasMovementInput() const { return bHasMovementInput; }
@@ -1212,6 +1232,20 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float MantleProgress = 0.0f;
 
+	/** True when the active mantle is the low-ledge VAULT bucket (ledge ≤ the traversal
+	 *  component's MantleVaultMaxHeight): fores plant on top, quick hind hop — vs the
+	 *  deep-hang pull-up for tall ledges. Latched in StartMantle on owner + server from
+	 *  the same deterministic params (the PivotAngleDeg precedent); selects the clip in
+	 *  the ABP Mantle state and the §B2/curve tables in C++. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bMantleVault = false;
+
+	/** The active mantle's ledge height (uu), latched with bMantleVault — scales the §B2
+	 *  drop tables to the actual wall (each is contact-calibrated at one height: climb 68,
+	 *  vault 40) so bucket-edge ledges stay planted instead of floating (2026-07-31). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	float MantleLedgeHeight = 0.0f;
+
 	/** True while the traversal component holds the cat against a wall (cling or scramble).
 	 *  Owner + server both write it from their own attach drive; proxies read the replicated
 	 *  value. No ABP consumer yet — the wall-hug clip is traversal-batch work. */
@@ -1271,6 +1305,45 @@ protected:
 	/** Draw the per-paw ground traces + hit points for tuning/debugging. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning")
 	bool bFootIKDebugDraw = false;
+
+	/** Scale on the mantle deep-hang drop — same doctrine as PivotCrouchScale, but sourced from
+	 *  the retargeted `Ledge_Climb_Up` clip: its pelvis translation dives to ~4 uu (body hanging
+	 *  low against the wall face through the pull) and the skeleton's all-SKELETON translation
+	 *  retargeting discards it, which rendered the tucked hind legs as a mid-air kangaroo sit
+	 *  (frame-verified vs the pack showcase, 2026-07-30). The §B2 valley envelope (peak −25.4 uu
+	 *  at progress 0.4) restores it synced to MantleProgress. 0 disables. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Mantle", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float MantleCrouchScale = 1.0f;
+
+	// ── Wall-hug conform (traversal wall clips, 2026-07-30) ─────────────
+	/** Master switch: while wall-attached (cling/scramble) or mantling, trace along actor
+	 *  forward and slide the MESH toward the wall so the wall clips' paw plane meets the
+	 *  surface. The attach freezes the capsule wherever the probe caught the wall (the gap
+	 *  varies per catch, up to the probe reach) and the skeleton discards body translation,
+	 *  so no clip can close this gap — the §B2 procedural-drop doctrine rotated 90°.
+	 *  Cosmetic + local on every machine (proxies derive it from the replicated flags and
+	 *  the replicated rotation; no RPC surface). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug")
+	bool bEnableWallHug = true;
+
+	/** Where the wall clips' paw-contact plane sits along mesh forward relative to the capsule
+	 *  center (uu, negative = behind it). Measured −7 on the retargeted climb set (the authored
+	 *  A_Cat_Wall_Hang sat at −2). Slide = wall distance − WallHugSurfaceBias − this. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "-20.0", ClampMax = "20.0"))
+	float WallHugPawPlane = -7.0f;
+
+	/** Stop the paw plane this far short of the surface (paw thickness). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float WallHugSurfaceBias = 2.0f;
+
+	/** Max forward mesh slide (uu). An extreme catch distance keeps some float past this —
+	 *  preferable to rendering the body a half-capsule away from where gameplay says it is. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float WallHugMaxSlide = 40.0f;
+
+	/** Engage/release interp speed (1/s). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "1.0", ClampMax = "50.0"))
+	float WallHugInterpSpeed = 10.0f;
 
 	// ── Landing cushion — mesh-Z spring (AnimX pass Step 4) ─────────────
 	/** Master switch for the landing cushion: a damped vertical spring on the mesh's relative Z.
