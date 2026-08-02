@@ -5,10 +5,105 @@
 #include "PawPrintSubsystem.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "HAL/IConsoleManager.h"
+
+/** Second axis of the crossing A/B (2026-08-02): whether the mesh pitches along the
+ *  trajectory at all. 0 leaves the clip's own attitude untouched for the whole
+ *  transfer — the "version C" read. Combine with cat.WallSailHold for the matrix. */
+// Defaults to 0 since 2026-08-02: Sean A/B'd A vs C vs D across 26 crossings and
+// picked C (pose HELD, no procedural pitch), so C is what a fresh launch gives.
+static TAutoConsoleVariable<int32> CVarTransferPitch(
+	TEXT("cat.WallTransferPitch"), 0,
+	TEXT("Wall transfer: 1 = pitch the mesh along the trajectory, 0 = no procedural pitch."),
+	ECVF_Cheat);
 
 UCatTraversalComponent::UCatTraversalComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── The wall-transfer leap, as an AUTHORED CONSTANT (round 20c) ───────────
+// ══════════════════════════════════════════════════════════════════════════
+//
+// The crossing is no longer fitted to whatever gap it finds: the leap itself is
+// the design, and level geometry is built to match it (Sean's call — he blocks
+// levels to these dimensions). Three numbers define it, and the CLIPS ARE
+// AUTHORED TO THEM — change one and A_Cat_Wall_Spring/Sail must be re-authored,
+// which is why they are constants here and not tuning knobs.
+//
+// Why 45°: the launch angle has to be the same number as the cat's body pitch
+// leaving the wall, or the pose and the path visibly disagree. The donor clip
+// (Climb_Start) reared to ~73° because it is a cat leaping UP AT a wall from the
+// ground, and matching THAT would have demanded ~293 uu of capsule rise during
+// the 0.37 s push (≈4 m of climb per crossing, capsule outrunning the pose 3×).
+// At 45° pose and path agree and the climb lands at ~143 uu per crossing.
+namespace CatTransferArc
+{
+	constexpr float LaunchDeg   = 55.0f;   // == the authored body pitch at departure
+	constexpr float ApexFrac    = 2.0f / 3.0f;
+	constexpr float ArrivalDeg  = 15.0f;   // the "bit of dip" onto the far wall
+
+	// Wall phase (the turn's own root motion; the spring is scaled separately).
+	constexpr float RootZ[11]      = { 0.00f, -2.60f, 4.40f, 17.70f, 28.80f, 32.40f, 31.50f, 31.40f, 31.40f, 31.40f, 31.40f };
+	constexpr float Sway[11]       = { 0.00f, 1.70f, 5.70f, 6.60f, 1.50f, 0.30f, 1.20f, 1.60f, 1.60f, 1.60f, 1.60f };
+	constexpr float SpringNorm[11] = { 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.052f, 0.474f, 1.000f };
+	constexpr float YawShape[11]   = { 0.000f, 0.000f, 0.000f, 0.000f, 0.000f, 0.194f, 0.661f, 0.781f, 0.974f, 1.000f, 1.000f };
+
+	float Sample(const float (&T)[11], float X)
+	{
+		const float S = FMath::Clamp(X, 0.0f, 1.0f) * 10.0f;
+		const int32 Seg = FMath::Min(FMath::FloorToInt32(S), 9);
+		const float U = S - Seg;
+		const float P0 = T[FMath::Max(Seg - 1, 0)], P1 = T[Seg];
+		const float P2 = T[Seg + 1], P3 = T[FMath::Min(Seg + 2, 10)];
+		return 0.5f * ((2.f*P1) + (-P0+P2)*U + (2.f*P0-5.f*P1+4.f*P2-P3)*U*U + (-P0+3.f*P1-3.f*P2+P3)*U*U*U);
+	}
+
+	/** Everything the crossing needs, solved from the gap alone. */
+	struct FSolve
+	{
+		float SpringAcross = 0.f, SpringZ = 0.f;   // the scaled push
+		float AcrossEnd = 0.f, ZEnd = 0.f;         // where the wall phase leaves the cat
+		float HorizSpan = 0.f, FlightClimb = 0.f;  // the sail
+		float TotalClimb = 0.f;                    // the level-design metric
+		float B = 0.f, C = 0.f;                    // flight cubic (with the u³ term below)
+		float D = 0.f;
+	};
+
+	FSolve Solve(float Gap, float PushTime, float FlightTime)
+	{
+		FSolve S;
+		// Terminal slope of the normalised push, read off the curve so the tables
+		// stay the single source of truth.
+		constexpr float Eps = 0.02f;
+		const float SlopeU = (1.0f - Sample(SpringNorm, 1.0f - Eps)) / Eps;
+		const float SlopeSec = SlopeU / FMath::Max(PushTime, 0.05f);
+		S.AcrossEnd = Sample(Sway, 1.0f);
+		// Lateral continuity: the push must EXIT at the sail's crossing speed.
+		S.SpringAcross = FMath::Max(Gap - S.AcrossEnd, 0.0f)
+			/ FMath::Max(1.0f + SlopeSec * FlightTime, 0.01f);
+		S.AcrossEnd += S.SpringAcross;
+		S.HorizSpan = FMath::Max(Gap - S.AcrossEnd, 1.0f);
+		// Vertical continuity: leave along the authored launch line, so the rise
+		// scales to whatever the lateral ended up being.
+		const float SlopeZU = (1.0f - Sample(SpringNorm, 1.0f - Eps)) / Eps;   // same shape
+		S.SpringZ = S.SpringAcross * FMath::Tan(FMath::DegreesToRadians(LaunchDeg))
+			* (SlopeU / FMath::Max(SlopeZU, 0.01f));
+		S.ZEnd = Sample(RootZ, 1.0f) + S.SpringZ;
+		// Flight cubic z(u) = B·u + C·u² + D·u³ over u = 0..1 of the horizontal span,
+		// with z'(0) = tan(launch), z'(ApexFrac) = 0, z'(1) = −tan(arrival). Height
+		// at the catch falls out as 0.25·tan(launch)·span — the arc is authored, the
+		// climb is emergent, which is exactly backwards from every previous round.
+		const float S0 = FMath::Tan(FMath::DegreesToRadians(LaunchDeg));
+		const float S1 = -FMath::Tan(FMath::DegreesToRadians(ArrivalDeg));
+		S.B = S0 * S.HorizSpan;
+		S.D = (S1 + 0.5f * S0) * S.HorizSpan;
+		S.C = (-1.25f * S0 - S1) * S.HorizSpan;
+		S.FlightClimb = S.B + S.C + S.D;
+		S.TotalClimb = S.ZEnd + S.FlightClimb;
+		return S;
+	}
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -162,6 +257,30 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 
 	WallAttachCooldownTimer = FMath::Max(WallAttachCooldownTimer - DeltaTime, 0.0f);
 
+	// Pending cling-kick: the grip held through the clip's load-and-push beat — fire
+	// the launch. If the attach already ended on its own (timeout / wall lost), the
+	// kick still fires off the stored normal: the player pressed, the kick happens.
+	// (Grab / mantle / landing cancel it in EndWallAttach instead.)
+	if (PendingKickTimer > 0.0f)
+	{
+		PendingKickTimer -= DeltaTime;
+		if (PendingKickTimer <= 0.0f)
+		{
+			if (IsWallAttached())
+			{
+				EndWallAttach(EWallAttachEnd::Kick);
+			}
+			DoWallBounce(PendingKickNormal, bPendingKickRight);
+			if (ACatBase* KickCat = GetCat())
+			{
+				if (!KickCat->HasAuthority())
+				{
+					KickCat->Server_WallBounce(PendingKickNormal, bPendingKickRight);
+				}
+			}
+		}
+	}
+
 	// Deferred mantle exit step-out (see EndMantle): input was suppressed through the
 	// exit frame, so the held-input check waits here for the first tick with real
 	// acceleration. Applied along the INPUT direction — the player may already be
@@ -203,6 +322,11 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (TraversalState == ECatTraversalState::Mantle)
 	{
 		DriveMantle(DeltaTime);
+		return;
+	}
+	if (TraversalState == ECatTraversalState::WallTransfer)
+	{
+		DriveWallTransfer(DeltaTime);
 		return;
 	}
 	// Runs on the owner AND the server copy (the RPC mirrors the entry, both then
@@ -680,6 +804,14 @@ void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float Ri
 	AttachStartZ    = Cat->GetActorLocation().Z;
 	Cat->SetWallAttachAnimState(true);
 
+	// A fresh grip ends any in-flight kick anim (chimney: kick → cross → re-cling).
+	// No snap on the yaw-hold release — DriveWallAttach faces the NEW wall on its
+	// first tick, which is the rotation this state actually wants.
+	Cat->FinishWallKickYawHold(/*bSnapToLaunchYaw=*/false);
+	Cat->bGoWallKick        = false;
+	Cat->bWallKickArcPhase  = false;
+	Cat->WallKickAnimTimer  = 0.0f;
+
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach START — normal (%.2f, %.2f)%s"),
 		*Cat->GetName(), N.X, N.Y,
 		RiseSpeed > 0.0f ? TEXT(" [scramble]") : TEXT(" [cling]"));
@@ -759,7 +891,14 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 	CMC->Velocity = Vel;
 
 	// Face the wall (cosmetic; orient-to-movement is inert at zero horizontal velocity).
-	Cat->SetActorRotation(FRotator(0.0f, (-AttachNormal).Rotation().Yaw, 0.0f));
+	// EASE-OUT, wrap-safe — see WallAttachFaceInterpSpeed: settles the tail of the kick
+	// sweep onto the face; near no-op for ordinary already-facing approaches.
+	{
+		const float CurYaw = Cat->GetActorRotation().Yaw;
+		const float Delta  = FMath::FindDeltaAngleDegrees(CurYaw, (-AttachNormal).Rotation().Yaw);
+		const float Alpha  = FMath::Clamp(DeltaTime * WallAttachFaceInterpSpeed, 0.0f, 1.0f);
+		Cat->SetActorRotation(FRotator(0.0f, CurYaw + Delta * Alpha, 0.0f));
+	}
 
 	if (Cat->PawPrint)
 	{
@@ -780,6 +919,24 @@ void UCatTraversalComponent::EndWallAttach(EWallAttachEnd Reason)
 	}
 	TraversalState = ECatTraversalState::None;
 	WallAttachCooldownTimer = WallAttachCooldown;
+
+	// A pending anticipated kick dies with the attach when something that owns the cat
+	// outright ends it — grounded (a launch from the floor would be a superjump),
+	// grabbed, mantled, or the server mirror. Timeout / wall-lost do NOT cancel: the
+	// player pressed, so the kick in flight still fires from TickComponent.
+	if (PendingKickTimer > 0.0f
+		&& (Reason == EWallAttachEnd::Grounded || Reason == EWallAttachEnd::Grabbed
+			|| Reason == EWallAttachEnd::Mantled || Reason == EWallAttachEnd::Remote
+			|| Reason == EWallAttachEnd::Aborted))
+	{
+		PendingKickTimer = 0.0f;
+		if (ACatBase* KickCat = GetCat())
+		{
+			KickCat->bGoWallKick       = false;   // the press's anim arm rolls back too
+			KickCat->bWallKickArcPhase = false;
+			KickCat->WallKickAnimTimer = 0.0f;
+		}
+	}
 
 	// A timeout means "this face is spent" — remember it so the held input that got the
 	// cat here cannot immediately re-grip it. Cleared on ground / kick / mantle.
@@ -823,6 +980,10 @@ bool UCatTraversalComponent::TryWallBounce()
 	{
 		return false;
 	}
+	if (PendingKickTimer > 0.0f)
+	{
+		return true;   // a kick is already loading — consume the press, don't double-arm
+	}
 	if (WallBounceCooldownTimer > 0.0f || IsMantling() || Cat->IsGrabbing())
 	{
 		return false;
@@ -834,14 +995,14 @@ bool UCatTraversalComponent::TryWallBounce()
 	}
 
 	FVector WallNormal;
-	if (IsWallAttached())
+	const bool bFromCling = IsWallAttached();
+	if (bFromCling)
 	{
 		// Clinging: kick off the face we are HOLDING, not whatever the radial probe
 		// finds. In a chimney both walls are usually in reach, so re-probing here could
 		// kick off the wrong one — and the whole point of the cling is that the player
 		// chooses the moment, having already chosen the wall.
 		WallNormal = AttachNormal;
-		EndWallAttach(EWallAttachEnd::Kick);
 	}
 	else
 	{
@@ -853,15 +1014,83 @@ bool UCatTraversalComponent::TryWallBounce()
 		}
 	}
 
-	DoWallBounce(WallNormal);
+	// Twist side = the lateral component of the HELD INPUT across the launch line —
+	// the twist leads the arc the player is about to steer. Neutral input alternates
+	// shoulders (the chimney rhythm). This is the only signal that varies per kick:
+	// anything derived from actor-vs-launch geometry is constant from a cling, because
+	// DriveWallAttach re-faces the wall every frame (the rounds-1/2 always-one-way bug).
+	FVector Lateral = WallNormal; Lateral.Z = 0.0f; Lateral.Normalize();
+	const FVector RightDir = FVector::CrossProduct(FVector::UpVector, Lateral);
+	float Side = 0.0f;
+	if (Cat->PivotInputStaleTime < 0.15f && !Cat->PivotLiveInputDir.IsNearlyZero())
+	{
+		Side = FVector::DotProduct(Cat->PivotLiveInputDir, RightDir);
+	}
+	const bool bKickRight = (FMath::Abs(Side) > 0.3f) ? (Side > 0.0f) : !bLastKickRight;
+	bLastKickRight = bKickRight;
+
+	// Chimney transfer: a cling kick with an opposite wall in range rides the clip's
+	// timeline instead of ballistics (see ECatTraversalState::WallTransfer). Probe
+	// along the HELD normal — the wall the kick leaves toward is by definition the
+	// one the cling faces away from.
+	if (bFromCling && bEnableWallTransfer && GetWorld())
+	{
+		const FVector P0 = Cat->GetActorLocation();
+		FHitResult Hit;
+		FCollisionQueryParams Params(FName(TEXT("CatWallTransfer")), false, Cat);
+		if (GetWorld()->LineTraceSingleByChannel(Hit, P0, P0 + AttachNormal * WallTransferMaxGap,
+				ECC_Visibility, Params)
+			&& !Hit.bStartPenetrating && Hit.ImpactNormal.Z < 0.5f)
+		{
+			FVector NormalB = Hit.ImpactNormal;
+			NormalB.Z = 0.0f;
+			if (NormalB.Normalize())
+			{
+				FVector Target = Hit.ImpactPoint + NormalB * WallTransferStandOff;
+				// The climb is DERIVED from the authored leap, not dialled in: at a
+				// fixed launch angle the arc's height follows from the span, so the
+				// gap decides the climb (and that pairing is the level-blocking spec).
+				{
+					const float G = FVector::Dist2D(P0, Target);
+					Target.Z = P0.Z + CatTransferArc::Solve(G, GetWallTransferPushTime(),
+						FMath::Max(GetWallTransferDuration() - GetWallTransferPushTime(), 0.05f)).TotalClimb;
+				}
+				StartWallTransfer(P0, Target, NormalB, bKickRight);
+				if (!Cat->HasAuthority())
+				{
+					Cat->Server_WallTransfer(P0, Target, NormalB, bKickRight);
+				}
+				return true;
+			}
+		}
+	}
+
+	if (bFromCling && WallBounceAnticipation > 0.0f)
+	{
+		// ANTICIPATION: the clip's first ~0.13 s is the load-and-push ON the wall, so
+		// the grip holds (DriveWallAttach keeps pinning velocity and facing) while the
+		// clip plays, and the launch fires when the clip's paws actually leave. The
+		// anim starts NOW on the owner; the server/proxies start it at the RPC.
+		PendingKickTimer  = WallBounceAnticipation;
+		PendingKickNormal = WallNormal;
+		bPendingKickRight = bKickRight;
+		Cat->bGoWallKick        = true;
+		Cat->bWallKickRight     = bKickRight;
+		Cat->bWallKickArcPhase  = false;
+		Cat->WallKickAnimTimer  = Cat->WallKickAnimDuration;
+		return true;
+	}
+
+	// Raw mid-air bounce (or anticipation disabled): instant, as before.
+	DoWallBounce(WallNormal, bKickRight);
 	if (!Cat->HasAuthority())
 	{
-		Cat->Server_WallBounce(WallNormal);
+		Cat->Server_WallBounce(WallNormal, bKickRight);
 	}
 	return true;
 }
 
-void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
+void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal, bool bKickRight)
 {
 	ACatBase* Cat = GetCat();
 	if (!Cat)
@@ -887,9 +1116,53 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
 	// the fall had accumulated (an additive kick off a fast fall barely registers).
 	Cat->LaunchCharacter(Launch, /*bXYOverride=*/true, /*bZOverride=*/true);
 
+	// Kick anim: side chosen by the caller (held-input lateral, alternate on neutral —
+	// see TryWallBounce) and carried through the RPC so every machine picks the same
+	// clip. An anticipated cling kick armed the window at the PRESS (the clip has been
+	// playing its load-and-push since then) — don't restart it here.
+	if (!Cat->bGoWallKick)
+	{
+		Cat->WallKickAnimTimer = Cat->WallKickAnimDuration;
+	}
+	Cat->bGoWallKick        = true;
+	Cat->bWallKickRight     = bKickRight;
+	Cat->bWallKickArcPhase  = false;
+
+	// The wall-hug slide is deliberately NOT zeroed here (round-4 fix). A cling hug
+	// rides up to ~40 uu, and the round-2 hard zero was a one-frame mesh snap at
+	// every kick press (PawPrint 2026-08-01: WallHugSlide 39.5 → 0 in one sample).
+	// With the actor frame HELD through the kick there is no flip to protect against
+	// any more — the hug decays through its own interp as the trace stops finding
+	// the wall, which renders as paw contact easing off while the body springs away.
+	// FinishWallKickYawHold zeroes any residual when the frame finally rotates.
+
+	// No snap here — arm the YAW EASE (round 5): the actor sweeps to the launch line
+	// at WallKickTurnRate along the chosen shoulder while the clip contributes only
+	// its push-segment POSE. One rotation source end to end: the ease runs through
+	// the flight, and a re-cling's own face-ease (or grounded orient-to-movement)
+	// continues the turn from wherever this one is. Prior models both failed on
+	// composition: frame-1 snap (rounds 1-2) double-rotated against the in-pose
+	// twist; hold-then-late-flip (round 3-4) never reached its flip in chimneys and
+	// re-clings flipped back through the un-twisting pose blend.
 	if (bWallBounceReorientBody)
 	{
-		Cat->SetActorRotation(FRotator(0.0f, Lateral.Rotation().Yaw, 0.0f));
+		Cat->WallKickFaceYaw = Lateral.Rotation().Yaw;
+		Cat->WallKickTurnDir = bKickRight ? 1.0f : -1.0f;
+
+		// Latch the SmoothStep sweep: total angle measured ALONG the chosen shoulder
+		// (never shortest-path), duration from the rate so bigger turns take longer.
+		Cat->WallKickSweepStartYaw = Cat->GetActorRotation().Yaw;
+		float Angle = FMath::Fmod(Cat->WallKickTurnDir > 0.0f
+			? (Cat->WallKickFaceYaw - Cat->WallKickSweepStartYaw)
+			: (Cat->WallKickSweepStartYaw - Cat->WallKickFaceYaw), 360.0f);
+		if (Angle < 0.0f)
+		{
+			Angle += 360.0f;
+		}
+		Cat->WallKickSweepAngle    = Cat->WallKickTurnDir > 0.0f ? Angle : -Angle;
+		Cat->WallKickSweepDuration = FMath::Max(Angle / FMath::Max(Cat->WallKickTurnRate, 90.0f), 0.05f);
+		Cat->WallKickSweepElapsed  = 0.0f;
+		Cat->bWallKickHoldingYaw   = true;
 	}
 
 	// Re-enter the Launch phase so the jump SM plays the launch pose again — the Fall
@@ -915,6 +1188,14 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
 	{
 		CMC->GravityScale = Cat->GravityScaleRising;
 
+		// Yaw ease owns rotation: air steering feeds acceleration, and orient-to-
+		// movement would fight the sweep. Restored by FinishWallKickYawHold at ease
+		// arrival / landing / new attach / mantle.
+		if (bWallBounceReorientBody)
+		{
+			CMC->bOrientRotationToMovement = false;
+		}
+
 		// Rebound window: drop lateral air friction so the kick actually carries.
 		if (WallBounceReboundTime > 0.0f)
 		{
@@ -926,11 +1207,303 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal)
 
 	WallBounceCooldownTimer = WallBounceCooldown;
 
-	// Per-bounce spec line (the stop/start/mantle log doctrine) — these numbers are the
-	// authoring spec for the real plant-and-spring clip in the traversal batch.
+	// Per-bounce spec line (the stop/start/mantle log doctrine).
 	UE_LOG(LogCatVentures, Log,
-		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up"),
-		*Cat->GetName(), Lateral.X, Lateral.Y, WallBounceLateralSpeed, WallBounceVerticalSpeed);
+		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up, kick %s"),
+		*Cat->GetName(), Lateral.X, Lateral.Y, WallBounceLateralSpeed, WallBounceVerticalSpeed,
+		bKickRight ? TEXT("R") : TEXT("L"));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Wall Transfer (the chimney crossing as a takeover) ────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+float UCatTraversalComponent::GetWallTransferProgress() const
+{
+	return IsWallTransferring()
+		? FMath::Clamp(TransferElapsed / FMath::Max(GetWallTransferDuration(), 0.05f), 0.0f, 1.0f)
+		: 0.0f;
+}
+
+float UCatTraversalComponent::GetWallTransferPitchTarget() const
+{
+	if (!IsWallTransferring() || CVarTransferPitch.GetValueOnGameThread() == 0)
+	{
+		return 0.0f;
+	}
+	const float P = GetWallTransferProgress();
+	// In slightly AFTER the arc-pose blend starts (round 15: pitching while the hug
+	// still holds the mesh at the wall swept the head's ~40 uu lever arm through the
+	// face). NO out-window since round 16 — the nose follows the tangent DOWN past
+	// the apex (round 15 zeroed it by 0.99 and the cat sat "locked in the upward
+	// pose" through the descent); the last ~7% sweeps to the CATCH REAR-UP instead
+	// (chest thrown up into the grab), which also rotates the body toward the
+	// vertical cling before the pose crossfade swaps them.
+	const float PushFrac = GetWallTransferPushFrac();
+	// ZERO on the wall (round 20d): the launch attitude is AUTHORED INTO THE CLIP now
+	// — the spring rears to LaunchDeg by its last frame and the sail holds it — so the
+	// clip owns the pose on the wall and through the departure. Adding a procedural
+	// pitch there too would double-count it (55 + 55 = past vertical).
+	if (P < PushFrac)
+	{
+		return 0.0f;
+	}
+	// In flight the procedural layer supplies only the CHANGE from the launch line, so
+	// the body tracks the arc over as it flattens and dips. At the departure frame the
+	// tangent IS LaunchDeg, so this is exactly 0 — continuous with the wall phase by
+	// construction, not by a blend.
+	constexpr float Launch = CatTransferArc::LaunchDeg;
+	const float Tangent = FMath::Clamp(TransferPitchRaw * WallTransferPitchScale,
+	                                   -WallTransferPitchMax + Launch, WallTransferPitchMax + Launch);
+	// Rear-up into the grab (also expressed relative to the authored launch).
+	const float Aimed = FMath::Lerp(Tangent, WallTransferCatchPitchDeg,
+	                                FMath::SmoothStep(0.88f, 0.98f, P));
+	return Aimed - Launch;
+}
+
+void UCatTraversalComponent::StartWallTransfer(const FVector& InStart, const FVector& InTarget,
+	const FVector& InTargetNormal, bool bKickRight)
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat || TraversalState == ECatTraversalState::Mantle
+		|| TraversalState == ECatTraversalState::WallTransfer)
+	{
+		return;
+	}
+	if (IsWallAttached())
+	{
+		EndWallAttach(EWallAttachEnd::Kick);
+	}
+
+	TraversalState  = ECatTraversalState::WallTransfer;
+	TransferStart   = InStart;
+	TransferTarget  = InTarget;
+	TransferNormalB = InTargetNormal;
+	TransferElapsed = 0.0f;
+	TransferPitchRaw = 0.0f;
+
+	// The single CMC takeover point (the mantle doctrine): Flying kills gravity
+	// while the curve owns the capsule; the restore lives in EndWallTransfer only.
+	if (UCharacterMovementComponent* CMC = Cat->GetCharacterMovement())
+	{
+		CMC->StopMovementImmediately();
+		CMC->SetMovementMode(MOVE_Flying);
+	}
+
+	// The clip plays ONLY its push segment (round 10): the anim window is the push
+	// length, after which the ACatBase::Tick expiry flips bWallKickArcPhase and the
+	// WallKick state blends to the authored sailing pose (A_Cat_Transfer_Arc) for
+	// the crossing — bGoWallKick spans the WHOLE transfer (round 13; the crossing
+	// previously exited to Jump_Fall and borrowed its nose-down apex pose). The
+	// JumpDown clip's back half is dismount acrobatics that somersaulted on a
+	// rising crossing — parked for a future high-dismount move.
+	Cat->bGoWallKick        = true;
+	Cat->bWallKickRight     = bKickRight;
+	Cat->bWallKickArcPhase  = false;
+	Cat->WallKickAnimTimer  = GetWallTransferPushTime();
+
+	// Latch the yaw swing: from the cling facing to the far-wall facing, measured
+	// ALONG the chosen shoulder (a chimney 180 sits on the wrap boundary — the
+	// round-5 lesson). DriveWallTransfer sweeps it on a SmoothStep of progress, so
+	// the turn completes just before the catch and cannot be interrupted.
+	TransferStartYaw = Cat->GetActorRotation().Yaw;
+	const float EndYaw = (-InTargetNormal).Rotation().Yaw;
+	const float Dir = bKickRight ? 1.0f : -1.0f;
+	float Angle = FMath::Fmod(Dir > 0.0f ? (EndYaw - TransferStartYaw)
+	                                     : (TransferStartYaw - EndYaw), 360.0f);
+	if (Angle < 0.0f)
+	{
+		Angle += 360.0f;
+	}
+	TransferSwingAngle = Dir > 0.0f ? Angle : -Angle;
+
+	UE_LOG(LogCatVentures, Log,
+		TEXT("[%s] Wall transfer START — gap %.0f uu, climb %.0f uu, %.2f s, kick %s"),
+		*Cat->GetName(), FVector::Dist2D(InStart, InTarget), InTarget.Z - InStart.Z,
+		GetWallTransferDuration(), bKickRight ? TEXT("R") : TEXT("L"));
+}
+
+void UCatTraversalComponent::DriveWallTransfer(float DeltaTime)
+{
+	ACatBase* Cat = GetCat();
+	if (!Cat)
+	{
+		EndWallTransfer(false);
+		return;
+	}
+	UCharacterMovementComponent* CMC = Cat->GetCharacterMovement();
+	if (!CMC || CMC->MovementMode != MOVE_Flying || Cat->IsGrabbing())
+	{
+		EndWallTransfer(false);
+		return;
+	}
+
+	TransferElapsed += DeltaTime;
+	const float P = FMath::Clamp(TransferElapsed / FMath::Max(GetWallTransferDuration(), 0.05f), 0.0f, 1.0f);
+
+	// ── THE WALL PHASE IS THE SOURCE CLIP'S OWN ROOT MOTION (round 19b) ──────
+	// The whole 19-round saga came from playing the *_IP variant, which has the
+	// clip's motion FLATTENED into the root track and then discarded: measured on
+	// the IP the clip looks like it has no turn, so every round tried to
+	// re-synthesise one procedurally. Sampling the SOURCE *_RM with root motion
+	// incorporated shows the real move, all of it authored (60 fps frames):
+	//   f0–12   settle/coil — hips sink 2.5, all four paws planted
+	//   f12–33  SPRING UP THE WALL — root rises 31 uu with BOTH HANDS FIXED IN
+	//           WORLD SPACE (a pull-up); hinds re-plant higher at f27
+	//   f33–48  THE TURN — root yaw swings 144° (L) / 128° (R) while the HIND FEET
+	//           STAY PLANTED; hands release at f42–45
+	//   f48+    the falling dismount — root drops away. THE ONLY WRONG PART: cut.
+	// So the capsule follows the root curve and the ABP renders the root-relative
+	// (IP) pose — the mantle model, and by definition it reconstructs the source.
+	// Verified before shipping: composed against our retarget, hands hold 65–71 uu
+	// through a 32 uu body rise and hinds hold 53–56 through the whole turn.
+	// Round 20 — the wall phase is now TURN + BRIDGE + SPRING (A_Cat_Wall_Spring_*,
+	// 1.2333 s / 74 f): JumpDown f0–45 verbatim (coil, 31 uu pull-up on fixed hands,
+	// 124° of turn on planted hinds) → a 10-frame authored bridge → Climb_Start
+	// f12–30 (crouch bottom → explosive extension → tuck), which is a real ~40°
+	// leap in the source and so matches our launch angle. These tables are the
+	// COMBINED root motion: JumpDown's root through the turn, the bridge holding
+	// position while the remaining yaw sweeps, then Climb_Start's authored +33 rise
+	// / +33 drive as the actual push-off — so the cat leaves the wall on the spring
+	// rather than on a formula.
+	using namespace CatTransferArc;
+
+	FVector AcrossDir = TransferTarget - TransferStart;
+	AcrossDir.Z = 0.0f;
+	const float Gap = AcrossDir.Size();
+	AcrossDir = Gap > 1.0f ? AcrossDir / Gap : FVector::ZeroVector;
+
+	const float PushFrac = FMath::Clamp(GetWallTransferPushTime() / FMath::Max(GetWallTransferDuration(), 0.1f), 0.1f, 0.85f);
+	const float LatU = FMath::Clamp((P - PushFrac) / (1.0f - PushFrac), 0.0f, 1.0f);
+	const float WallU = FMath::Clamp(P / FMath::Max(PushFrac, 0.01f), 0.0f, 1.0f);
+	const float FlightTime = FMath::Max(GetWallTransferDuration() - GetWallTransferPushTime(), 0.05f);
+	const FSolve Arc = Solve(Gap, GetWallTransferPushTime(), FlightTime);
+
+	const float Across = (P < PushFrac)
+		? Sample(Sway, WallU) + Arc.SpringAcross * Sample(SpringNorm, WallU)
+		: Arc.AcrossEnd + Arc.HorizSpan * LatU;       // constant speed, lands exactly on Gap
+	FVector Pos = TransferStart + AcrossDir * Across;
+	Pos.Z = TransferStart.Z + (P < PushFrac
+		? Sample(RootZ, WallU) + Arc.SpringZ * Sample(SpringNorm, WallU)
+		: Arc.ZEnd + Arc.B * LatU + Arc.C * LatU * LatU + Arc.D * LatU * LatU * LatU);
+	Cat->SetActorLocation(Pos);
+
+	// Trajectory tangent — analytic from the same cubic driving the capsule, so pose
+	// and path cannot disagree. It runs during the PUSH too (round 20c): the spring
+	// IS the launch, so the mesh reaches launch attitude as the legs extend instead
+	// of stepping 0 → 45° on the departure frame. During the push the slope is the
+	// push's own (rise ÷ across), which by construction converges on the launch line.
+	if (P < PushFrac)
+	{
+		constexpr float dU = 0.02f;
+		const float U1 = FMath::Min(WallU + dU, 1.0f), U0 = FMath::Max(WallU - dU, 0.0f);
+		const float dZ = (Sample(RootZ, U1) + Arc.SpringZ * Sample(SpringNorm, U1))
+		               - (Sample(RootZ, U0) + Arc.SpringZ * Sample(SpringNorm, U0));
+		const float dX = (Sample(Sway, U1) + Arc.SpringAcross * Sample(SpringNorm, U1))
+		               - (Sample(Sway, U0) + Arc.SpringAcross * Sample(SpringNorm, U0));
+		TransferPitchRaw = (dX > 0.01f) ? FMath::RadiansToDegrees(FMath::Atan2(dZ, dX)) : 0.0f;
+	}
+	else
+	{
+		const float Slope = Arc.B + 2.0f * Arc.C * LatU + 3.0f * Arc.D * LatU * LatU;
+		TransferPitchRaw = FMath::RadiansToDegrees(FMath::Atan2(Slope, Arc.HorizSpan));
+	}
+
+	// The body turn — the ACTOR follows the clip's own root yaw (round 19b). The
+	// rotation is authored: it is flat for the first 60% (coil + pull-up, no turn
+	// at all) and then swings through in the last 40% ON PLANTED HINDS. Magnitudes
+	// are per-side because the pack's two takes differ (L 144.4°, R 128.5°); the
+	// remainder to the far-wall facing sweeps over the flight, which is a small
+	// mid-air correction rather than the "dead cat spinning" rotisserie.
+	// The yaw shape now carries the WHOLE turn: the clip's authored 124° swing on
+	// planted hinds, then the bridge sweeping the remainder so the cat is aimed at
+	// the far wall BEFORE the spring fires (a launch must be aimed, and leftover
+	// rotation in flight is the "spinning" of round 16). The flight therefore has
+	// essentially nothing left to sweep.
+	// NO seam flip: the clip ends in a full extension and the sail is a gathered
+	// sail, so pose-distance alignment has no minimum worth trusting (RMS 34.8 at
+	// its best angle — noise). Extension → sail is a legitimate animation blend and
+	// the 0.10 s crossfade owns it; a flip here would be inventing a rotation to
+	// cancel a difference that is not a rotation. (The 153° flip of rounds 10–18 was
+	// exactly that mistake.)
+	const float TurnSign = FMath::Sign(TransferSwingAngle);
+	const float TurnMag  = FMath::Min(180.0f, FMath::Abs(TransferSwingAngle));
+	const float PushEndYaw = TransferStartYaw + TurnSign * TurnMag;
+	const float S = FMath::SmoothStep(PushFrac, 0.9f, P);
+	const float Yaw = (P < PushFrac)
+		? TransferStartYaw + TurnSign * TurnMag * Sample(YawShape, WallU)
+		: PushEndYaw + (TransferStartYaw + TransferSwingAngle - PushEndYaw) * S;
+	Cat->SetActorRotation(FRotator(0.0f, Yaw, 0.0f));
+
+	// One-shot launch report: the derived numbers that decide whether the crossing
+	// reads continuous. Exit and flight speeds should MATCH by construction — if a
+	// future table edit breaks that, this line says so instead of the eye having to.
+	if (TransferElapsed <= DeltaTime * 1.5f)
+	{
+		static IConsoleVariable* CVarHold = IConsoleManager::Get().FindConsoleVariable(TEXT("cat.WallSailHold"));
+		const bool bHold  = CVarHold && CVarHold->GetInt() != 0;
+		const bool bPitch = CVarTransferPitch.GetValueOnGameThread() != 0;
+		UE_LOG(LogCatVentures, Log, TEXT("[%s] Transfer mode — pose %s, pitch %s  [%s]"),
+			*Cat->GetName(),
+			bHold ? TEXT("HELD") : TEXT("sail settle"), bPitch ? TEXT("ON") : TEXT("OFF"),
+			bHold ? (bPitch ? TEXT("A") : TEXT("C")) : (bPitch ? TEXT("B") : TEXT("D")));
+		UE_LOG(LogCatVentures, Log,
+			TEXT("[%s] Transfer arc — gap %.0f -> climb %.0f (wall %.0f + flight %.0f), "
+			     "launch %.0f deg, apex %.0f%% at +%.0f, arrival %.0f deg  [LEVEL SPEC]"),
+			*Cat->GetName(), Gap, Arc.TotalClimb, Arc.ZEnd, Arc.FlightClimb,
+			CatTransferArc::LaunchDeg, CatTransferArc::ApexFrac * 100.0f,
+			Arc.B * ApexFrac + Arc.C * ApexFrac * ApexFrac + Arc.D * ApexFrac * ApexFrac * ApexFrac,
+			CatTransferArc::ArrivalDeg);
+	}
+
+	if (Cat->PawPrint)
+	{
+		static const FName ChTransfer(TEXT("TransferProgress"));
+		Cat->PawPrint->SampleChannel(ChTransfer, P);
+	}
+
+	if (P >= 1.0f)
+	{
+		EndWallTransfer(true);
+	}
+}
+
+void UCatTraversalComponent::EndWallTransfer(bool bCompleted)
+{
+	if (TraversalState != ECatTraversalState::WallTransfer)
+	{
+		return;
+	}
+	TraversalState = ECatTraversalState::None;
+
+	ACatBase* Cat = GetCat();
+	if (Cat)
+	{
+		if (UCharacterMovementComponent* CMC = Cat->GetCharacterMovement())
+		{
+			CMC->SetMovementMode(MOVE_Falling);
+			CMC->Velocity = FVector::ZeroVector;
+		}
+		if (bCompleted)
+		{
+			// THE SEAM FLIP: the clip's end pose faces actor-BACKWARD, so flipping the
+			// actor to face the far wall on the same frame the cling pose (actor-
+			// forward) takes over keeps the rendered facing continuous — the takeover
+			// guarantees the clip reached its end, which is what made this composition
+			// impossible in the ballistic rounds. The WallKick → WallHang transition
+			// is a near-cut for the same reason.
+			Cat->SetActorRotation(FRotator(0.0f, (-TransferNormalB).Rotation().Yaw, 0.0f));
+			StartWallAttach(TransferNormalB, 0.0f, 0.0f);
+		}
+		else
+		{
+			Cat->bGoWallKick        = false;
+			Cat->bWallKickArcPhase  = false;
+			Cat->WallKickAnimTimer  = 0.0f;
+		}
+		UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall transfer END — %s"),
+			*Cat->GetName(), bCompleted ? TEXT("caught far wall") : TEXT("aborted"));
+	}
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1213,6 +1786,13 @@ void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& 
 	Cat->bMantleVault = bMantleIsVault;
 	Cat->MantleLedgeHeight = MantleTarget.Z - MantleStart.Z;
 	Cat->SetMantleAnimState(true, 0.0f);
+
+	// A mantle outranks any in-flight kick anim (bounce into a ledge → clamber).
+	// No snap — the mantle latched MantleStartYaw above and eases to the ledge line.
+	Cat->FinishWallKickYawHold(/*bSnapToLaunchYaw=*/false);
+	Cat->bGoWallKick        = false;
+	Cat->bWallKickArcPhase  = false;
+	Cat->WallKickAnimTimer  = 0.0f;
 
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Mantle START — ledge %.0f uu, duration %.2f s, face-swing %.0f deg [%s]"),
 		*Cat->GetName(), MantleTarget.Z - MantleStart.Z, MantleDuration, SnapDeg,

@@ -689,6 +689,12 @@ protected:
 	/** Wall-hug conform state — mesh rel-X (actor-forward) slide toward the attached wall,
 	 *  and the mesh's authored relative X captured in BeginPlay to offset from. */
 	float WallHugForward = 0.0f;
+
+	/** Rendered wall-transfer trajectory pitch (deg, nose-up positive) — eases toward
+	 *  the traversal component's weighted target in the §C compose; the interp is also
+	 *  the abort path (a mid-arc abort drops the target to 0 in one frame and the
+	 *  interp walks the mesh back level instead of snapping). Cosmetic, local. */
+	float WallTransferPitchRender = 0.0f;
 	float MeshBaseRelLocX = 0.0f;
 
 	/** Mantle-phase hug latch (−1 = unset): the hug value is frozen at mantle start so a
@@ -997,7 +1003,14 @@ protected:
 	 *  tuning knobs (the pivot-braking mirror pattern). Reliable — a dropped bounce
 	 *  would desync the arc for the whole airborne span. */
 	UFUNCTION(Server, Reliable)
-	void Server_WallBounce(FVector_NetQuantizeNormal WallNormal);
+	void Server_WallBounce(FVector_NetQuantizeNormal WallNormal, bool bKickRight);
+
+	/** Client → Server: mirror a chimney wall-transfer takeover. The server drives its
+	 *  own copy deterministically from the same start/target/normal — the mantle model,
+	 *  no progress streaming. Reliable: a dropped transfer would teleport-desync. */
+	UFUNCTION(Server, Reliable)
+	void Server_WallTransfer(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
+		FVector_NetQuantizeNormal InTargetNormal, bool bKickRight);
 
 	/** Client → Server: mirror both edges of a wall attach (cling or scramble). The server
 	 *  runs the same deterministic vertical profile from the same entry parameters, so no
@@ -1248,9 +1261,127 @@ protected:
 
 	/** True while the traversal component holds the cat against a wall (cling or scramble).
 	 *  Owner + server both write it from their own attach drive; proxies read the replicated
-	 *  value. No ABP consumer yet — the wall-hug clip is traversal-batch work. */
+	 *  value. Drives the ABP WallHang state (cling/scramble clips since 2026-07-31). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	bool bGoWallAttach = false;
+
+	/** True for the wall-kick anim window after a wall bounce — the ABP plays the
+	 *  Climb_JumpDown plant-and-twist clip (WallKick state) instead of re-entering
+	 *  Jump_Launch's run-start scrub. Set in DoWallBounce on owner + server (the RPC
+	 *  mirror runs the same code, the mantle model — no streaming); cleared by
+	 *  Landed(), a new wall attach, a mantle, or WallKickAnimDuration expiring. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bGoWallKick = false;
+
+	/** Which twist variant the active kick plays (true = Climb_JumpDown_Right, which
+	 *  renders a right-shoulder twist — Sean-verified by the round-2 always-Left read).
+	 *  Chosen on the OWNER from the lateral component of the held input across the
+	 *  launch line (the twist leads the arc the player is steering); neutral input
+	 *  ALTERNATES shoulders for the chimney rhythm. The bit rides Server_WallBounce so
+	 *  both machines pick the same clip. Rounds 1-2 lesson: any signal derived from
+	 *  actor-vs-launch geometry is CONSTANT for cling kicks — DriveWallAttach re-faces
+	 *  the wall every frame, so the yaw delta sat pinned on the ±180° wrap boundary
+	 *  and every kick turned the same way. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bWallKickRight = false;
+
+	/** True once a wall transfer's push segment has handed off — the WallKick state
+	 *  blends from the JumpDown push clip to the authored sailing pose
+	 *  (A_Cat_Transfer_Arc) for the crossing. Round 13: the crossing previously
+	 *  borrowed Jump_Fall's apex pose, which is authored as the tip-over moment of
+	 *  a ballistic jump (nose-down −20°, a 92° attitude drop at the handoff from
+	 *  the +71° push extension) — the pack has no "sailing between walls" pose, so
+	 *  one was authored. Only ever true during a transfer (bGoWallKick spans the
+	 *  whole crossing there); raw bounces and solitary cling kicks keep the
+	 *  push-window expiry hand-off to the real airborne poses. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bWallKickArcPhase = false;
+
+	/** Seconds bGoWallKick stays up after the press — the PUSH SEGMENT of the JumpDown
+	 *  clip only (load → spring → extension; the authored lean starts ~0.4). The clip's
+	 *  back half (in-pose 180° twist + dive-away tail) is deliberately UNUSED (round 5,
+	 *  2026-08-01): it is dismount choreography, and composing its in-pose twist with
+	 *  any interrupt (re-cling, landing) produced the flip-back — the turn now lives
+	 *  entirely on the actor-yaw ease (WallKickTurnRate). Expiry hands off through the
+	 *  WallKick → Jump_Apex/Jump_Fall rules onto the normal airborne poses. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Kick", meta = (ClampMin = "0.1", ClampMax = "2.0"))
+	float WallKickAnimDuration = 0.55f;   // 0.45 → 0.55 round 6: the clip's first hint of
+	                                      // authored lean plays during the swing (head and
+	                                      // shoulders lead the turn) and the frozen-pose gap
+	                                      // before the apex handoff closes.
+
+	/** Body compression toward the wall (uu) during the kick's load beat — composed into
+	 *  the wall-hug mesh slide on a SmoothStep over the anticipation window, released by
+	 *  the hug's own decay as the body springs away. This restores the clip's authored
+	 *  load-sink, which lives in ROOT translation and is discarded by the skeleton (the
+	 *  §B2 lesson in wall-normal costume): without it the legs fold around a stationary
+	 *  body and the load never reads. Small paw-into-wall cost during the load accepted
+	 *  (same class as the skid's blend-window penetration). */
+	// (Rounds 6-7's WallKickCoilDepth / WallKickLoadDip are GONE, not zeroed: the wall
+	// transfer's capsule curve carries the clip's own root-arc load dip and spring, so
+	// procedural load fakes are no longer needed — and a knob whose only correct value
+	// is 0 is a trap for a later session, the away-release lesson.)
+
+	/** Actor-yaw swing rate (deg/s) from the wall facing to the launch line after a
+	 *  kick — THE single rotation source for the kick turn (the clip contributes pose,
+	 *  not yaw). ~650 swings a chimney 180° in ~0.28 s ≈ the measured wall-to-wall
+	 *  flight. Direction comes from bWallKickRight (input steer / alternation), never
+	 *  from shortest-path — a chimney 180 sits exactly on the angle-wrap boundary. At
+	 *  a re-cling the attach's own face-ease continues the turn from wherever this one
+	 *  is: one continuous rotation from launch to grip, no duty swap. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Kick", meta = (ClampMin = "90.0", ClampMax = "3000.0"))
+	float WallKickTurnRate = 650.0f;
+
+	/** +1 = swing right (yaw increasing), −1 = left. Latched with bWallKickRight. */
+	float WallKickTurnDir = 1.0f;
+
+	/** Sweep state (round 6 — SmoothStep profile instead of constant rate: constant
+	 *  angular velocity is the definition of mechanical). Latched in DoWallBounce:
+	 *  yaw = Start + Angle × SmoothStep(Elapsed / Duration), Duration = |Angle| / rate. */
+	float WallKickSweepStartYaw = 0.0f;
+	float WallKickSweepAngle    = 0.0f;   // signed, along WallKickTurnDir — never shortest-path
+	float WallKickSweepDuration = 0.1f;
+	float WallKickSweepElapsed  = 0.0f;
+
+	/** Countdown for the kick anim window. Armed only where DoWallBounce runs (owner +
+	 *  server); proxies read the replicated flag. */
+	float WallKickAnimTimer = 0.0f;
+
+	/** Clip time for the ABP's JumpDown evaluators (round 15) — advances while the
+	 *  kick's push segment plays, FREEZES at the arc handoff, holds through blend-out.
+	 *  Derived on every machine from bGoWallKick/bWallKickArcPhase — not replicated. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Animation|Cosmetic")
+	float WallKickClipTime = 0.0f;
+
+	// (No separate sail time: the ABP derives it as WallKickClipTime − the spring
+	//  clip's length, and each evaluator clamps at its own ends. The 1.2333 literal
+	//  in the WallKick graph is that clip length — if A_Cat_Wall_Spring is ever
+	//  re-authored to a different duration, WallTransferPushTime AND that literal
+	//  both follow it.)
+
+	/** Edge detector for the clip-time reset (all roles). */
+	bool bPrevGoWallKickForClipTime = false;
+
+	/** Kick-press hug latch (§B3, round 15) — the hug may decay during a kick's push
+	 *  but never grow past its at-press value (the paws are leaving the wall). */
+	float KickPressHug = 0.0f;
+	bool bKickPressHugValid = false;
+
+	/** Kick yaw-ease state (round 5, 2026-08-01 — replaces the hold-then-late-flip
+	 *  model, whose flip never arrived in chimneys: every kick was re-clung at ~0.33 s,
+	 *  mid-twist, and the pose-untwist + shortest-path attach turn composed as the
+	 *  "180 flip back the other way"). While bWallKickHoldingYaw, Tick sweeps the actor
+	 *  yaw toward WallKickFaceYaw at WallKickTurnRate along WallKickTurnDir (never
+	 *  shortest-path — a chimney 180 sits on the wrap boundary), orient-to-movement
+	 *  off; arrival or an interrupt releases it. */
+	float WallKickFaceYaw = 0.0f;
+	bool  bWallKickHoldingYaw = false;
+
+	/** Stop the kick yaw-ease: restore orient-to-movement (unless a grab owns it).
+	 *  Interrupts (attach / mantle / landing) pass false and leave the yaw wherever the
+	 *  ease got to — the attach face-ease or grounded orient-to-movement continues the
+	 *  turn naturally from there. The snap branch is a legacy safety, currently unused. */
+	void FinishWallKickYawHold(bool bSnapToLaunchYaw);
 
 	/** True while a sprint start (coil + burst) drives the Start state — the ABP plays the
 	 *  start-step clip scrubbed by StartProgress. Rides Server_SetStartStep on the edges. */
@@ -1344,6 +1475,14 @@ protected:
 	/** Engage/release interp speed (1/s). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "1.0", ClampMax = "50.0"))
 	float WallHugInterpSpeed = 10.0f;
+
+	/** Build speed while a wall CATCH is landing (1/s) — the transfer's pre-seed window
+	 *  (progress > 0.8, facing has swung to the far wall) and the first 0.3 s of any
+	 *  attach. Round 14: at the base 10/s the hug was 0 at every catch and took ~0.2 s
+	 *  to build (0 → 26 measured) — paws gripping air for ~40% of a chimney-rhythm
+	 *  cling. Rising moves only; release keeps the gentle base speed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Animation Tuning|Wall Hug", meta = (ClampMin = "1.0", ClampMax = "60.0"))
+	float WallHugCatchInterpSpeed = 25.0f;
 
 	// ── Landing cushion — mesh-Z spring (AnimX pass Step 4) ─────────────
 	/** Master switch for the landing cushion: a damped vertical spring on the mesh's relative Z.

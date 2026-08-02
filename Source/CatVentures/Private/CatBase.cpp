@@ -24,6 +24,17 @@
 #include "DrawDebugHelpers.h"
 #include "Engine/SkinnedAsset.h"
 #include "ReferenceSkeleton.h"
+#include "HAL/IConsoleManager.h"
+
+/** A/B for the wall-transfer crossing (2026-08-02). Toggle live in PIE:
+ *    cat.WallSailHold 1  — (A) hold the spring's FINAL FRAME for the whole crossing
+ *    cat.WallSailHold 0  — (B) play the authored sail settle
+ *  Only the pose differs; trajectory, timing, turn and hug are identical in both,
+ *  so whatever changes on screen is the settle and nothing else. */
+static TAutoConsoleVariable<int32> CVarWallSailHold(
+	TEXT("cat.WallSailHold"), 1,
+	TEXT("Wall transfer: 1 = hold the launch pose across the gap, 0 = play the sail settle."),
+	ECVF_Cheat);
 
 ACatBase::ACatBase()
 {
@@ -299,6 +310,95 @@ void ACatBase::Tick(float DeltaTime)
 		}
 	}
 
+	// ── Wall-kick anim window ──────────────────────────────────────────
+	// Same shape as the mantle hold: armed where DoWallBounce runs (owner + server),
+	// proxies read the replicated flag. The window covers only the clip's PUSH
+	// segment. Expiry during a WALL TRANSFER hands off WITHIN the WallKick state —
+	// push clip → the authored sailing pose (bWallKickArcPhase; round 13, the
+	// crossing no longer borrows Jump_Fall's nose-down apex pose); everywhere else
+	// it hands the SM to Jump_Apex/Jump_Fall as before. The yaw-ease below is
+	// deliberately DECOUPLED from this window — it completes on its own schedule.
+	if (WallKickAnimTimer > 0.0f)
+	{
+		WallKickAnimTimer -= DeltaTime;
+		if (WallKickAnimTimer <= 0.0f)
+		{
+			if (Traversal && Traversal->IsWallTransferring())
+			{
+				bWallKickArcPhase = true;
+			}
+			else
+			{
+				bGoWallKick = false;
+			}
+		}
+	}
+
+	// Kick clip time (round 15) — the ABP's JumpDown EVALUATORS scrub this instead of
+	// free-running: it FREEZES when the arc phase takes over, so the clip's dive-lean
+	// and ~300°/s in-pose twist can never advance through the arc blend (that advance
+	// was the "anim turns the body back while the whole body turns forward" read).
+	// Derived locally on EVERY machine from the two replicated flags — no streaming;
+	// holds its last value after the kick drops so the blend-out evaluates a stable
+	// pose (the mantle scrub-freeze pattern).
+	if (bGoWallKick && !bPrevGoWallKickForClipTime)
+	{
+		WallKickClipTime = 0.0f;
+	}
+	// Advances through the WHOLE kick now (round 20c), not just the push. Both clip
+	// families read this one value and clamp themselves at their own ends:
+	//   springs  ExplicitTime = this            (clamps at 1.2333 = frozen end pose)
+	//   sail     ExplicitTime = this − 1.2333   (clamps at 0 until the handoff)
+	// so the sail always begins on its own frame 0 — which is authored to BE the
+	// spring's last frame (verified 0.000 cm), making the departure continuous by
+	// construction. It used to be a LOOPING player free-running since state entry,
+	// landing on whatever phase it happened to be in (measured 0.067 s into its
+	// loop) with a 55 cm pose jump on the handoff frame.
+	// A/B (round 20d, Sean): `cat.WallSailHold 1` freezes the clip time at the handoff,
+	// so sail time stays at 0 — and since the sail's frame 0 IS the spring's final
+	// frame, that holds the launch pose for the ENTIRE crossing with no settle at all.
+	// `0` plays the authored sail. Nothing else differs between the two, which is what
+	// makes it a clean isolation of the settle.
+	const bool bHoldLaunchPose = bWallKickArcPhase
+		&& CVarWallSailHold.GetValueOnGameThread() != 0;
+	// Advances in CLIP seconds, so it runs at the transfer's play rate: the wall and
+	// flight windows shrink by the same factor, which keeps the scrub and the capsule
+	// on one timeline at any speed (and keeps the ABP's 1.2333 subtract literal — a
+	// clip LENGTH, not a wall-clock duration — correct without edits).
+	const float ClipRate = Traversal ? Traversal->GetWallClipPlayRate() : 1.0f;
+	if (bGoWallKick && !bHoldLaunchPose)
+	{
+		WallKickClipTime = FMath::Min(WallKickClipTime + DeltaTime * ClipRate, 4.0f);
+	}
+	bPrevGoWallKickForClipTime = bGoWallKick;
+
+	// ── Wall-kick yaw sweep ────────────────────────────────────────────
+	// THE single rotation source for the kick turn (round 5), on a SmoothStep profile
+	// (round 6 — constant rate read as robotic): the body accelerates into the turn
+	// and settles onto the launch line. Direction is WallKickTurnDir, never shortest-
+	// path (a chimney 180 sits exactly on the wrap boundary). Runs where DoWallBounce
+	// armed it (owner + server); proxies get the rotation through the CMC. A
+	// re-cling/mantle/landing interrupts via FinishWallKickYawHold and the next
+	// system continues the turn from wherever the sweep got to.
+	// DEFERRED TO DESCENT (round 7, source-frame informed): the reference cat barely
+	// yaw-spins at all — it rises in its push pose, arcs over, and orients to the new
+	// wall on the way DOWN (frames 11–13). The sweep arms at the kick but only
+	// advances once the physics arc is falling; a re-cling that catches before Fall
+	// ever arrives skips it entirely and the attach face-ease does the whole turn at
+	// the grip (the approved round-4 body-whip).
+	if (bWallKickHoldingYaw && JumpPhase == ECatJumpPhase::Fall)
+	{
+		WallKickSweepElapsed += DeltaTime;
+		const float T = FMath::Clamp(WallKickSweepElapsed / WallKickSweepDuration, 0.0f, 1.0f);
+		const float NewYaw = WallKickSweepStartYaw
+			+ WallKickSweepAngle * FMath::SmoothStep(0.0f, 1.0f, T);
+		SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
+		if (T >= 1.0f)
+		{
+			FinishWallKickYawHold(/*bSnapToLaunchYaw=*/false);
+		}
+	}
+
 	// ── PawPrint telemetry — the locally controlled cat's channel set ──
 	// Every pose-driving scalar the diagnostic sessions kept hand-sampling.
 	if (PawPrint && IsLocallyControlled() && GetNetMode() != NM_DedicatedServer)
@@ -334,6 +434,45 @@ void ACatBase::Tick(float DeltaTime)
 		static const FName ChWallHug(TEXT("WallHugSlide")), ChAnimJumpPhase(TEXT("AnimJumpPhase"));
 		PawPrint->SampleChannel(ChWallHug, WallHugForward);
 		PawPrint->SampleChannel(ChAnimJumpPhase, static_cast<float>(AnimJumpPhase));
+		// Kick pose slot: 0 none / 1 push clip / 2 arc (sailing) pose — verifies the
+		// round-13 in-state handoff actually fires at WallTransferPushTime.
+		static const FName ChKickPhase(TEXT("WallKickPhase"));
+		PawPrint->SampleChannel(ChKickPhase, !bGoWallKick ? 0.0f : (bWallKickArcPhase ? 2.0f : 1.0f));
+		// Rendered trajectory pitch through a transfer (round 14 #3) — verifies the
+		// clamp ride early, the level-out, and the pre-catch ease to 0.
+		static const FName ChTransferPitch(TEXT("TransferPitch"));
+		PawPrint->SampleChannel(ChTransferPitch, WallTransferPitchRender);
+
+		// The anim SM's ACTIVE STATE, as an index — the instrument the wall-kick saga
+		// lacked: every "it looked crazy" round guessed at which state was rendering.
+		// Index into the state list below; -1 = unknown/none. (Round 9, 2026-08-01.)
+		static const FName ChLocoState(TEXT("LocomotionState"));
+		if (USkeletalMeshComponent* MeshComp = GetMesh())
+		{
+			if (UAnimInstance* AnimInst = MeshComp->GetAnimInstance())
+			{
+				static int32 LocoMachineIdx = INDEX_NONE;
+				if (LocoMachineIdx == INDEX_NONE)
+				{
+					LocoMachineIdx = AnimInst->GetStateMachineIndex(FName(TEXT("Locomotion_v2")));
+				}
+				if (LocoMachineIdx != INDEX_NONE)
+				{
+					static const FName StateNames[] = {
+						FName(TEXT("A_Cat_Idle_Base")), FName(TEXT("Move")), FName(TEXT("Turn")),
+						FName(TEXT("Skid")), FName(TEXT("Start")), FName(TEXT("Jump_Launch")),
+						FName(TEXT("Jump_Apex")), FName(TEXT("Jump_Fall")), FName(TEXT("Jump_Land")),
+						FName(TEXT("Mantle")), FName(TEXT("WallHang")), FName(TEXT("WallKick")) };
+					const FName Current = AnimInst->GetCurrentStateName(LocoMachineIdx);
+					float StateIdx = -1.0f;
+					for (int32 i = 0; i < UE_ARRAY_COUNT(StateNames); ++i)
+					{
+						if (StateNames[i] == Current) { StateIdx = static_cast<float>(i); break; }
+					}
+					PawPrint->SampleChannel(ChLocoState, StateIdx);
+				}
+			}
+		}
 
 		// Live paw-contact gap while mantling: min distance from any paw to the nearest
 		// surface (short down + forward traces per paw). This is the number Sean's eye
@@ -462,7 +601,8 @@ void ACatBase::Move(const FInputActionValue& Value)
 		// which is what TryDetectMantle reads as its heading while the cat clings
 		// (horizontal velocity is zero there, so input is the only heading source —
 		// this is what lets a cling turn into a mantle when a lip enters band).
-		if (Traversal && (Traversal->IsMantling() || Traversal->IsWallAttached()))
+		if (Traversal && (Traversal->IsMantling() || Traversal->IsWallAttached()
+			|| Traversal->IsWallTransferring()))
 		{
 			return;
 		}
@@ -1218,11 +1358,20 @@ void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FV
 	}
 }
 
-void ACatBase::Server_WallBounce_Implementation(FVector_NetQuantizeNormal WallNormal)
+void ACatBase::Server_WallBounce_Implementation(FVector_NetQuantizeNormal WallNormal, bool bKickRight)
 {
 	if (Traversal)
 	{
-		Traversal->DoWallBounce(WallNormal);
+		Traversal->DoWallBounce(WallNormal, bKickRight);
+	}
+}
+
+void ACatBase::Server_WallTransfer_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
+	FVector_NetQuantizeNormal InTargetNormal, bool bKickRight)
+{
+	if (Traversal)
+	{
+		Traversal->StartWallTransfer(InStart, InTarget, InTargetNormal, bKickRight);
 	}
 }
 
@@ -1246,6 +1395,31 @@ void ACatBase::Server_SetWallAttach_Implementation(bool bActive, FVector_NetQuan
 void ACatBase::SetWallAttachAnimState(bool bActive)
 {
 	bGoWallAttach = bActive;
+}
+
+void ACatBase::FinishWallKickYawHold(bool bSnapToLaunchYaw)
+{
+	if (!bWallKickHoldingYaw)
+	{
+		return;
+	}
+	bWallKickHoldingYaw = false;
+	if (bSnapToLaunchYaw)
+	{
+		SetActorRotation(FRotator(0.0f, WallKickFaceYaw, 0.0f));
+		// The hug slide is an actor-frame mesh offset — the frame just rotated, so any
+		// residual would flip to the far side. By this point it has decayed to a few uu
+		// at most (the kick released it ≥0.2 s ago); zeroing the remainder is invisible.
+		WallHugForward = 0.0f;
+	}
+	if (UCharacterMovementComponent* CMC = GetCharacterMovement())
+	{
+		// Grab-drag owns orient-to-movement while a grab is held — don't fight it.
+		if (!bIsGrabbing)
+		{
+			CMC->bOrientRotationToMovement = true;
+		}
+	}
 }
 
 void ACatBase::SetMantleAnimState(bool bActive, float Progress)
@@ -1837,6 +2011,9 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, bMantleVault, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, MantleLedgeHeight, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoWallAttach, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bGoWallKick, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bWallKickRight, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bWallKickArcPhase, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, TurnRateAnim, COND_SkipOwner);
 	DOREPLIFETIME(ACatBase, bIsGrabbing);
 	DOREPLIFETIME(ACatBase, bIsSprinting);
@@ -2042,6 +2219,14 @@ void ACatBase::UpdateCosmeticInterpolation(float DeltaTime)
 
 	// ── (B) Aim Interp ────────────────────────────────────────────────
 	AlphaAim = FMath::GetMappedRangeValueClamped(FVector2D(0.0f, 800.0f), FVector2D(1.0f, 0.0f), Speed);
+	// Wall states kill the head-look: the aim is a ground-locomotion layer, and at
+	// cling speeds it sat at FULL weight pinning the head toward the camera through
+	// the authored wall poses and the kick's in-pose twist (mannequin read, round 4
+	// 2026-08-01). The interp below fades it, so engage/release are smooth.
+	if (bGoWallAttach || bGoWallKick)
+	{
+		AlphaAim = 0.0f;
+	}
 	AlphaAimInterp = FMath::FInterpTo(AlphaAimInterp, AlphaAim, DeltaTime, 2.0f);
 	AimYawInterp = FMath::FInterpTo(AimYawInterp, AimYawClamped, DeltaTime, 5.0f);
 	AimPitchInterp = FMath::FInterpTo(AimPitchInterp, AimPitchClamped, DeltaTime, 5.0f);
@@ -2323,11 +2508,27 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		// (masked by the fast pull) instead of during the calm walk-out killed the
 		// post-mantle backward mesh glide (Sean's "jitter after topping out").
 		const bool bMantleHugPhase = bGoMantle && MantleProgress < 0.5f;
+		// Wall transfer: keep the paw conform alive through the whole WALL phase (the
+		// push fraction — 0.69 since the round-17 turn-at-the-wall cut): the clip's
+		// paws work the face through the wind-up AND the turning footwork, and the
+		// capsule is still at the held wall. The trace runs along actor-forward,
+		// which the transfer holds facing that wall until the departure flip.
+		const bool bTransferring = Traversal && Traversal->IsWallTransferring();
+		const float TransferP = bTransferring ? Traversal->GetWallTransferProgress() : 0.0f;
+		const bool bTransferHugPhase = bTransferring
+			&& TransferP < Traversal->GetWallTransferPushFrac();
 		// The climb clip's chest/head already ride AT the wall plane, so every uu of
 		// mantle-phase hug is a uu of face interpenetration ("whole front of the cat
 		// clips through the ledge") — cap it hard; the drop tables own paw contact.
 		constexpr float MantleHugCap = 5.0f;
-		if (bEnableWallHug && (bGoWallAttach || bMantleHugPhase) && GetWorld())
+		// NOTE: the trace is SKIPPED during a transfer (see the condition below). The
+		// actor yaws through the authored turn, so actor-forward stops pointing at the
+		// wall, the trace misses, and the hug collapsed 22.5 -> 0 in ONE frame at 87%
+		// of the wall phase (measured 2026-08-02). A transfer's capsule rides a known
+		// authored curve, so the table owns the hug outright. GENERAL RULE, third time
+		// this family has bitten: never aim a probe with a quantity the same move is
+		// rotating (cf. the fence axis detector, the mantle-vs-cling heading).
+		if (bEnableWallHug && (bGoWallAttach || bMantleHugPhase) && !bTransferHugPhase && GetWorld())
 		{
 			const FVector Start = GetActorLocation();
 			const FVector Fwd   = GetActorForwardVector();
@@ -2342,6 +2543,70 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 				                         0.0f, bMantleHugPhase ? MantleHugCap : WallHugMaxSlide);
 			}
 		}
+		// Kick-press growth cap (round 15): while a kick's push plays on the wall the
+		// paws are LEAVING it — the live trace kept growing the hug through the peel
+		// (measured 35 vs the ~30 settled cling) and pressed the pose through the
+		// face. Latch the at-press value: the hug may decay during the push, never grow.
+		if (bGoWallKick && (bGoWallAttach || bTransferHugPhase))
+		{
+			if (!bKickPressHugValid)
+			{
+				KickPressHug = WallHugForward;
+				bKickPressHugValid = true;
+			}
+			HugTarget = FMath::Min(HugTarget, KickPressHug);
+			// Turn backout — MEASURED off the authored motion (round 19b; replaces
+			// round 18's guessed 0.36→0.56 window, which backed the mesh off before
+			// the turn was even visible and floated all four paws). Composing the
+			// clip's root curve with our retarget and sweeping every body bone: the
+			// whole coil, pull-up and first half of the turn sit 4–11 uu BEHIND the
+			// grip plane (full hug is correct and the paws are genuinely planted),
+			// then the rear swings 16→27 uu past it over the last fifth as the body
+			// comes around — in the source that space is open (it dismounts over a
+			// wall TOP); in a chimney it is solid. So the cap is flat until 0.8 and
+			// then rides the measured overshoot down. Snap-tracked, not interped:
+			// a scrub-driven conform must sit exactly on its table (the skid lesson).
+			if (bTransferring)
+			{
+				// Round 20 (re-measured for the turn+spring clip): through the coil and
+				// pull-up the torso rides EXACTLY on the grip plane — full hug, real
+				// contact. Then the authored turn swings body AND hind paws 20–26 uu
+				// past where our wall is (the source turns over a wall TOP; a chimney
+				// face keeps going), so the cap drops to put the paws back ON the face
+				// rather than inside it — the opposite of round 18, where backing off
+				// floated paws that were already correctly placed. The spring's own
+				// across-motion takes over from ~0.9 and the hug ends at 0.
+				static constexpr float TurnHugCap[11] =
+					{ 30.0f, 30.0f, 30.0f, 30.0f, 30.0f, 20.0f, 6.0f, 7.0f, 8.0f, 4.0f, 0.0f };
+				const float WallU = FMath::Clamp(
+					TransferP / FMath::Max(Traversal->GetWallTransferPushFrac(), 0.01f), 0.0f, 1.0f);
+				const float S = WallU * 10.0f;
+				const int32 Seg = FMath::Min(FMath::FloorToInt32(S), 9);
+				const float U = S - Seg;
+				const float K0 = TurnHugCap[FMath::Max(Seg - 1, 0)], K1 = TurnHugCap[Seg];
+				const float K2 = TurnHugCap[Seg + 1], K3 = TurnHugCap[FMath::Min(Seg + 2, 10)];
+				const float Cap = 0.5f * ((2.f*K1) + (-K0+K2)*U + (2.f*K0-5.f*K1+4.f*K2-K3)*U*U
+					+ (-K0+3.f*K1-3.f*K2+K3)*U*U*U);
+				// BASE = the latched press hug, NOT HugTarget. The trace is disabled during
+				// a transfer (above), so HugTarget is 0 here and min(0, Cap) pinned the hug
+				// at ZERO for the whole wall phase — every paw floated ~31 uu off the face
+				// for the entire move (PawPrint: WallHugSlide flat 0.0 until the catch).
+				// Self-inflicted by the trace fix earlier the same day; the cap was only
+				// ever meant to LIMIT the latched value, never to become the value.
+				HugTarget = FMath::Min(KickPressHug, Cap);
+				WallHugForward = HugTarget;
+			}
+		}
+		else if (!bGoWallKick)
+		{
+			bKickPressHugValid = false;
+		}
+		// (Round 16: NO hug during the flight — round 15's pre-seed ramp slid a still-
+		// LEVEL body 25 uu "forward", which for a horizontal cat is INTO the wall
+		// face (the front-half burial, hug 25.4 at pitch −2 measured at the catch).
+		// The full 30 is only correct for the VERTICAL cling pose, so the hug now
+		// builds AT the catch through the fast attach window below — 25/s reaches
+		// ~90% inside the 0.15 s cling crossfade, paws and pose land together.)
 		// Corner-flap guard: during a mantle the wall distance is fixed by the takeover,
 		// so LATCH the first computed hug and hold it — at a face's lateral edge the live
 		// trace alternately hits and misses across the corner as the body moves, and the
@@ -2361,8 +2626,20 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 		// Downward hug moves during a mantle ease at HALF speed: the cling→mantle handoff
 		// sheds the cling's full hug (~14) down to the mantle cap (5), and at full interp
 		// that 9 uu pull-back reads as a hitch right at the takeover start (2026-07-31).
-		const float HugInterp = (bGoMantle && HugTarget < WallHugForward)
-			? WallHugInterpSpeed * 0.5f : WallHugInterpSpeed;
+		// Rising moves in a fresh grip's first beats build fast (round 14; transfer-
+		// tail half removed in round 16 with the pre-seed) — this window is what
+		// syncs the catch hug against the cling crossfade. Release keeps base speed.
+		const bool bCatchWindow =
+			bGoWallAttach && Traversal && Traversal->GetWallAttachElapsed() < 0.3f;
+		float HugInterp = WallHugInterpSpeed;
+		if (bGoMantle && HugTarget < WallHugForward)
+		{
+			HugInterp = WallHugInterpSpeed * 0.5f;
+		}
+		else if (bCatchWindow && HugTarget > WallHugForward)
+		{
+			HugInterp = WallHugCatchInterpSpeed;
+		}
 		WallHugForward = FMath::FInterpTo(WallHugForward, HugTarget, DeltaTime, HugInterp);
 		if (HugTarget == 0.0f && FMath::Abs(WallHugForward) < 0.01f)
 		{
@@ -2528,11 +2805,21 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	// (Sean's "stuck downward pose", snapshot-confirmed 2026-07-06: SpineInclineF 0.978
 	// vs applied pitch 19.55). Paw-floor-derived pitch cannot disagree with the stance.
 
+	// Wall-transfer trajectory pitch (round 14, #3): ease toward the component's
+	// weighted tangent target. Shares the MeshSlopePitch compose slot — both are
+	// "pitch the silhouette to the surface/trajectory" terms and are never nonzero
+	// together (slope pitch levels out fast while airborne).
+	const float TransferPitchTarget = Traversal ? Traversal->GetWallTransferPitchTarget() : 0.0f;
+	// 25/s (round 15 — was 10): the analytic target is already smooth, so the interp
+	// only exists as the abort path; at 10 it ate a third of the peak (26.6 vs 32).
+	WallTransferPitchRender = FMath::FInterpTo(WallTransferPitchRender, TransferPitchTarget, DeltaTime, 25.0f);
+
 	// Single transform write; skip once fully at rest (avoids per-tick transform writes).
 	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ + TurnStanceDropZ;
 	FVector Rel = MeshComp->GetRelativeLocation();
 	if (FMath::Abs(TotalOffset) < 0.01f && FMath::Abs(MeshSlopePitch) < 0.05f
 		&& FMath::Abs(WallHugForward) < 0.01f
+		&& FMath::Abs(WallTransferPitchRender) < 0.05f
 		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f)
 		&& FMath::IsNearlyEqual(Rel.X, MeshBaseRelLocX, 0.01f))
 	{
@@ -2542,7 +2829,7 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	Rel.X = MeshBaseRelLocX + WallHugForward;   // wall-hug: actor-forward slide toward the wall
 	// Slope pitch is about the ACTOR's lateral axis — compose it in parent space ahead of
 	// the rig's authored relative rotation (the −90° yaw), then write both in one call.
-	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
+	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch + WallTransferPitchRender, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
 	MeshComp->SetRelativeLocationAndRotation(Rel, RelQuat.Rotator());
 }
 
@@ -3101,6 +3388,14 @@ void ACatBase::Landed(const FHitResult& Hit)
 	FallTransitionHoldTimer = 0.0f;
 	Super::Landed(Hit);
 
+	// A landing ends the kick anim window — the SM funnels WallKick → Jump_Land.
+	// No snap: the yaw stays wherever the ease got to, and grounded
+	// orient-to-movement walks the remainder off naturally.
+	FinishWallKickYawHold(/*bSnapToLaunchYaw=*/false);
+	bGoWallKick = false;
+	bWallKickArcPhase = false;
+	WallKickAnimTimer = 0.0f;
+
 	const float ImpactZ = FMath::Abs(GetCharacterMovement()->Velocity.Z);
 	LandImpactIntensity = FMath::Clamp(ImpactZ / HardLandSpeedThreshold, 0.0f, 1.0f);
 	LandRecoveryTimer = LandRecoveryDuration;
@@ -3315,6 +3610,19 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		}
 		const float SpreadAlpha = FMath::Clamp((HeightAboveGround - GatherHeight) / (SpreadHeight - GatherHeight), 0.0f, 1.0f);
 		NormalizedFallSpeed = 1.0f - 0.5f * SpreadAlpha;
+
+		// Wall transfer override (round 11, 2026-08-01): a chimney crossing is a
+		// CONTROLLED move, not a fall — but the phase pins at Fall through it, this
+		// probe kept running, and mid-chimney the distant floor drove the feed to the
+		// Fall_low DIVE SPLAY for the whole crossing (Sean: "jump arch pose weirdly
+		// pointed downwards"), whose head-down pose then pitched up into the vertical
+		// cling at the catch in 0.15 s — the "crazy flip after it attaches". The cat
+		// crosses GATHERED, like any deliberate hop. (Proxies don't know the transfer
+		// state — cosmetic MP residual, parked with the other proxy-transfer polish.)
+		if (Traversal && Traversal->IsWallTransferring())
+		{
+			NormalizedFallSpeed = 1.0f;
+		}
 	}
 
 	switch (JumpPhase)

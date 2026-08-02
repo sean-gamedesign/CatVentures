@@ -20,6 +20,13 @@ enum class ECatTraversalState : uint8
 	 *  are the same state machine with different entry parameters and the same exits —
 	 *  collapsing them was the 2026-07-24 design call. */
 	WallAttach,
+	/** Wall-to-wall chimney transfer (round 8 of the kick saga, 2026-08-01): a cling
+	 *  kick with an opposite wall in range becomes a TAKEOVER on the JumpDown clip's
+	 *  own timeline — the capsule flies the clip's root arc (up the held wall, peel
+	 *  over, cross late) over the clip's real duration while the full clip plays, and
+	 *  ends in a cling on the far wall. Exists because seven procedural rounds proved
+	 *  1.07 s of authored motion cannot fit a 0.30 s ballistic crossing. */
+	WallTransfer,
 };
 
 /** Why an attach ended. Logged per release — the cling has several silent exits and
@@ -212,6 +219,138 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallBounce", meta = (ClampMin = "0.0", ClampMax = "8.0"))
 	float WallBounceReboundLateralFriction = 0.0f;
 
+	/** Seconds a CLING kick holds the grip after the jump press before the launch
+	 *  fires — the standstill-jump anticipation doctrine applied to the wall. The
+	 *  JumpDown clip spends its first ~0.13 s loading and pushing ON the wall; an
+	 *  instant launch had the paws leaving on frame 1 while the body language said
+	 *  "still pushing" — push-off in mid-air, Sean's "mechanical" (2026-07-31, the
+	 *  mantle timeline lesson in kick form). Raw mid-air bounces stay instant: no
+	 *  grip to hold, and latency there reads as lag. 0 disables (instant kicks).
+	 *  0.13 → 0.22 round 6: the clip's load bottoms ~0.2 and pushes off ~0.22 — at
+	 *  0.13 the launch fired mid-load and the spring frames played in mid-air. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallBounce", meta = (ClampMin = "0.0", ClampMax = "0.4"))
+	float WallBounceAnticipation = 0.22f;
+
+	// ── Wall Transfer (chimney crossing as a takeover) ──────────────────
+	// The cling-kick crossing rides the clip's timeline, not ballistics: capsule on
+	// the authored root arc, full clip playing, cling on the far wall at the seam.
+	// Solitary-wall cling kicks (no opposite wall in range) keep the anticipation +
+	// physics-launch path; raw mid-air bounces are untouched.
+
+	/** Master switch — off restores the pure physics kick for all cling kicks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer")
+	bool bEnableWallTransfer = true;
+
+	/** Max face-to-face gap (uu) the transfer will cross. Beyond it a cling kick is a
+	 *  plain physics launch. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "60.0", ClampMax = "600.0"))
+	float WallTransferMaxGap = 250.0f;
+
+	// (Round 20c: WallTransferClimb is GONE. The leap is an authored constant — see
+	// the CatTransferArc namespace in the .cpp — so the climb is DERIVED from the gap
+	// rather than dialled in, and the two can no longer disagree. Each transfer logs
+	// its gap → climb pairing as the level-blocking spec.)
+
+	// (Round 20b: WallTransferLaunchAngleDeg is GONE, and so are the arc-hump table
+	// and WallTransferArcHeight before it — trap-knob doctrine. The launch is no
+	// longer a number anyone picks: the spring clip's own push sets the exit
+	// velocity, and the flight parabola starts on that exact vector, so the arc IS
+	// the launch by construction. A knob here could only ever contradict the
+	// animation. See DriveWallTransfer.)
+
+	/** Body pitch (deg, nose-up) the catch rear-up sweeps to over the last ~12% of the
+	 *  crossing — the chest thrown up into the grab, so the level/descending sail
+	 *  rotates toward the vertical cling BEFORE the pose crossfade swaps them.
+	 *  28 from 0.88 since round 17 (the 20-from-0.93 first pass rendered only ~6° —
+	 *  the sweep outran its 25/s interp). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "45.0"))
+	float WallTransferCatchPitchDeg = 28.0f;
+
+	/** Seconds for the whole crossing = WallTransferPushTime (the authored wall
+	 *  phase, played 1:1 by the WallKickClipTime scrub) + the flight. 1.13 keeps
+	 *  round 17's approved ~0.33 s pounce. Change it together with the push time
+	 *  or the flight tempo moves. */
+	/** Playback rate for the whole crossing — THE speed dial (1.5 = half again as
+	 *  fast, Sean 2026-08-02). Everything else is derived from it and the clip
+	 *  lengths below, so the anim scrub and the capsule timeline cannot drift apart:
+	 *  the clip time advances at this rate while the wall/flight windows shrink by
+	 *  it, which is the same total in CLIP seconds either way. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.25", ClampMax = "4.0"))
+	float WallTransferPlayRate = 1.5f;
+
+	/** The asset durations, in seconds of ANIMATION. These are facts about
+	 *  A_Cat_Wall_Spring_* / A_Cat_Wall_Sail_*, not tuning — re-author the clips and
+	 *  these follow (as does the subtract literal in the ABP's WallKick graph). */
+	static constexpr float kSpringClipLen = 1.2333f;
+	static constexpr float kSailClipLen   = 0.4333f;
+
+	float GetWallTransferPushTime() const
+	{
+		return kSpringClipLen / FMath::Max(WallTransferPlayRate, 0.1f);
+	}
+	float GetWallTransferDuration() const
+	{
+		return (kSpringClipLen + kSailClipLen) / FMath::Max(WallTransferPlayRate, 0.1f);
+	}
+	/** Rate the ABP evaluators' scrub must advance at (read by ACatBase::Tick). */
+	float GetWallClipPlayRate() const { return FMath::Max(WallTransferPlayRate, 0.1f); }
+
+	/** Capsule stand-off from the target face at the catch (uu). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "10.0", ClampMax = "60.0"))
+	float WallTransferStandOff = 25.0f;
+
+	// (WallTransferMidClearance is GONE, round 15 — the ballistic linear lateral
+	// departs the held wall at push-off, so a clearance floor has nothing to do and
+	// a knob whose only correct value is "redundant" is a trap for a later session.)
+
+	// (WallTransferPushTime and WallTransferDuration are GONE as knobs — they were
+	//  always "the clip length" and "clip + sail", so storing them separately from
+	//  the assets was a desync waiting to happen. Both are now derived above from
+	//  the clip lengths ÷ WallTransferPlayRate.)
+
+	/** Scale from the crossing trajectory's tangent angle to rendered body pitch —
+	 *  round 14 (#3): the mesh pitches toward where the capsule is actually
+	 *  travelling, so rise → level → dip falls out of the curve geometry instead of
+	 *  a hand-keyed envelope (and it stays correct if the gap/climb knobs change).
+	 *  1.0 since round 15 (analytic tangent on the ballistic curve: ~30° at
+	 *  push-off declining smoothly — 0.6 on top of that undersold the arc). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "1.5"))
+	float WallTransferPitchScale = 1.0f;
+
+	/** Clamp (deg) on the trajectory pitch above. Net early attitude = this + the
+	 *  clip's authored +10, ~+42 at ship values. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "60.0"))
+	float WallTransferPitchMax = 32.0f;
+
+	/** Begin the transfer takeover (owner on detection; server via the pawn RPC).
+	 *  Deterministic from the same params on both machines — the mantle model. */
+	void StartWallTransfer(const FVector& InStart, const FVector& InTarget,
+		const FVector& InTargetNormal, bool bKickRight);
+
+	bool IsWallTransferring() const { return TraversalState == ECatTraversalState::WallTransfer; }
+
+	/** 0→1 along the crossing — read by the wall-hug (§B3) to keep paw conform alive
+	 *  through the spring-up phase while the cat is still at the held wall. */
+	float GetWallTransferProgress() const;
+
+	/** Fraction of the crossing spent ON the wall (push time ÷ duration) — the §B3
+	 *  hug gate reads this so the paw conform lives through the whole wall phase
+	 *  regardless of how the push window is tuned. */
+	float GetWallTransferPushFrac() const
+	{
+		return FMath::Clamp(GetWallTransferPushTime() / FMath::Max(GetWallTransferDuration(), 0.1f), 0.1f, 0.85f);
+	}
+
+	/** Weighted trajectory-pitch target (deg, nose-up positive) for the mesh during a
+	 *  crossing — 0 outside the arc window (eases in with the arc-pose blend, out just
+	 *  before the catch so the cling rear-up starts from level). ACatBase interps
+	 *  toward it in the §C compose; the interp is also the abort path. */
+	float GetWallTransferPitchTarget() const;
+
+	/** Seconds since the current wall attach began (0 when not attached) — read by the
+	 *  §B3 catch window so a fresh grip builds its hug at catch speed. */
+	float GetWallAttachElapsed() const { return TraversalState == ECatTraversalState::WallAttach ? AttachElapsed : 0.0f; }
+
 	/** True while the post-kick rebound window is running (read by ACatBase::Move). */
 	bool IsRebounding() const { return WallBounceReboundTimer > 0.0f; }
 
@@ -292,6 +431,15 @@ public:
 	 *  kick where velocity has not yet flipped away from the wall. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float WallAttachCooldown = 0.12f;
+
+	/** Exponential ease-out speed (1/s) of the body turn onto the wall face while
+	 *  attached — wrap-safe FInterpTo on the signed yaw delta. Ease-OUT (not a
+	 *  constant rate, round 6 — that read robotic): a re-cling out of a kick arrives
+	 *  already rotating from the kick sweep, and this settles the remainder onto the
+	 *  face instead of re-accelerating. Ordinary approaches arrive already facing the
+	 *  wall, so it is a near no-op there. 12 converges a large angle in ~0.25 s. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallAttach", meta = (ClampMin = "1.0", ClampMax = "50.0"))
+	float WallAttachFaceInterpSpeed = 12.0f;
 
 	// ── Vertical Scramble (verb 3) ──────────────────────────────────────
 	// Run at a tall climbable wall fast enough and the cat scrambles UP it: the same
@@ -467,8 +615,9 @@ public:
 	bool TryWallBounce();
 
 	/** Applies the bounce impulse. Runs on the owner (predicted) and on the server
-	 *  (RPC mirror) from the same wall normal, so both copies launch identically. */
-	void DoWallBounce(const FVector& WallNormal);
+	 *  (RPC mirror) from the same wall normal + kick side, so both copies launch
+	 *  identically and pick the same twist clip. */
+	void DoWallBounce(const FVector& WallNormal, bool bKickRight);
 
 private:
 	/** Airborne ledge detection for the locally controlled cat; starts the mantle on a hit. */
@@ -537,6 +686,28 @@ private:
 	/** Advance the takeover curve on owner and server alike. */
 	void DriveMantle(float DeltaTime);
 
+	/** Advance the wall-transfer curve on owner and server alike. */
+	void DriveWallTransfer(float DeltaTime);
+
+	/** Restore the CMC and either catch the far wall (completed) or drop to falling. */
+	void EndWallTransfer(bool bCompleted);
+
+	FVector TransferStart   = FVector::ZeroVector;
+	FVector TransferTarget  = FVector::ZeroVector;
+	FVector TransferNormalB = FVector::ZeroVector;   // far wall's outward normal
+	float   TransferElapsed = 0.0f;
+	float   TransferPitchRaw = 0.0f;                 // analytic tangent angle (deg, nose-up +)
+
+	/** Yaw swing across the crossing (round 10): the clip contributes only its PUSH
+	 *  segment — its back half is dismount acrobatics (a ~75° head-down peel-and-dive
+	 *  authored for arcing over a wall's TOP edge) that rendered as a mid-air
+	 *  somersault on a rising chimney crossing. The visible turn is instead the actor
+	 *  yaw sweeping StartYaw → StartYaw+SwingAngle on a SmoothStep of transfer
+	 *  progress, over the normal gathered airborne pose. Signed along the chosen
+	 *  shoulder, never shortest-path. */
+	float TransferStartYaw   = 0.0f;
+	float TransferSwingAngle = 0.0f;
+
 	/** Restore the CMC and clear state. bCompleted = reached the target (vs external abort). */
 	void EndMantle(bool bCompleted);
 
@@ -577,6 +748,18 @@ private:
 	/** Post-kick rebound-protection window; see WallBounceReboundTime. */
 	float WallBounceReboundTimer = 0.0f;
 	FVector WallBounceReboundDir = FVector::ZeroVector;
+
+	/** Pending cling-kick (owner only): armed at the jump press while attached, fires
+	 *  DoWallBounce + the RPC when it expires (WallBounceAnticipation later). The clip
+	 *  starts at the press; the grip holds through the load-and-push beat. Cancelled if
+	 *  a grab, mantle or landing ends the attach first. */
+	float   PendingKickTimer  = 0.0f;
+	FVector PendingKickNormal = FVector::ZeroVector;
+	bool    bPendingKickRight = false;
+
+	/** Shoulder the last kick twisted over — neutral-input kicks alternate from this,
+	 *  which is what gives a chimney climb its natural L/R rhythm. */
+	bool bLastKickRight = false;
 
 	/** Restores the CMC's lateral air friction when the rebound window closes. */
 	void EndReboundWindow();
