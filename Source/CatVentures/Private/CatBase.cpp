@@ -26,16 +26,6 @@
 #include "ReferenceSkeleton.h"
 #include "HAL/IConsoleManager.h"
 
-/** A/B for the wall-transfer crossing (2026-08-02). Toggle live in PIE:
- *    cat.WallSailHold 1  — (A) hold the spring's FINAL FRAME for the whole crossing
- *    cat.WallSailHold 0  — (B) play the authored sail settle
- *  Only the pose differs; trajectory, timing, turn and hug are identical in both,
- *  so whatever changes on screen is the settle and nothing else. */
-static TAutoConsoleVariable<int32> CVarWallSailHold(
-	TEXT("cat.WallSailHold"), 1,
-	TEXT("Wall transfer: 1 = hold the launch pose across the gap, 0 = play the sail settle."),
-	ECVF_Cheat);
-
 ACatBase::ACatBase()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -354,13 +344,12 @@ void ACatBase::Tick(float DeltaTime)
 	// construction. It used to be a LOOPING player free-running since state entry,
 	// landing on whatever phase it happened to be in (measured 0.067 s into its
 	// loop) with a 55 cm pose jump on the handoff frame.
-	// A/B (round 20d, Sean): `cat.WallSailHold 1` freezes the clip time at the handoff,
-	// so sail time stays at 0 — and since the sail's frame 0 IS the spring's final
-	// frame, that holds the launch pose for the ENTIRE crossing with no settle at all.
-	// `0` plays the authored sail. Nothing else differs between the two, which is what
-	// makes it a clean isolation of the settle.
-	const bool bHoldLaunchPose = bWallKickArcPhase
-		&& CVarWallSailHold.GetValueOnGameThread() != 0;
+	// The crossing HOLDS the launch pose (Sean's A/B verdict over 26 crossings): the
+	// clip time freezes at the handoff, so sail time stays at 0 — and since the sail's
+	// frame 0 IS the spring's final frame, the cat crosses in the pose it launched in.
+	// The sail clip's later frames are unused for now; they are the settle variant, one
+	// line away if a polish round wants it.
+	const bool bHoldLaunchPose = bWallKickArcPhase;
 	// Advances in CLIP seconds, so it runs at the transfer's play rate: the wall and
 	// flight windows shrink by the same factor, which keeps the scrub and the capsule
 	// on one timeline at any speed (and keeps the ABP's 1.2333 subtract literal — a
@@ -440,8 +429,6 @@ void ACatBase::Tick(float DeltaTime)
 		PawPrint->SampleChannel(ChKickPhase, !bGoWallKick ? 0.0f : (bWallKickArcPhase ? 2.0f : 1.0f));
 		// Rendered trajectory pitch through a transfer (round 14 #3) — verifies the
 		// clamp ride early, the level-out, and the pre-catch ease to 0.
-		static const FName ChTransferPitch(TEXT("TransferPitch"));
-		PawPrint->SampleChannel(ChTransferPitch, WallTransferPitchRender);
 
 		// The anim SM's ACTIVE STATE, as an index — the instrument the wall-kick saga
 		// lacked: every "it looked crazy" round guessed at which state was rendering.
@@ -2809,17 +2796,15 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	// weighted tangent target. Shares the MeshSlopePitch compose slot — both are
 	// "pitch the silhouette to the surface/trajectory" terms and are never nonzero
 	// together (slope pitch levels out fast while airborne).
-	const float TransferPitchTarget = Traversal ? Traversal->GetWallTransferPitchTarget() : 0.0f;
+
 	// 25/s (round 15 — was 10): the analytic target is already smooth, so the interp
 	// only exists as the abort path; at 10 it ate a third of the peak (26.6 vs 32).
-	WallTransferPitchRender = FMath::FInterpTo(WallTransferPitchRender, TransferPitchTarget, DeltaTime, 25.0f);
 
 	// Single transform write; skip once fully at rest (avoids per-tick transform writes).
 	const float TotalOffset = MeshCushionOffset + MeshGroundConformZ + TurnStanceDropZ;
 	FVector Rel = MeshComp->GetRelativeLocation();
 	if (FMath::Abs(TotalOffset) < 0.01f && FMath::Abs(MeshSlopePitch) < 0.05f
 		&& FMath::Abs(WallHugForward) < 0.01f
-		&& FMath::Abs(WallTransferPitchRender) < 0.05f
 		&& FMath::IsNearlyEqual(Rel.Z, MeshCushionBaseZ, 0.01f)
 		&& FMath::IsNearlyEqual(Rel.X, MeshBaseRelLocX, 0.01f))
 	{
@@ -2829,7 +2814,7 @@ void ACatBase::UpdateLandCushion(float DeltaTime)
 	Rel.X = MeshBaseRelLocX + WallHugForward;   // wall-hug: actor-forward slide toward the wall
 	// Slope pitch is about the ACTOR's lateral axis — compose it in parent space ahead of
 	// the rig's authored relative rotation (the −90° yaw), then write both in one call.
-	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch + WallTransferPitchRender, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
+	const FQuat RelQuat = FQuat(FRotator(MeshSlopePitch, 0.0f, 0.0f)) * FQuat(MeshBaseRelRot);
 	MeshComp->SetRelativeLocationAndRotation(Rel, RelQuat.Rotator());
 }
 

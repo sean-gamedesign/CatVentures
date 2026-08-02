@@ -694,7 +694,6 @@ protected:
 	 *  the traversal component's weighted target in the §C compose; the interp is also
 	 *  the abort path (a mid-arc abort drops the target to 0 in one frame and the
 	 *  interp walks the mesh back level instead of snapping). Cosmetic, local. */
-	float WallTransferPitchRender = 0.0f;
 	float MeshBaseRelLocX = 0.0f;
 
 	/** Mantle-phase hug latch (−1 = unset): the hug value is frozen at mantle start so a

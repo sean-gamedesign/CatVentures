@@ -11,7 +11,15 @@
 Binaries/
 DerivedDataCache/
 Intermediate/
-Saved/
+Saved/*
+# ...except the Blender authoring file: it is the SOURCE for every clip we author
+# (the wall spring/sail and the M5 batch). The .uassets are committed, but losing
+# this means redoing the pose surgery from scratch rather than just re-exporting.
+# NOTE the `Saved/*` form above: an ignored DIRECTORY (`Saved/`) is never descended
+# into, so a negation for a file inside it can never match.
+!Saved/BlenderExchange/
+Saved/BlenderExchange/*
+!Saved/BlenderExchange/M5_authoring.blend
 Build/
 Script/
 

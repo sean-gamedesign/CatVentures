@@ -5,17 +5,6 @@
 #include "PawPrintSubsystem.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
-#include "HAL/IConsoleManager.h"
-
-/** Second axis of the crossing A/B (2026-08-02): whether the mesh pitches along the
- *  trajectory at all. 0 leaves the clip's own attitude untouched for the whole
- *  transfer — the "version C" read. Combine with cat.WallSailHold for the matrix. */
-// Defaults to 0 since 2026-08-02: Sean A/B'd A vs C vs D across 26 crossings and
-// picked C (pose HELD, no procedural pitch), so C is what a fresh launch gives.
-static TAutoConsoleVariable<int32> CVarTransferPitch(
-	TEXT("cat.WallTransferPitch"), 0,
-	TEXT("Wall transfer: 1 = pitch the mesh along the trajectory, 0 = no procedural pitch."),
-	ECVF_Cheat);
 
 UCatTraversalComponent::UCatTraversalComponent()
 {
@@ -1225,41 +1214,14 @@ float UCatTraversalComponent::GetWallTransferProgress() const
 		: 0.0f;
 }
 
-float UCatTraversalComponent::GetWallTransferPitchTarget() const
-{
-	if (!IsWallTransferring() || CVarTransferPitch.GetValueOnGameThread() == 0)
-	{
-		return 0.0f;
-	}
-	const float P = GetWallTransferProgress();
-	// In slightly AFTER the arc-pose blend starts (round 15: pitching while the hug
-	// still holds the mesh at the wall swept the head's ~40 uu lever arm through the
-	// face). NO out-window since round 16 — the nose follows the tangent DOWN past
-	// the apex (round 15 zeroed it by 0.99 and the cat sat "locked in the upward
-	// pose" through the descent); the last ~7% sweeps to the CATCH REAR-UP instead
-	// (chest thrown up into the grab), which also rotates the body toward the
-	// vertical cling before the pose crossfade swaps them.
-	const float PushFrac = GetWallTransferPushFrac();
-	// ZERO on the wall (round 20d): the launch attitude is AUTHORED INTO THE CLIP now
-	// — the spring rears to LaunchDeg by its last frame and the sail holds it — so the
-	// clip owns the pose on the wall and through the departure. Adding a procedural
-	// pitch there too would double-count it (55 + 55 = past vertical).
-	if (P < PushFrac)
-	{
-		return 0.0f;
-	}
-	// In flight the procedural layer supplies only the CHANGE from the launch line, so
-	// the body tracks the arc over as it flattens and dips. At the departure frame the
-	// tangent IS LaunchDeg, so this is exactly 0 — continuous with the wall phase by
-	// construction, not by a blend.
-	constexpr float Launch = CatTransferArc::LaunchDeg;
-	const float Tangent = FMath::Clamp(TransferPitchRaw * WallTransferPitchScale,
-	                                   -WallTransferPitchMax + Launch, WallTransferPitchMax + Launch);
-	// Rear-up into the grab (also expressed relative to the authored launch).
-	const float Aimed = FMath::Lerp(Tangent, WallTransferCatchPitchDeg,
-	                                FMath::SmoothStep(0.88f, 0.98f, P));
-	return Aimed - Launch;
-}
+// (GetWallTransferPitchTarget and the whole procedural transfer-pitch layer are GONE.
+//  Sean A/B'd it live over 26 crossings — held pose with NO trajectory pitch won, and
+//  a knob whose chosen value is "off" is a trap for a later session. The launch
+//  attitude is authored into the clip instead, which is why the layer became
+//  redundant: rotating the mesh to the tangent AND baking the tangent into the pose
+//  are two owners of one quantity, and the whole saga is a catalogue of what that
+//  costs. If a future round wants the body to track the arc over, resurrect it from
+//  git — but author the clip flat first, or it double-counts.)
 
 void UCatTraversalComponent::StartWallTransfer(const FVector& InStart, const FVector& InTarget,
 	const FVector& InTargetNormal, bool bKickRight)
@@ -1280,7 +1242,6 @@ void UCatTraversalComponent::StartWallTransfer(const FVector& InStart, const FVe
 	TransferTarget  = InTarget;
 	TransferNormalB = InTargetNormal;
 	TransferElapsed = 0.0f;
-	TransferPitchRaw = 0.0f;
 
 	// The single CMC takeover point (the mantle doctrine): Flying kills gravity
 	// while the curve owns the capsule; the restore lives in EndWallTransfer only.
@@ -1388,26 +1349,7 @@ void UCatTraversalComponent::DriveWallTransfer(float DeltaTime)
 		: Arc.ZEnd + Arc.B * LatU + Arc.C * LatU * LatU + Arc.D * LatU * LatU * LatU);
 	Cat->SetActorLocation(Pos);
 
-	// Trajectory tangent — analytic from the same cubic driving the capsule, so pose
-	// and path cannot disagree. It runs during the PUSH too (round 20c): the spring
-	// IS the launch, so the mesh reaches launch attitude as the legs extend instead
-	// of stepping 0 → 45° on the departure frame. During the push the slope is the
-	// push's own (rise ÷ across), which by construction converges on the launch line.
-	if (P < PushFrac)
-	{
-		constexpr float dU = 0.02f;
-		const float U1 = FMath::Min(WallU + dU, 1.0f), U0 = FMath::Max(WallU - dU, 0.0f);
-		const float dZ = (Sample(RootZ, U1) + Arc.SpringZ * Sample(SpringNorm, U1))
-		               - (Sample(RootZ, U0) + Arc.SpringZ * Sample(SpringNorm, U0));
-		const float dX = (Sample(Sway, U1) + Arc.SpringAcross * Sample(SpringNorm, U1))
-		               - (Sample(Sway, U0) + Arc.SpringAcross * Sample(SpringNorm, U0));
-		TransferPitchRaw = (dX > 0.01f) ? FMath::RadiansToDegrees(FMath::Atan2(dZ, dX)) : 0.0f;
-	}
-	else
-	{
-		const float Slope = Arc.B + 2.0f * Arc.C * LatU + 3.0f * Arc.D * LatU * LatU;
-		TransferPitchRaw = FMath::RadiansToDegrees(FMath::Atan2(Slope, Arc.HorizSpan));
-	}
+	// (No trajectory tangent any more — nothing consumes it. The pose owns attitude.)
 
 	// The body turn — the ACTOR follows the clip's own root yaw (round 19b). The
 	// rotation is authored: it is flat for the first 60% (coil + pull-up, no turn
@@ -1440,13 +1382,6 @@ void UCatTraversalComponent::DriveWallTransfer(float DeltaTime)
 	// future table edit breaks that, this line says so instead of the eye having to.
 	if (TransferElapsed <= DeltaTime * 1.5f)
 	{
-		static IConsoleVariable* CVarHold = IConsoleManager::Get().FindConsoleVariable(TEXT("cat.WallSailHold"));
-		const bool bHold  = CVarHold && CVarHold->GetInt() != 0;
-		const bool bPitch = CVarTransferPitch.GetValueOnGameThread() != 0;
-		UE_LOG(LogCatVentures, Log, TEXT("[%s] Transfer mode — pose %s, pitch %s  [%s]"),
-			*Cat->GetName(),
-			bHold ? TEXT("HELD") : TEXT("sail settle"), bPitch ? TEXT("ON") : TEXT("OFF"),
-			bHold ? (bPitch ? TEXT("A") : TEXT("C")) : (bPitch ? TEXT("B") : TEXT("D")));
 		UE_LOG(LogCatVentures, Log,
 			TEXT("[%s] Transfer arc — gap %.0f -> climb %.0f (wall %.0f + flight %.0f), "
 			     "launch %.0f deg, apex %.0f%% at +%.0f, arrival %.0f deg  [LEVEL SPEC]"),

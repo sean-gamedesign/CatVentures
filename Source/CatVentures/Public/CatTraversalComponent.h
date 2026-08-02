@@ -258,13 +258,6 @@ public:
 	// the launch by construction. A knob here could only ever contradict the
 	// animation. See DriveWallTransfer.)
 
-	/** Body pitch (deg, nose-up) the catch rear-up sweeps to over the last ~12% of the
-	 *  crossing — the chest thrown up into the grab, so the level/descending sail
-	 *  rotates toward the vertical cling BEFORE the pose crossfade swaps them.
-	 *  28 from 0.88 since round 17 (the 20-from-0.93 first pass rendered only ~6° —
-	 *  the sweep outran its 25/s interp). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "45.0"))
-	float WallTransferCatchPitchDeg = 28.0f;
 
 	/** Seconds for the whole crossing = WallTransferPushTime (the authored wall
 	 *  phase, played 1:1 by the WallKickClipTime scrub) + the flight. 1.13 keeps
@@ -295,6 +288,9 @@ public:
 	/** Rate the ABP evaluators' scrub must advance at (read by ACatBase::Tick). */
 	float GetWallClipPlayRate() const { return FMath::Max(WallTransferPlayRate, 0.1f); }
 
+	// (The procedural transfer-pitch knobs — PitchScale, PitchMax, CatchPitchDeg —
+	//  are GONE with the layer itself. The clip carries the launch attitude now.)
+
 	/** Capsule stand-off from the target face at the catch (uu). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "10.0", ClampMax = "60.0"))
 	float WallTransferStandOff = 25.0f;
@@ -308,19 +304,7 @@ public:
 	//  the assets was a desync waiting to happen. Both are now derived above from
 	//  the clip lengths ÷ WallTransferPlayRate.)
 
-	/** Scale from the crossing trajectory's tangent angle to rendered body pitch —
-	 *  round 14 (#3): the mesh pitches toward where the capsule is actually
-	 *  travelling, so rise → level → dip falls out of the curve geometry instead of
-	 *  a hand-keyed envelope (and it stays correct if the gap/climb knobs change).
-	 *  1.0 since round 15 (analytic tangent on the ballistic curve: ~30° at
-	 *  push-off declining smoothly — 0.6 on top of that undersold the arc). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "1.5"))
-	float WallTransferPitchScale = 1.0f;
 
-	/** Clamp (deg) on the trajectory pitch above. Net early attitude = this + the
-	 *  clip's authored +10, ~+42 at ship values. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallTransfer", meta = (ClampMin = "0.0", ClampMax = "60.0"))
-	float WallTransferPitchMax = 32.0f;
 
 	/** Begin the transfer takeover (owner on detection; server via the pawn RPC).
 	 *  Deterministic from the same params on both machines — the mantle model. */
@@ -341,11 +325,6 @@ public:
 		return FMath::Clamp(GetWallTransferPushTime() / FMath::Max(GetWallTransferDuration(), 0.1f), 0.1f, 0.85f);
 	}
 
-	/** Weighted trajectory-pitch target (deg, nose-up positive) for the mesh during a
-	 *  crossing — 0 outside the arc window (eases in with the arc-pose blend, out just
-	 *  before the catch so the cling rear-up starts from level). ACatBase interps
-	 *  toward it in the §C compose; the interp is also the abort path. */
-	float GetWallTransferPitchTarget() const;
 
 	/** Seconds since the current wall attach began (0 when not attached) — read by the
 	 *  §B3 catch window so a fresh grip builds its hug at catch speed. */
@@ -696,7 +675,6 @@ private:
 	FVector TransferTarget  = FVector::ZeroVector;
 	FVector TransferNormalB = FVector::ZeroVector;   // far wall's outward normal
 	float   TransferElapsed = 0.0f;
-	float   TransferPitchRaw = 0.0f;                 // analytic tangent angle (deg, nose-up +)
 
 	/** Yaw swing across the crossing (round 10): the clip contributes only its PUSH
 	 *  segment — its back half is dismount acrobatics (a ~75° head-down peel-and-dive
