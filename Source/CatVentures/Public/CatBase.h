@@ -1017,7 +1017,8 @@ protected:
 	 *  leave the server falling while the owner hangs, and a dropped exit would strand it. */
 	UFUNCTION(Server, Reliable)
 	void Server_SetWallAttach(bool bActive, FVector_NetQuantizeNormal WallNormal,
-	                          float RiseSpeed, float RiseTime);
+	                          float RiseSpeed, float RiseTime,
+	                          float RunSpeed = 0.0f, float RunTime = 0.0f, float RunSign = 0.0f);
 
 	/** Written by the traversal component on owner and server; replicated to proxies. */
 	void SetWallAttachAnimState(bool bActive);

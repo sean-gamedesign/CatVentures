@@ -1363,7 +1363,8 @@ void ACatBase::Server_WallTransfer_Implementation(FVector_NetQuantize InStart, F
 }
 
 void ACatBase::Server_SetWallAttach_Implementation(bool bActive, FVector_NetQuantizeNormal WallNormal,
-                                                   float RiseSpeed, float RiseTime)
+                                                   float RiseSpeed, float RiseTime,
+                                                   float RunSpeed, float RunTime, float RunSign)
 {
 	if (!Traversal)
 	{
@@ -1371,7 +1372,7 @@ void ACatBase::Server_SetWallAttach_Implementation(bool bActive, FVector_NetQuan
 	}
 	if (bActive)
 	{
-		Traversal->StartWallAttach(WallNormal, RiseSpeed, RiseTime);
+		Traversal->StartWallAttach(WallNormal, RiseSpeed, RiseTime, RunSpeed, RunTime, RunSign);
 	}
 	else
 	{

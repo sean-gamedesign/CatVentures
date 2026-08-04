@@ -582,10 +582,32 @@ bool UCatTraversalComponent::IsScrambleSurface(const FHitResult& Hit) const
 	return false;
 }
 
+void UCatTraversalComponent::LogWallRunReject(const TCHAR* Reason) const
+{
+	// Logged on CHANGE only: a sustained reject is the common case every frame the cat
+	// is near a wall, and at Verbose it would drown the category (the same reason
+	// ETraversalReject logs on change for the mantle).
+	if (WallRunRejectLast == Reason)
+	{
+		return;
+	}
+	WallRunRejectLast = Reason;
+	if (const ACatBase* Cat = GetCat())
+	{
+		// Log, not Verbose: LogCatVentures defaults to Log verbosity, so the Verbose
+		// version of this emitted NOTHING and the first "why won't it trigger" round
+		// had no data at all. Change-only keeps the volume bounded.
+		UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall run reject — %s"), *Cat->GetName(), Reason);
+	}
+}
+
 void UCatTraversalComponent::TryDetectScramble()
 {
 	ACatBase* Cat = GetCat();
-	if (!Cat || !bEnableWallScramble || TraversalState != ECatTraversalState::None)
+	// Detects BOTH verbs (they share every gate but the approach angle), so either
+	// switch being on keeps the detector alive.
+	if (!Cat || (!bEnableWallScramble && !bEnableWallRun)
+		|| TraversalState != ECatTraversalState::None)
 	{
 		return;
 	}
@@ -608,25 +630,55 @@ void UCatTraversalComponent::TryDetectScramble()
 		return;
 	}
 
+	// THE PROBE MUST NOT BE AIMED DOWN THE VELOCITY for a wall run. A scramble runs AT
+	// its wall, so one ray along travel finds it; a wall run runs PAST its wall, so that
+	// same ray goes parallel to the face and never hits. With reach 46 a ray at angle θ
+	// off parallel only reaches 46·sinθ sideways, so a wall ~35 uu away needs θ ≳ 50° —
+	// which, combined with needing to be UNDER the scramble's head-on threshold, left a
+	// detectable sliver of ~35–44° off head-on and made the shallow approach the verb
+	// actually wants undetectable by construction (measured 2026-08-02: one run fired in
+	// a whole session, at 35°). Fan 4 directions, like the cling: a wall you are running
+	// past is BESIDE you, not ahead of you.
+	// THIRD instance of this family — after the fence detector rotating its own probe and
+	// the mantle/cling pair looking different ways. The rule: never aim a probe with a
+	// quantity that, for this move, points away from the thing being looked for.
 	FVector WallPoint, WallNormal;
 	bool bAnyHit = false;
 	FHitResult WallHit;
-	if (!ProbeWalls(ScrambleReach, /*NumDirections=*/1, WallPoint, WallNormal, bAnyHit,
+	if (!ProbeWalls(ScrambleReach, bEnableWallRun ? 4 : 1, WallPoint, WallNormal, bAnyHit,
 			HorizVel, &WallHit))
 	{
+		LogWallRunReject(TEXT("no wall in reach"));
 		return;
 	}
-	if (FVector::DotProduct(HorizVel, -WallNormal) < ScrambleMinEntrySpeed)
+	// Head-on or glancing? The closing component decides which verb this is. This test
+	// used to just reject the glancing case ("skimming along the face"); a wall run is
+	// exactly that case, so the rejection became a branch (2026-08-02).
+	const float ClosingSpeed = FVector::DotProduct(HorizVel, -WallNormal);
+	const FVector Tangent = FVector::CrossProduct(FVector::UpVector, WallNormal).GetSafeNormal();
+	const float AlongSigned = FVector::DotProduct(HorizVel, Tangent);
+	const bool bWallRun = ClosingSpeed < ScrambleMinEntrySpeed
+		&& bEnableWallRun
+		&& ClosingSpeed >= WallRunMinApproachSpeed
+		&& FMath::Abs(AlongSigned) >= WallRunMinLateralSpeed;
+	if (ClosingSpeed < ScrambleMinEntrySpeed && !bWallRun)
 	{
-		return;   // skimming along the face, not running into it
+		// Say WHICH half of the run gate failed — "it will not trigger" has now cost a
+		// round on two separate verbs, and silent non-detection is invisible in a dump.
+		LogWallRunReject(ClosingSpeed < WallRunMinApproachSpeed
+			? TEXT("not closing on the wall")
+			: TEXT("too slow along the face"));
+		return;
 	}
 	if (!SpentWallNormal.IsZero()
 		&& FVector::DotProduct(WallNormal, SpentWallNormal) > 0.9f)
 	{
+		LogWallRunReject(TEXT("face just timed out"));
 		return;   // this face just timed out; leave it before climbing it again
 	}
 	if (!IsScrambleSurface(WallHit))
 	{
+		LogWallRunReject(TEXT("surface not tagged Scrambleable"));
 		return;   // not every wall is climbable — level authoring decides
 	}
 
@@ -648,11 +700,16 @@ void UCatTraversalComponent::TryDetectScramble()
 		}
 	}
 
-	// Rise budget from entry speed — a harder run-up climbs higher. Height gained is
-	// RiseSpeed × RiseTime / 2, since DriveWallAttach decays the budget linearly.
-	const float RiseSpeed = FMath::GetMappedRangeValueClamped(
-		FVector2D(ScrambleMinEntrySpeed, ScrambleEntrySpeedForMaxRise),
-		FVector2D(ScrambleRiseSpeedMin, ScrambleRiseSpeedMax), EntrySpeed);
+	// Budgets. A scramble converts the run-up into HEIGHT; a wall run carries it
+	// along the face instead. Both decay linearly, so distance = speed × time / 2.
+	const float RiseSpeed = bWallRun ? WallRunRiseSpeed
+		: FMath::GetMappedRangeValueClamped(
+			FVector2D(ScrambleMinEntrySpeed, ScrambleEntrySpeedForMaxRise),
+			FVector2D(ScrambleRiseSpeedMin, ScrambleRiseSpeedMax), EntrySpeed);
+	const float RiseTime  = bWallRun ? WallRunRiseTime : ScrambleRiseTime;
+	const float RunSpeed  = bWallRun ? FMath::Abs(AlongSigned) * WallRunSpeedScale : 0.0f;
+	const float RunTime   = bWallRun ? WallRunTime : 0.0f;
+	const float RunSign   = bWallRun ? FMath::Sign(AlongSigned) : 0.0f;
 
 	// Entering from the ground: hand the capsule to falling physics first, or the
 	// attach's own grounded exit would fire on its very first drive tick.
@@ -661,10 +718,22 @@ void UCatTraversalComponent::TryDetectScramble()
 		CMC->SetMovementMode(MOVE_Falling);
 	}
 
-	StartWallAttach(WallNormal, RiseSpeed, ScrambleRiseTime);
+	StartWallAttach(WallNormal, RiseSpeed, RiseTime, RunSpeed, RunTime, RunSign);
 	if (!Cat->HasAuthority())
 	{
-		Cat->Server_SetWallAttach(true, WallNormal, RiseSpeed, ScrambleRiseTime);
+		Cat->Server_SetWallAttach(true, WallNormal, RiseSpeed, RiseTime, RunSpeed, RunTime, RunSign);
+	}
+
+	if (bWallRun)
+	{
+		UE_LOG(LogCatVentures, Log,
+			TEXT("[%s] Wall RUN START — entry %.0f cm/s (closing %.0f, along %.0f), "
+			     "run %.0f cm/s over %.2f s (~%.0f uu), lift %.0f uu"),
+			*Cat->GetName(), EntrySpeed, ClosingSpeed, AlongSigned,
+			RunSpeed, RunTime,
+			RunSpeed * RunTime * (1.0f - FMath::Clamp(WallRunHoldFrac, 0.0f, 0.95f) * 0.5f),
+			RiseSpeed * RiseTime * 0.5f);
+		return;
 	}
 
 	// Per-scramble spec line: entry speed → climb height is the authoring spec for the
@@ -770,7 +839,8 @@ void UCatTraversalComponent::TryWallCling()
 	}
 }
 
-void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float RiseSpeed, float RiseTime)
+void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float RiseSpeed, float RiseTime,
+	float RunSpeed, float RunTime, float RunSign)
 {
 	ACatBase* Cat = GetCat();
 	if (!Cat || TraversalState != ECatTraversalState::None)
@@ -790,6 +860,9 @@ void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float Ri
 	AttachElapsed   = 0.0f;
 	AttachRiseSpeed = RiseSpeed;
 	AttachRiseTime  = RiseTime;
+	AttachRunSpeed  = RunSpeed;
+	AttachRunTime   = RunTime;
+	AttachRunSign   = RunSign;
 	AttachStartZ    = Cat->GetActorLocation().Z;
 	Cat->SetWallAttachAnimState(true);
 
@@ -803,7 +876,8 @@ void UCatTraversalComponent::StartWallAttach(const FVector& WallNormal, float Ri
 
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Wall attach START — normal (%.2f, %.2f)%s"),
 		*Cat->GetName(), N.X, N.Y,
-		RiseSpeed > 0.0f ? TEXT(" [scramble]") : TEXT(" [cling]"));
+		RiseSpeed > 0.0f ? TEXT(" [scramble]")
+			: RunSpeed > 0.0f ? TEXT(" [run]") : TEXT(" [cling]"));
 }
 
 void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
@@ -827,7 +901,10 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 		EndWallAttach(EWallAttachEnd::Grabbed);
 		return;
 	}
-	if (CMC->IsMovingOnGround())
+	// Grace while a rise budget is still lifting: a wall run enters AT floor level, so
+	// the capsule is still touching ground for the first frames and this exit killed
+	// every run in ~0.2 s before the lift could take effect (2026-08-02).
+	if (CMC->IsMovingOnGround() && AttachElapsed >= AttachRiseTime)
 	{
 		EndWallAttach(EWallAttachEnd::Grounded);
 		return;
@@ -835,7 +912,10 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 	// The cap budgets the HANGING portion, so it starts after the rise. Charging a
 	// scramble's climb against a cling's budget left only 0.7 s of slide and dumped the
 	// cat mid-wall (2026-07-25). A cling has RiseTime 0, so its 1.4 s is unchanged.
-	if (AttachElapsed > AttachRiseTime + WallClingMaxTime)
+	// The cap budgets the HANGING portion, so it starts after whatever budget was spent
+	// getting here — a scramble's rise or a run's lateral. Charging a climb against the
+	// cling's budget left only 0.7 s of hang and dumped the cat mid-wall (2026-07-25).
+	if (AttachElapsed > AttachRiseTime + AttachRunTime + WallClingMaxTime)
 	{
 		EndWallAttach(EWallAttachEnd::Timeout);
 		return;
@@ -861,7 +941,10 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 	{
 		VzTarget = AttachRiseSpeed * (1.0f - AttachElapsed / FMath::Max(AttachRiseTime, KINDA_SMALL_NUMBER));
 	}
-	else if (AttachElapsed < AttachRiseTime + WallClingCatchTime)
+	// A wall run HOLDS height for the length of its lateral budget; the cling's own
+	// slide then takes over, which is the sag. (Cling and scramble have RunTime 0, so
+	// this is the unchanged catch-then-slide for them.)
+	else if (AttachElapsed < AttachRiseTime + FMath::Max(WallClingCatchTime, AttachRunTime))
 	{
 		VzTarget = 0.0f;
 	}
@@ -870,21 +953,39 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 		VzTarget = -WallClingSlideSpeed;
 	}
 
-	// Hold the profile and kill horizontal drift: the cat is stuck to the face, so the
-	// into-wall component would grind through it and the tangential component would slide
-	// it along a wall it is supposed to be gripping.
+	// ── Lateral profile: the WALL RUN's budget, decaying like the scramble's ──
+	// Zero for a cling or a scramble, which is why this replaces the old blanket
+	// "kill horizontal drift" without changing either of them: the into-wall
+	// component still never survives (we write the velocity outright), and the
+	// tangential component is now a budget rather than always zero.
+	// HOLD then decay, not decay-from-the-start: the latter averages half the entry
+	// speed and made the run bleed out from frame one (Sean: "doesn't travel far
+	// enough"). Distance is now speed × time × (1 − HoldFrac/2).
+	float RunNow = 0.0f;
+	FVector RunDir = FVector::ZeroVector;
+	if (AttachRunSpeed > 0.0f && AttachElapsed < AttachRunTime)
+	{
+		const float U = AttachElapsed / FMath::Max(AttachRunTime, KINDA_SMALL_NUMBER);
+		const float Hold = FMath::Clamp(WallRunHoldFrac, 0.0f, 0.95f);
+		RunNow = (U <= Hold) ? AttachRunSpeed
+			: AttachRunSpeed * (1.0f - (U - Hold) / FMath::Max(1.0f - Hold, KINDA_SMALL_NUMBER));
+		RunDir = FVector::CrossProduct(FVector::UpVector, AttachNormal).GetSafeNormal() * AttachRunSign;
+	}
+
 	FVector Vel = CMC->Velocity;
-	Vel.X = 0.0f;
-	Vel.Y = 0.0f;
+	Vel.X = RunDir.X * RunNow;
+	Vel.Y = RunDir.Y * RunNow;
 	Vel.Z = VzTarget;
 	CMC->Velocity = Vel;
 
-	// Face the wall (cosmetic; orient-to-movement is inert at zero horizontal velocity).
+	// Face along the run while there is a budget, into the wall otherwise. A running
+	// cat looks where it is going; a clinging one faces its grip.
 	// EASE-OUT, wrap-safe — see WallAttachFaceInterpSpeed: settles the tail of the kick
 	// sweep onto the face; near no-op for ordinary already-facing approaches.
 	{
+		const FVector FaceDir = (RunNow > 0.0f) ? RunDir : -AttachNormal;
 		const float CurYaw = Cat->GetActorRotation().Yaw;
-		const float Delta  = FMath::FindDeltaAngleDegrees(CurYaw, (-AttachNormal).Rotation().Yaw);
+		const float Delta  = FMath::FindDeltaAngleDegrees(CurYaw, FaceDir.Rotation().Yaw);
 		const float Alpha  = FMath::Clamp(DeltaTime * WallAttachFaceInterpSpeed, 0.0f, 1.0f);
 		Cat->SetActorRotation(FRotator(0.0f, CurYaw + Delta * Alpha, 0.0f));
 	}
@@ -893,8 +994,10 @@ void UCatTraversalComponent::DriveWallAttach(float DeltaTime)
 	{
 		static const FName ChAttach(TEXT("WallAttachPhase"));
 		static const FName ChClimb(TEXT("WallAttachClimb"));
+		// 1 rise (scramble) / 2 catch / 3 slide / 4 lateral run
 		const float Phase = (AttachRiseSpeed > 0.0f && AttachElapsed < AttachRiseTime) ? 1.0f
-			: (AttachElapsed < AttachRiseTime + WallClingCatchTime) ? 2.0f : 3.0f;
+			: (RunNow > 0.0f) ? 4.0f
+			: (AttachElapsed < AttachRiseTime + FMath::Max(WallClingCatchTime, AttachRunTime)) ? 2.0f : 3.0f;
 		Cat->PawPrint->SampleChannel(ChAttach, Phase);
 		Cat->PawPrint->SampleChannel(ChClimb, Cat->GetActorLocation().Z - AttachStartZ);
 	}
@@ -1098,8 +1201,19 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal, bool bKickR
 	// is what keeps a chimney (alternating normals) working after any timeout.
 	SpentWallNormal = FVector::ZeroVector;
 
+	// Carry the along-wall momentum through the kick (2026-08-02) so a wall run can
+	// CHAIN: run one face, kick, arrive at the opposite face still carrying enough
+	// speed to run that one too. Without this the launch is purely normal + up, so
+	// you cross an alley with zero forward speed and the far wall can only give you a
+	// cling. Note this needs NO special-casing for the other verbs: a cling and a
+	// scramble both hold their tangential velocity at zero, so the term vanishes and
+	// chimney bouncing stays bit-identical to its tuning.
+	FVector Tangential(Cat->GetCharacterMovement() ? Cat->GetCharacterMovement()->Velocity : FVector::ZeroVector);
+	Tangential.Z = 0.0f;
+	Tangential -= Lateral * FVector::DotProduct(Tangential, Lateral);   // drop the into/out-of wall part
 	const FVector Launch = Lateral * WallBounceLateralSpeed
-		+ FVector::UpVector * WallBounceVerticalSpeed;
+		+ FVector::UpVector * WallBounceVerticalSpeed
+		+ Tangential * WallBounceMomentumRetain;
 
 	// Override both planes: a bounce should feel decisive, not additive to whatever
 	// the fall had accumulated (an additive kick off a fast fall barely registers).
@@ -1198,8 +1312,10 @@ void UCatTraversalComponent::DoWallBounce(const FVector& WallNormal, bool bKickR
 
 	// Per-bounce spec line (the stop/start/mantle log doctrine).
 	UE_LOG(LogCatVentures, Log,
-		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up, kick %s"),
+		TEXT("[%s] Wall bounce — normal (%.2f, %.2f), launch %.0f lateral / %.0f up"
+		     " + %.0f carried along, kick %s"),
 		*Cat->GetName(), Lateral.X, Lateral.Y, WallBounceLateralSpeed, WallBounceVerticalSpeed,
+		Tangential.Size() * WallBounceMomentumRetain,
 		bKickRight ? TEXT("R") : TEXT("L"));
 }
 

@@ -189,6 +189,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallBounce", meta = (ClampMin = "0.0", ClampMax = "1500.0"))
 	float WallBounceVerticalSpeed = 620.0f;
 
+	/** Fraction of the ALONG-WALL velocity carried through a kick. The launch is
+	 *  otherwise purely normal + up with an XY override, so every bit of forward speed
+	 *  died at the kick and a wall run could never chain — you crossed an alley with
+	 *  zero along-speed and the far wall could only give you a cling (2026-08-02).
+	 *  Needs no per-verb gating: a cling and a scramble both hold their tangential
+	 *  velocity at zero, so this term is zero for them and chimney bouncing is
+	 *  unchanged. 0.75 of a ~640 run arrives at ~480, comfortably over the
+	 *  WallRunMinLateralSpeed needed to run the far face too. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallBounce", meta = (ClampMin = "0.0", ClampMax = "1.2"))
+	float WallBounceMomentumRetain = 0.75f;
+
 	/** Seconds before another bounce may fire. Stops a single press from chaining and
 	 *  keeps a chimney climb to one kick per wall contact. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallBounce", meta = (ClampMin = "0.0", ClampMax = "2.0"))
@@ -491,6 +502,67 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Scramble", meta = (ClampMin = "0.1", ClampMax = "2.0"))
 	float ScrambleRiseTime = 0.75f;
 
+	// ── Wall run (verb 6 — PHASE 1, mechanics on placeholder anim) ──────
+	// Arrive at a marked wall fast but OBLIQUELY and the cat carries its momentum
+	// along the face instead of stopping. The discriminator was already sitting in
+	// TryDetectScramble as a rejection ("skimming along the face, not running into
+	// it") — a head-on arrival is a scramble, a glancing one is a run, and they
+	// share the speed gate, the authoring tag, the wall-height probe and the whole
+	// exit set. No new state: WallAttach with a lateral budget (see AttachRunSpeed).
+	//
+	// NO ANIM YET, by the mechanics-first doctrine that has served every verb here:
+	// this runs on the cling pose so the MOVE can be judged before any clip work.
+	// There is no wall-run clip in the pack's 285 sequences; the plan if it earns
+	// one is the ground run cycle rolled 90 deg about its forward axis.
+
+	/** Master switch. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun")
+	bool bEnableWallRun = true;
+
+	/** Speed ALONG the face (cm/s) needed to run rather than just slap into it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "100.0", ClampMax = "900.0"))
+	float WallRunMinLateralSpeed = 320.0f;
+
+	/** Minimum closing speed (cm/s) — the cat must actually be ARRIVING at the wall,
+	 *  not sprinting past it a metre away. Deliberately low: the whole point is that
+	 *  this fires below the scramble's head-on threshold. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "10.0", ClampMax = "400.0"))
+	float WallRunMinApproachSpeed = 20.0f;   // 60 first pass — with the velocity-aimed
+	                                         // probe replaced by a lateral fan, a genuinely
+	                                         // parallel run has almost no closing speed and
+	                                         // 60 rejected the best case. Proximity is
+	                                         // already proven by the probe hitting at all.
+
+	/** How long the lateral budget lasts (s). Speed is HELD for WallRunHoldFrac of it
+	 *  and then decays to zero, so distance ≈ speed × time × (1 − HoldFrac/2) rather
+	 *  than the speed × time / 2 a decay-from-the-start gives — nearly double the reach
+	 *  for the same duration, and it reads as keeping your momentum and then losing it
+	 *  instead of bleeding out from the first frame. Height is held for the same window;
+	 *  the cling's own slide takes over after, which is the sag. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "0.2", ClampMax = "2.5"))
+	float WallRunTime = 1.1f;
+
+	/** Fraction of the budget spent at full speed before the decay starts. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "0.0", ClampMax = "0.9"))
+	float WallRunHoldFrac = 0.6f;
+
+	/** Entry lift (cm/s) and how long it lasts. NOT cosmetic — a wall run entered at
+	 *  floor level re-lands within a couple of frames and the attach's grounded exit
+	 *  kills it in ~0.2 s of a 0.9 s budget (measured 2026-08-02: every run died that
+	 *  way, which read as both "hard to trigger" and "doesn't travel far"). You do not
+	 *  wall-run along a skirting board; you rise onto the wall. Reuses the scramble's
+	 *  rise machinery, so the vertical profile becomes lift → hold → sag. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "0.0", ClampMax = "600.0"))
+	float WallRunRiseSpeed = 250.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WallRunRiseTime = 0.35f;
+
+	/** Fraction of the arriving lateral speed carried into the run. 1.0 = momentum is
+	 *  conserved; below that the wall costs you something to use. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|WallRun", meta = (ClampMin = "0.3", ClampMax = "1.5"))
+	float WallRunSpeedScale = 1.0f;
+
 	// ── Balance assist (verb 4, and deliberately NOT a verb) ────────────
 	// Walking a fence rail or a block-wall top is NOT a mode. It began as one — speed
 	// clamped to a creep, input projected onto the edge, position magnetised to the
@@ -575,7 +647,8 @@ public:
 	/** Begin a wall attach. RiseSpeed/RiseTime are the SCRAMBLE parameters (0/0 = cling):
 	 *  vertical velocity eases RiseSpeed → 0 across RiseTime, then the catch, then the
 	 *  slide. Owner on detection; server via ACatBase::Server_SetWallAttach. */
-	void StartWallAttach(const FVector& WallNormal, float RiseSpeed, float RiseTime);
+	void StartWallAttach(const FVector& WallNormal, float RiseSpeed, float RiseTime,
+	                     float RunSpeed = 0.0f, float RunTime = 0.0f, float RunSign = 0.0f);
 
 	/** Release the attach. The cling is deliberately STICKY: steering away does NOT let
 	 *  go (2026-07-25 Sean call). In a chimney the wall you are aiming at lies along the
@@ -615,6 +688,12 @@ private:
 
 	/** Run-at-a-climbable-wall detection; starts a scramble on a hit. Local owner only. */
 	void TryDetectScramble();
+
+	/** Name the wall run's bail-out (logged on change only). A verb that silently fails
+	 *  to detect is invisible in a dump — "it will not trigger" has cost a round on two
+	 *  verbs now, so every gate says which one it was. */
+	void LogWallRunReject(const TCHAR* Reason) const;
+	mutable const TCHAR* WallRunRejectLast = nullptr;
 
 	/** One downward support sample: is there floor at Probe within FenceMinDropDepth of
 	 *  FloorZ, or has the ground fallen away? */
@@ -753,6 +832,15 @@ private:
 	float   AttachElapsed  = 0.0f;
 	float   AttachRiseSpeed = 0.0f;                 // >0 = scramble entry
 	float   AttachRiseTime  = 0.0f;
+	/** Lateral budget — the WALL RUN entry (2026-08-02). Third use of this one state:
+	 *  cling enters with no budget, scramble with a VERTICAL one, a wall run with a
+	 *  LATERAL one, and all three share the exits (kick / mantle / timeout / wall lost
+	 *  / grounded) and the same deterministic MP mirror. Sign selects which way along
+	 *  the face; the tangent itself is derived from the normal so both machines get
+	 *  the same vector from the same RPC. */
+	float   AttachRunSpeed = 0.0f;                  // >0 = wall-run entry
+	float   AttachRunTime  = 0.0f;
+	float   AttachRunSign  = 0.0f;                  // +1 / −1 along Up × Normal
 	float   WallAttachCooldownTimer = 0.0f;
 
 	/** Normal of the wall a timeout just released, so the same face cannot be re-gripped
