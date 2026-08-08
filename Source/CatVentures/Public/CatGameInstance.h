@@ -39,8 +39,10 @@ public:
 	/** When true, HostSession and FindSessions force bIsLAN=true regardless of
 	 *  the value passed from Blueprint. Lets us A/B test the LAN code path
 	 *  without touching the UI graph. UCatGameInstance is assigned directly in
-	 *  DefaultEngine.ini (no Blueprint subclass) — toggle this from C++ or a
-	 *  debug console route. Never ship enabled. */
+	 *  DefaultEngine.ini (no Blueprint subclass), so there is no CDO to tick in
+	 *  the editor — Init() also sets this from the `-ForceLAN` command line
+	 *  parameter, which is how it gets enabled on a packaged build. Never ship
+	 *  enabled. Pair with `-nosteam` for a pure UE LAN networking A/B. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Network|Debug")
 	bool bForceLANMatch = false;
 
@@ -81,10 +83,25 @@ public:
 
 protected:
 	virtual void Init() override;
+	virtual void Shutdown() override;
 
 private:
 	// ── OSS interface cache ────────────────────────────────────────────────
 	IOnlineSessionPtr SessionInterface;
+
+	// ── Net driver identity logging ───────────────────────────────────────
+	// CreateNamedNetDriver loads DriverClassNameFallback with LOAD_Quiet when the
+	// configured driver class is missing or reports IsAvailable()==false — silently,
+	// with no warning anywhere. That silence hid a dead SteamNetDriver config for
+	// three months (every build ran raw IpNetDriver while lobbies advertised Steam
+	// P2P URLs). Naming the driver that was actually created makes the fallback
+	// impossible to miss again, on host and client alike.
+	FDelegateHandle NetDriverCreatedDelegateHandle;
+	void HandleNetDriverCreated(UWorld* World, UNetDriver* NetDriver);
+
+	/** Warns when a non-LAN session op runs on something other than the Steam OSS —
+	 *  i.e. Steam init failed and we silently fell through to the NULL subsystem. */
+	void WarnIfNotSteam(const TCHAR* Context, bool bIsLAN) const;
 
 	// ── Search state ──────────────────────────────────────────────────────
 	TSharedPtr<FOnlineSessionSearch> SessionSearch;

@@ -3,9 +3,14 @@
 #include "CatGameInstance.h"
 #include "CatVenturesLog.h"
 #include "OnlineSubsystem.h"
+#include "OnlineSubsystemNames.h"        // STEAM_SUBSYSTEM
 #include "OnlineSessionSettings.h"
 #include "Online/OnlineSessionNames.h"   // SEARCH_LOBBIES
+#include "Engine/NetDriver.h"
+#include "Engine/World.h"                // FWorldDelegates::OnNetDriverCreated
 #include "GameFramework/PlayerController.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 
 // ── Session name shared across all methods ────────────────────────────────
 static const FName SESSION_NAME = FName("CatVenturesSession");
@@ -32,6 +37,20 @@ static FString JoinResultToString(EOnJoinSessionCompleteResult::Type Result)
 void UCatGameInstance::Init()
 {
 	Super::Init();
+
+	// Bind BEFORE the OSS checks below — those early-return, and the driver identity
+	// matters most in exactly the cases where the OSS is missing (-nosteam, Steam
+	// client down), since that is when the silent IpNetDriver fallback kicks in.
+	NetDriverCreatedDelegateHandle = FWorldDelegates::OnNetDriverCreated.AddUObject(
+		this, &UCatGameInstance::HandleNetDriverCreated);
+
+	// Packaged builds have no CDO to tick — `-ForceLAN` is how the LAN A/B path gets
+	// enabled on the rig. Never clears the flag, so an editor-set true still wins.
+	if (FParse::Param(FCommandLine::Get(), TEXT("ForceLAN")))
+	{
+		bForceLANMatch = true;
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] -ForceLAN on the command line: bForceLANMatch enabled."));
+	}
 
 	IOnlineSubsystem* OSS = IOnlineSubsystem::Get();
 	if (!OSS)
@@ -68,6 +87,53 @@ void UCatGameInstance::Init()
 		*OSS->GetSubsystemName().ToString());
 }
 
+void UCatGameInstance::Shutdown()
+{
+	FWorldDelegates::OnNetDriverCreated.Remove(NetDriverCreatedDelegateHandle);
+	NetDriverCreatedDelegateHandle.Reset();
+
+	Super::Shutdown();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Diagnostics ──────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void UCatGameInstance::HandleNetDriverCreated(UWorld* World, UNetDriver* NetDriver)
+{
+	if (!NetDriver)
+	{
+		return;
+	}
+
+	// Def=GameNetDriver Class=SteamSocketsNetDriver is the healthy Steam-transport
+	// line. Class=IpNetDriver on a Steam build means the configured driver failed to
+	// load or reported IsAvailable()==false and the engine quietly fell back — the
+	// exact state that made every lobby join fail in ~3 ms with no explanation.
+	UE_LOG(LogCatVentures, Log, TEXT("[Net] NetDriver created  Def=%s  Class=%s  Obj=%s"),
+		*NetDriver->GetNetDriverDefinition().ToString(),
+		*NetDriver->GetClass()->GetName(),
+		*NetDriver->GetName());
+}
+
+void UCatGameInstance::WarnIfNotSteam(const TCHAR* Context, bool bIsLAN) const
+{
+	if (bIsLAN)
+	{
+		return;   // LAN never needed Steam.
+	}
+
+	IOnlineSubsystem* OSS = IOnlineSubsystem::Get();
+	const FName ActiveName = OSS ? OSS->GetSubsystemName() : FName(TEXT("<none>"));
+
+	if (ActiveName != STEAM_SUBSYSTEM)
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] %s requested a non-LAN session but the active OSS is '%s', not STEAM. ")
+			TEXT("Steam init failed (client not running, or -nosteam) and we fell through to the NULL subsystem — ")
+			TEXT("discovery across machines will not work."), Context, *ActiveName.ToString());
+	}
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // ── Host ─────────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
@@ -81,6 +147,7 @@ void UCatGameInstance::HostSession(int32 MaxPlayers, bool bIsLAN)
 	}
 
 	UE_LOG(LogCatVentures, Log, TEXT("[Session] HostSession start  MaxPlayers=%d  LAN=%d"), MaxPlayers, bIsLAN ? 1 : 0);
+	WarnIfNotSteam(TEXT("HostSession"), bIsLAN);
 
 	if (!SessionInterface.IsValid())
 	{
@@ -136,7 +203,7 @@ void UCatGameInstance::CreateSessionInternal(int32 MaxPlayers, bool bIsLAN)
 	Settings.bIsLANMatch           = bIsLAN;
 	Settings.bUsesPresence         = true;   // Required for Steam lobby P2P discovery
 	Settings.bShouldAdvertise      = true;
-	Settings.bUseLobbiesIfAvailable = true;  // Steam AppID 480: lobbies, not game servers
+	Settings.bUseLobbiesIfAvailable = true;  // Steam lobbies, not dedicated game servers
 	Settings.bAllowJoinInProgress  = true;
 	Settings.bAllowInvites          = true;
 	Settings.bAllowJoinViaPresence  = true;   // enables overlay "Join Game" button
@@ -183,6 +250,7 @@ void UCatGameInstance::FindSessions(int32 MaxResults, bool bIsLAN)
 	}
 
 	UE_LOG(LogCatVentures, Log, TEXT("[Session] FindSessions start  MaxResults=%d  LAN=%d"), MaxResults, bIsLAN ? 1 : 0);
+	WarnIfNotSteam(TEXT("FindSessions"), bIsLAN);
 
 	if (!SessionInterface.IsValid())
 	{
@@ -195,7 +263,7 @@ void UCatGameInstance::FindSessions(int32 MaxResults, bool bIsLAN)
 	SessionSearch->MaxSearchResults = MaxResults;
 	SessionSearch->bIsLanQuery      = bIsLAN;
 	// SEARCH_LOBBIES ("LOBBYSEARCH") is the key OSS Steam checks in UE 5.7 to route
-	// FindSessions to RequestLobbyList (the lobby path AppID 480 sessions live on).
+	// FindSessions to RequestLobbyList (the lobby path our sessions live on).
 	// The old SEARCH_PRESENCE key was removed from the engine — without SEARCH_LOBBIES
 	// the search silently falls through to the internet *server* query and finds nothing.
 	SessionSearch->QuerySettings.Set(SEARCH_LOBBIES, true, EOnlineComparisonOp::Equals);
