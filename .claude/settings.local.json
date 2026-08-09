@@ -256,7 +256,8 @@
       "PowerShell($csv = \"C:\\\\Projects\\\\CatVentures\\\\Saved\\\\PawPrint\\\\20260802-133322_host_channels.csv\"; Import-Csv $csv | Where-Object { [double]$_.Time -ge 11.70 -and [double]$_.Time -le 13.30 -and $_.Channel -eq 'WallHugSlide' } | ForEach-Object { \"{0:F2}:{1:F1}\" -f \\([double]$_.Time - 11.704\\), [double]$_.Value } | Select-Object -Skip 0 | ForEach-Object -Begin { $i=0; $o=@\\(\\) } -Process { if \\($i % 5 -eq 0\\) { $o += $_ }; $i++ } -End { $o -join ' ' })",
       "PowerShell($csv = \"C:\\\\Projects\\\\CatVentures\\\\Saved\\\\PawPrint\\\\20260802-135735_host_channels.csv\"; foreach \\($ch in @\\('WallHugSlide','WallKickPhase','TransferPitch'\\)\\) { $g = Import-Csv $csv | Where-Object { [double]$_.Time -ge 8.06 -and [double]$_.Time -le 9.80 -and $_.Channel -eq $ch }; $s=@\\(\\); for\\($i=0;$i -lt $g.Count;$i+=7\\){ $s += \\(\"{0:F2}:{1:F1}\" -f \\([double]$g[$i].Time - 8.064\\), [double]$g[$i].Value\\) }; \"$ch  \" + \\($s -join ' '\\) })",
       "PowerShell(Start-Process -FilePath \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Binaries\\\\Win64\\\\UnrealEditor.exe\" -ArgumentList '\"C:\\\\Projects\\\\CatVentures\\\\CatVentures.uproject\"'; 'editor relaunching')",
-      "PowerShell($p = \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Plugins\\\\Online\"; if \\(Test-Path $p\\) { Get-ChildItem $p -Directory | Select-Object -ExpandProperty Name } else { \"MISSING: $p\" })"
+      "PowerShell($p = \"C:\\\\Program Files\\\\Epic Games\\\\UE_5.7\\\\Engine\\\\Plugins\\\\Online\"; if \\(Test-Path $p\\) { Get-ChildItem $p -Directory | Select-Object -ExpandProperty Name } else { \"MISSING: $p\" })",
+      "Bash(grep -n \"^#\\\\{1,3\\\\} \" \"C:/Projects/CatVentures/Saved/.Aura/plans/objective-system-v1.md\")"
     ]
   },
   "enableAllProjectMcpServers": true,
