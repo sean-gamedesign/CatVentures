@@ -81,6 +81,18 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Session")
 	FOnJoinSessionResult OnJoinSessionResult;
 
+	// ── Quit ──────────────────────────────────────────────────────────────
+
+	/** Tears down any live session, then closes the game. Menus must call THIS and
+	 *  not a bare Quit Game node: our session is named SESSION_NAME
+	 *  ("CatVenturesSession"), while the engine's Destroy Session Blueprint proxy
+	 *  targets NAME_GameSession — so that node destroys nothing and leaves a stale
+	 *  lobby advertised on Steam until it times out. Quits immediately when no
+	 *  session exists, and quits anyway if the teardown fails: a quit button that
+	 *  does nothing is worse than a stale lobby. */
+	UFUNCTION(BlueprintCallable, Category = "Session")
+	void QuitToDesktop();
+
 protected:
 	virtual void Init() override;
 	virtual void Shutdown() override;
@@ -112,6 +124,15 @@ private:
 	// completes. These hold the requested parameters across that gap.
 	int32 PendingHostMaxPlayers = 0;
 	bool  bPendingHostIsLAN = false;
+
+	// ── Pending quit state ────────────────────────────────────────────────
+	// DestroySessionCompleteDelegate is shared between the re-host path and the
+	// quit path. This flag is what tells the completion callback which one issued
+	// the destroy, so a quit never falls through into re-creating a session.
+	bool bPendingQuitAfterDestroy = false;
+
+	/** Closes the game. Shared by the immediate and post-teardown quit paths. */
+	void ExecuteQuit();
 
 	// ── Native OSS delegates ──────────────────────────────────────────────
 	// Constructed once in Init(). Registered immediately before each async OSS

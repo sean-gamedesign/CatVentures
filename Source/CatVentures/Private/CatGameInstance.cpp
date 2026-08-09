@@ -9,6 +9,7 @@
 #include "Engine/NetDriver.h"
 #include "Engine/World.h"                // FWorldDelegates::OnNetDriverCreated
 #include "GameFramework/PlayerController.h"
+#include "Kismet/KismetSystemLibrary.h"  // QuitGame
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 
@@ -186,6 +187,23 @@ void UCatGameInstance::HandleDestroySessionComplete(FName SessionName, bool bWas
 
 	UE_LOG(LogCatVentures, Log, TEXT("[Session] HandleDestroySessionComplete  Session=%s  Success=%d"),
 		*SessionName.ToString(), bWasSuccessful ? 1 : 0);
+
+	// This delegate is shared with the quit path. Check it FIRST — otherwise a quit
+	// would fall through and re-create the session we just tore down.
+	if (bPendingQuitAfterDestroy)
+	{
+		bPendingQuitAfterDestroy = false;
+
+		// Deliberately ignores bWasSuccessful: the player asked to leave, so a failed
+		// teardown must not strand them in the menu. Worst case is a stale lobby that
+		// Steam times out on its own.
+		if (!bWasSuccessful)
+		{
+			UE_LOG(LogCatVentures, Warning, TEXT("[Session] Session teardown failed on quit — quitting anyway; the lobby may linger until Steam expires it."));
+		}
+		ExecuteQuit();
+		return;
+	}
 
 	if (!bWasSuccessful)
 	{
@@ -398,6 +416,42 @@ void UCatGameInstance::HandleJoinSessionComplete(FName SessionName, EOnJoinSessi
 	}
 
 	OnJoinSessionResult.Broadcast(bDidTravel, ConnectString);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Quit ─────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void UCatGameInstance::QuitToDesktop()
+{
+	// Teardown lives here because SESSION_NAME lives here. The engine's Destroy
+	// Session Blueprint proxy operates on NAME_GameSession, so wiring the menu
+	// button to it would report success while destroying nothing.
+	if (SessionInterface.IsValid() && SessionInterface->GetNamedSession(SESSION_NAME))
+	{
+		bPendingQuitAfterDestroy = true;
+
+		DestroySessionCompleteDelegateHandle =
+			SessionInterface->AddOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegate);
+
+		UE_LOG(LogCatVentures, Log, TEXT("[Session] QuitToDesktop — live session found, destroying before quit."));
+		if (SessionInterface->DestroySession(SESSION_NAME))
+		{
+			return;   // ExecuteQuit runs from HandleDestroySessionComplete.
+		}
+
+		SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
+		bPendingQuitAfterDestroy = false;
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] QuitToDesktop — DestroySession call failed immediately; quitting anyway."));
+	}
+
+	ExecuteQuit();
+}
+
+void UCatGameInstance::ExecuteQuit()
+{
+	UE_LOG(LogCatVentures, Log, TEXT("[Session] Quitting to desktop."));
+	UKismetSystemLibrary::QuitGame(this, GetFirstLocalPlayerController(GetWorld()), EQuitPreference::Quit, false);
 }
 
 void UCatGameInstance::HandleSessionUserInviteAccepted(
