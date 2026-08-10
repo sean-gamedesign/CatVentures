@@ -944,6 +944,11 @@ void ACatBase::Server_SetPivotBraking_Implementation(bool bApply, float EntryAng
 	if (bApply)
 	{
 		PivotAngleDeg = EntryAngleDeg;   // proxies select the same 90°/180° clip variant
+		// Reset rides THIS reliable edge, not the Unreliable progress stream, which
+		// can be dropped or arrive out of order — a proxy would then render the
+		// previous pivot's end-of-clip pose for the first frames. Same shape the
+		// mantle already uses (SetMantleAnimState sets flag and progress together).
+		PivotProgress = 0.0f;
 	}
 }
 
@@ -1124,6 +1129,10 @@ void ACatBase::Server_SetStopBraking_Implementation(bool bApply, bool bSkid)
 {
 	ApplyStopBraking(bApply);
 	bGoSkid = bApply && bSkid;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+	if (bGoSkid)
+	{
+		SkidProgress = 0.0f;   // reset on the reliable edge — see Server_SetPivotBraking
+	}
 }
 
 void ACatBase::Server_SetSkidProgress_Implementation(float NewProgress)
@@ -1335,11 +1344,22 @@ void ACatBase::EndStartBurst()
 void ACatBase::Server_SetStartStep_Implementation(bool bActive)
 {
 	bGoStartStep = bActive;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
+	if (bActive)
+	{
+		// EnterStartCoil never even attempted this reset: it zeroes StartProgress
+		// locally, and StreamStartProgress won't fire until the delta reaches 0.05
+		// (~25 ms into a 0.12 s coil), so proxies held the previous launch's end
+		// pose for a fifth of the coil. See Server_SetPivotBraking.
+		StartProgress = 0.0f;
+	}
 }
 
 void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget)
 {
-	if (Traversal)
+	// StartMantle lerps the server's authoritative capsule between these two points
+	// with SetActorLocation. Unvalidated, that is a client-driven teleport anywhere
+	// on the map — and this RPC is the template four more verbs are built on.
+	if (Traversal && Traversal->ValidateMantleRequest(InStart, InTarget))
 	{
 		Traversal->StartMantle(InStart, InTarget);
 	}
@@ -1356,7 +1376,10 @@ void ACatBase::Server_WallBounce_Implementation(FVector_NetQuantizeNormal WallNo
 void ACatBase::Server_WallTransfer_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
 	FVector_NetQuantizeNormal InTargetNormal, bool bKickRight)
 {
-	if (Traversal)
+	// Same unvalidated-teleport hole as the mantle. Wall transfer shipped 2026-08-02,
+	// after the review that filed the mantle one — the pattern multiplying is exactly
+	// what that finding predicted, so both are validated through the same helper.
+	if (Traversal && Traversal->ValidateWallTransferRequest(InStart, InTarget))
 	{
 		Traversal->StartWallTransfer(InStart, InTarget, InTargetNormal, bKickRight);
 	}

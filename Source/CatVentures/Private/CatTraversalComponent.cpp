@@ -1784,6 +1784,96 @@ void UCatTraversalComponent::UpdateBalanceAssist(float DeltaTime)
 }
 
 
+// ══════════════════════════════════════════════════════════════════════════
+// ── Server-side validation of client takeover requests ───────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+bool UCatTraversalComponent::ValidateTakeoverGeometry(const TCHAR* Context,
+	const FVector& InStart, const FVector& InTarget,
+	float MaxHorizontal, float MinVertical, float MaxVertical) const
+{
+	const ACatBase* Cat = GetCat();
+	if (!Cat)
+	{
+		return false;
+	}
+
+	// FVector_NetQuantize rounds to whole units, and each verb's target carries a
+	// small authored float above the lip, so every bound gets a few uu of slack.
+	// The bounds are hundreds of uu wide — slack costs nothing that matters.
+	constexpr float Slack = 8.0f;
+
+	const float StartDrift = FVector::Dist(InStart, Cat->GetActorLocation());
+	if (StartDrift > TakeoverStartTolerance)
+	{
+		UE_LOG(LogCatVentures, Warning,
+			TEXT("[Traversal] %s REJECTED — claimed start is %.0f uu from the server's capsule (max %.0f)."),
+			Context, StartDrift, TakeoverStartTolerance);
+		return false;
+	}
+
+	const float Horizontal = FVector::Dist2D(InStart, InTarget);
+	if (Horizontal > MaxHorizontal + Slack)
+	{
+		UE_LOG(LogCatVentures, Warning,
+			TEXT("[Traversal] %s REJECTED — horizontal reach %.0f uu exceeds %.0f."),
+			Context, Horizontal, MaxHorizontal);
+		return false;
+	}
+
+	const float Vertical = InTarget.Z - InStart.Z;
+	if (Vertical < MinVertical - Slack || Vertical > MaxVertical + Slack)
+	{
+		UE_LOG(LogCatVentures, Warning,
+			TEXT("[Traversal] %s REJECTED — vertical delta %.0f uu outside [%.0f, %.0f]."),
+			Context, Vertical, MinVertical, MaxVertical);
+		return false;
+	}
+
+	return true;
+}
+
+bool UCatTraversalComponent::ValidateMantleRequest(const FVector& InStart, const FVector& InTarget) const
+{
+	// Both bounds fall out of TryDetectMantle's own arithmetic rather than being picked:
+	//   Target   = LipHit + IntoWall*12 + CornerShift(<=12 lateral) + (0,0,HalfHeight+2)
+	//   BottomZ  = Center.Z - HalfHeight
+	// so Target.Z - Start.Z is EXACTLY LedgeHeight + 2, and LedgeHeight is already
+	// gated to [MantleMinLedgeHeight, MantleMaxLedgeHeight] by the detector. The
+	// horizontal span is capped by the probe that found the lip in the first place.
+	constexpr float ForwardInset = 12.0f;   // IntoWall * 12 in the target expression
+	constexpr float MaxCornerShift = 12.0f; // SideProbe, applied along the wall tangent
+	constexpr float TargetFloat = 2.0f;     // the ~2 uu the capsule floats over the lip
+
+	return ValidateTakeoverGeometry(TEXT("Mantle"), InStart, InTarget,
+		MantleReachDistance + ForwardInset + MaxCornerShift,
+		MantleMinLedgeHeight,
+		MantleMaxLedgeHeight + TargetFloat);
+}
+
+bool UCatTraversalComponent::ValidateWallTransferRequest(const FVector& InStart, const FVector& InTarget) const
+{
+	// Horizontal: the far wall is found by a trace of WallTransferMaxGap along the
+	// held normal, then the target is pulled back by the stand-off.
+	const float MaxHorizontal = WallTransferMaxGap + WallTransferStandOff;
+
+	// Vertical is not a band here — the climb is DERIVED from the gap by the authored
+	// arc, so the server can just re-solve it. Pure arithmetic over constants and one
+	// UPROPERTY, identical on both machines, so this is exact rather than approximate.
+	const float Gap = FVector::Dist2D(InStart, InTarget);
+	const float ExpectedClimb = CatTransferArc::Solve(Gap, GetWallTransferPushTime(),
+		FMath::Max(GetWallTransferDuration() - GetWallTransferPushTime(), 0.05f)).TotalClimb;
+
+	// A wider tolerance than the flat Slack: this one rides a curve solve over a
+	// client-supplied gap, so small differences compound through the cubic.
+	constexpr float ClimbTolerance = 20.0f;
+
+	return ValidateTakeoverGeometry(TEXT("WallTransfer"), InStart, InTarget,
+		MaxHorizontal,
+		ExpectedClimb - ClimbTolerance,
+		ExpectedClimb + ClimbTolerance);
+}
+
 void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& InTarget)
 {
 	ACatBase* Cat = GetCat();

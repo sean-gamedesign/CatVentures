@@ -77,6 +77,31 @@ public:
 
 	bool IsMantling() const { return TraversalState == ECatTraversalState::Mantle; }
 
+	// ── Server-side validation of client takeover requests ──────────────
+	// A takeover RPC hands the server two points and it lerps its own authoritative
+	// capsule between them with SetActorLocation, outside the CMC. Unvalidated, a
+	// client can relocate its server-side pawn anywhere on the map — a far bigger
+	// grant than Server_BumperHitGC, which range-checks 300 cm for a shove.
+	//
+	// These check GEOMETRY ONLY and deliberately do NOT re-run the lip/headroom
+	// probes server-side: the server's copy of the pawn is ~RTT/2 behind the owner's
+	// and TestMap_02 is World Partition, so a server probe can legitimately miss
+	// geometry the client saw. That would false-reject valid mantles — turning a
+	// security fix into a gameplay bug. The bounds below are pure arithmetic derived
+	// from each verb's own detection maths, so they cannot false-reject.
+
+	/** True if a client-supplied mantle request lands inside the detector's own envelope. */
+	bool ValidateMantleRequest(const FVector& InStart, const FVector& InTarget) const;
+
+	/** True if a client-supplied wall-transfer request matches the authored arc. */
+	bool ValidateWallTransferRequest(const FVector& InStart, const FVector& InTarget) const;
+
+	/** How far a client's claimed start may sit from the server's own capsule (uu).
+	 *  Loose on purpose — it only has to make map-teleport impossible, while never
+	 *  tripping on ordinary RTT desync (a 650 cm/s sprint at 100 ms RTT is ~33 cm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traversal|Net", meta = (ClampMin = "50.0"))
+	float TakeoverStartTolerance = 200.0f;
+
 	// ── Tuning (header-only defaults, live-tunable) ─────────────────────
 
 	/** Master switch for the mantle. */
@@ -672,6 +697,14 @@ public:
 	void DoWallBounce(const FVector& WallNormal, bool bKickRight);
 
 private:
+	/** Shared core of the takeover validators. Checks the claimed start against the
+	 *  server's own capsule, then the start→target delta against a horizontal reach
+	 *  and a vertical band. Rejections log a Warning naming the offending quantity —
+	 *  a silent reject would present in play as a mantle that simply never happens.
+	 *  Context is the verb name for that log line. */
+	bool ValidateTakeoverGeometry(const TCHAR* Context, const FVector& InStart, const FVector& InTarget,
+		float MaxHorizontal, float MinVertical, float MaxVertical) const;
+
 	/** Airborne ledge detection for the locally controlled cat; starts the mantle on a hit. */
 	void TryDetectMantle();
 

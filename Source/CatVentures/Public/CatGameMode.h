@@ -41,8 +41,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "1.0"))
 	float ChaosThreshold = 100.0f;
 
-	/** How long Phase 1 (slow-mo warning) lasts in wall-clock seconds. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning")
+	/** How long Phase 1 (slow-mo warning) lasts in wall-clock seconds.
+	 *  ClampMin added 2026-08-09 (BB-03): this was the only Match|Tuning float without
+	 *  one, and a 0.01 debug value sat in the GM_CatVentures CDO unnoticed — at
+	 *  SlowMoDilation 0.2 that scheduled 0.002 game-seconds, so the entire slow-mo
+	 *  beat and the Meow Time widget were created and instantly overtaken by FinalCut. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.1"))
 	float WarningDuration = 3.0f;
 
 	/** How long Phase 2 (cinematic camera hold) lasts in wall-clock seconds before the fade begins. */
