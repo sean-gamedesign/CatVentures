@@ -505,10 +505,12 @@ void UCatTraversalComponent::TryDetectMantle()
 		EndWallAttach(EWallAttachEnd::Mantled);
 	}
 
-	StartMantle(Center, Target);
+	// The owner's yaw seeds BOTH machines' ease — see StartMantle.
+	const float SeedYaw = Cat->GetActorRotation().Yaw;
+	StartMantle(Center, Target, SeedYaw);
 	if (!Cat->HasAuthority())
 	{
-		Cat->Server_StartMantle(Center, Target);
+		Cat->Server_StartMantle(Center, Target, SeedYaw);
 	}
 }
 
@@ -1147,10 +1149,12 @@ bool UCatTraversalComponent::TryWallBounce()
 					Target.Z = P0.Z + CatTransferArc::Solve(G, GetWallTransferPushTime(),
 						FMath::Max(GetWallTransferDuration() - GetWallTransferPushTime(), 0.05f)).TotalClimb;
 				}
-				StartWallTransfer(P0, Target, NormalB, bKickRight);
+				// The owner's yaw seeds BOTH machines' sweep — see StartWallTransfer.
+				const float SeedYaw = Cat->GetActorRotation().Yaw;
+				StartWallTransfer(P0, Target, NormalB, bKickRight, SeedYaw);
 				if (!Cat->HasAuthority())
 				{
-					Cat->Server_WallTransfer(P0, Target, NormalB, bKickRight);
+					Cat->Server_WallTransfer(P0, Target, NormalB, bKickRight, SeedYaw);
 				}
 				return true;
 			}
@@ -1340,7 +1344,7 @@ float UCatTraversalComponent::GetWallTransferProgress() const
 //  git — but author the clip flat first, or it double-counts.)
 
 void UCatTraversalComponent::StartWallTransfer(const FVector& InStart, const FVector& InTarget,
-	const FVector& InTargetNormal, bool bKickRight)
+	const FVector& InTargetNormal, bool bKickRight, float SeedYaw)
 {
 	ACatBase* Cat = GetCat();
 	if (!Cat || TraversalState == ECatTraversalState::Mantle
@@ -1383,7 +1387,12 @@ void UCatTraversalComponent::StartWallTransfer(const FVector& InStart, const FVe
 	// ALONG the chosen shoulder (a chimney 180 sits on the wrap boundary — the
 	// round-5 lesson). DriveWallTransfer sweeps it on a SmoothStep of progress, so
 	// the turn completes just before the catch and cannot be interrupted.
-	TransferStartYaw = Cat->GetActorRotation().Yaw;
+	// SEEDED, not read locally — see StartMantle. This one matters more: Angle below
+	// is measured FROM this yaw and then applied as a relative sweep, so two machines
+	// starting 95° apart stay 95° apart for the whole crossing and land facing
+	// different directions on the far wall (Sean's 2026-08-09 report: client cat
+	// attached correctly on its own screen, 90–180° off on the host's).
+	TransferStartYaw = SeedYaw;
 	const float EndYaw = (-InTargetNormal).Rotation().Yaw;
 	const float Dir = bKickRight ? 1.0f : -1.0f;
 	float Angle = FMath::Fmod(Dir > 0.0f ? (EndYaw - TransferStartYaw)
@@ -1874,7 +1883,7 @@ bool UCatTraversalComponent::ValidateWallTransferRequest(const FVector& InStart,
 		ExpectedClimb + ClimbTolerance);
 }
 
-void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& InTarget)
+void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& InTarget, float SeedYaw)
 {
 	ACatBase* Cat = GetCat();
 	if (!Cat || TraversalState == ECatTraversalState::Mantle)
@@ -1899,7 +1908,11 @@ void UCatTraversalComponent::StartMantle(const FVector& InStart, const FVector& 
 	// catch teleport-rotated the body in one frame under a camera that doesn't
 	// follow — Sean's camera-positional "scramble" repro. DriveMantle swings the
 	// yaw over the first MantleFaceAlpha of the mantle instead.
-	MantleStartYaw  = Cat->GetActorRotation().Yaw;
+	// SEEDED, not read locally (2026-08-09). The owner passes its own yaw; the server
+	// receives that same value over the RPC. Reading here meant each machine seeded a
+	// relative ease from its own heading, so a pre-existing gap survived the whole
+	// takeover — measured as paired face-swing 6° vs 101° on one 28 uu ledge.
+	MantleStartYaw  = SeedYaw;
 	MantleTargetYaw = MantleStartYaw;
 	FVector Facing = InTarget - InStart;
 	Facing.Z = 0.0f;

@@ -993,9 +993,12 @@ protected:
 	void Server_SetStartStep(bool bActive);
 
 	/** Client → Server: mirror the mantle takeover (the grab pattern) — the server drives
-	 *  its own copy deterministically from the same start/target. */
+	 *  its own copy deterministically from the same start/target.
+	 *  OwnerYaw carries the owner's body yaw because the facing ease is RELATIVE and both
+	 *  machines run it independently: the server reading its own yaw meant any existing
+	 *  disagreement survived the whole takeover. Same reason the turn RPCs carry BodyYaw. */
 	UFUNCTION(Server, Reliable)
-	void Server_StartMantle(FVector_NetQuantize InStart, FVector_NetQuantize InTarget);
+	void Server_StartMantle(FVector_NetQuantize InStart, FVector_NetQuantize InTarget, float OwnerYaw);
 
 	/** Client → Server: mirror a wall bounce. The WALL NORMAL is what crosses the wire,
 	 *  not the resulting velocity, so both machines derive the launch from the same
@@ -1006,10 +1009,13 @@ protected:
 
 	/** Client → Server: mirror a chimney wall-transfer takeover. The server drives its
 	 *  own copy deterministically from the same start/target/normal — the mantle model,
-	 *  no progress streaming. Reliable: a dropped transfer would teleport-desync. */
+	 *  no progress streaming. Reliable: a dropped transfer would teleport-desync.
+	 *  OwnerYaw as per Server_StartMantle, and load-bearing here: the spring's authored
+	 *  turn is 124–128° applied RELATIVE to the start yaw, so a gap between the two
+	 *  copies is preserved exactly and they land facing different ways on the far wall. */
 	UFUNCTION(Server, Reliable)
 	void Server_WallTransfer(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
-		FVector_NetQuantizeNormal InTargetNormal, bool bKickRight);
+		FVector_NetQuantizeNormal InTargetNormal, bool bKickRight, float OwnerYaw);
 
 	/** Client → Server: mirror both edges of a wall attach (cling or scramble). The server
 	 *  runs the same deterministic vertical profile from the same entry parameters, so no

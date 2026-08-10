@@ -1354,14 +1354,15 @@ void ACatBase::Server_SetStartStep_Implementation(bool bActive)
 	}
 }
 
-void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget)
+void ACatBase::Server_StartMantle_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
+	float OwnerYaw)
 {
 	// StartMantle lerps the server's authoritative capsule between these two points
 	// with SetActorLocation. Unvalidated, that is a client-driven teleport anywhere
 	// on the map — and this RPC is the template four more verbs are built on.
 	if (Traversal && Traversal->ValidateMantleRequest(InStart, InTarget))
 	{
-		Traversal->StartMantle(InStart, InTarget);
+		Traversal->StartMantle(InStart, InTarget, OwnerYaw);
 	}
 }
 
@@ -1374,14 +1375,14 @@ void ACatBase::Server_WallBounce_Implementation(FVector_NetQuantizeNormal WallNo
 }
 
 void ACatBase::Server_WallTransfer_Implementation(FVector_NetQuantize InStart, FVector_NetQuantize InTarget,
-	FVector_NetQuantizeNormal InTargetNormal, bool bKickRight)
+	FVector_NetQuantizeNormal InTargetNormal, bool bKickRight, float OwnerYaw)
 {
 	// Same unvalidated-teleport hole as the mantle. Wall transfer shipped 2026-08-02,
 	// after the review that filed the mantle one — the pattern multiplying is exactly
 	// what that finding predicted, so both are validated through the same helper.
 	if (Traversal && Traversal->ValidateWallTransferRequest(InStart, InTarget))
 	{
-		Traversal->StartWallTransfer(InStart, InTarget, InTargetNormal, bKickRight);
+		Traversal->StartWallTransfer(InStart, InTarget, InTargetNormal, bKickRight, OwnerYaw);
 	}
 }
 

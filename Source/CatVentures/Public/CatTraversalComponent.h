@@ -72,8 +72,14 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType,
 		FActorComponentTickFunction* ThisTickFunction) override;
 
-	/** Begin the mantle takeover (local owner on detection; server via the pawn RPC). */
-	void StartMantle(const FVector& InStart, const FVector& InTarget);
+	/** Begin the mantle takeover (local owner on detection; server via the pawn RPC).
+	 *  SeedYaw is the body yaw the ease starts from. It is passed in rather than read
+	 *  from the actor because both machines run this curve independently and the ease
+	 *  is RELATIVE — reading locally let the server start from its own yaw, so any
+	 *  existing disagreement was carried through the whole move and never reconciled
+	 *  (nothing outside the CMC does). Measured 2026-08-09: paired mantles logging
+	 *  face-swing 6° vs 101° for the identical ledge. See Server_StartMantle. */
+	void StartMantle(const FVector& InStart, const FVector& InTarget, float SeedYaw);
 
 	bool IsMantling() const { return TraversalState == ECatTraversalState::Mantle; }
 
@@ -343,9 +349,12 @@ public:
 
 
 	/** Begin the transfer takeover (owner on detection; server via the pawn RPC).
-	 *  Deterministic from the same params on both machines — the mantle model. */
+	 *  Deterministic from the same params on both machines — the mantle model.
+	 *  SeedYaw for the same reason as StartMantle, and it matters MORE here: the
+	 *  authored spring turns 124–128°, applied as TransferStartYaw + TurnSign*TurnMag,
+	 *  so a relative turn preserves an existing gap exactly instead of washing it out. */
 	void StartWallTransfer(const FVector& InStart, const FVector& InTarget,
-		const FVector& InTargetNormal, bool bKickRight);
+		const FVector& InTargetNormal, bool bKickRight, float SeedYaw);
 
 	bool IsWallTransferring() const { return TraversalState == ECatTraversalState::WallTransfer; }
 
