@@ -832,10 +832,12 @@ void ACatBase::UpdateMovingPivot()
 		const float AppliedDelta = FRotator::NormalizeAxis(NewYaw - CurrentYaw);
 		SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
 
-		// Scaled by PivotFootworkCap: full-rate pivots sit in the 45-step blend zone
-		// instead of pinning the stride-elevated Move_Turn-90 rim clips (see header).
+		// Feeds TurnRateAnim, which during a pivot now drives only the BS1 fallback's
+		// residual weight through the ~0.1 s crossfade — the L/R side comes from the
+		// latched bPivotLeft (BB-08). The old PivotFootworkCap scale was deleted with it
+		// (BB-09): it shaped a magnitude nothing read.
 		const float AppliedRate = (DeltaTime > KINDA_SMALL_NUMBER) ? AppliedDelta / DeltaTime : 0.0f;
-		PivotTurnRateTarget = FMath::Clamp(AppliedRate / PivotTurnSpeedDegPerSec, -1.0f, 1.0f) * PivotFootworkCap;
+		PivotTurnRateTarget = FMath::Clamp(AppliedRate / PivotTurnSpeedDegPerSec, -1.0f, 1.0f);
 
 		// Clip scrub: accumulated APPLIED rotation over a drift-growing denominator.
 		// The remaining-vs-live-target form stalled during camera sweeps (2026-07-22
@@ -871,9 +873,13 @@ void ACatBase::EnterPivot()
 	PivotSweepAccumDeg = 0.0f;
 
 	// Latch the scrub denominator; floor at 1° so a threshold-grazing entry can't divide by ~0.
-	PivotInitialAngleDeg = FMath::Max(FMath::Abs(FRotator::NormalizeAxis(
-		PivotLiveInputDir.Rotation().Yaw - GetActorRotation().Yaw)), 1.0f);
+	const float SignedEntryAngle = FRotator::NormalizeAxis(
+		PivotLiveInputDir.Rotation().Yaw - GetActorRotation().Yaw);
+	PivotInitialAngleDeg = FMath::Max(FMath::Abs(SignedEntryAngle), 1.0f);
 	PivotAngleDeg         = PivotInitialAngleDeg;
+	// Latch the SIDE too (BB-08). Taken from the same signed entry angle the magnitude
+	// comes from, so side and clip variant can never disagree about the same pivot.
+	bPivotLeft            = SignedEntryAngle < 0.0f;
 	PivotAccumDeg         = 0.0f;
 	PivotProgress         = 0.0f;
 	LastSentPivotProgress = 0.0f;
@@ -886,7 +892,7 @@ void ACatBase::EnterPivot()
 	ApplyPivotBraking(true);
 	if (!HasAuthority())
 	{
-		Server_SetPivotBraking(true, PivotAngleDeg);
+		Server_SetPivotBraking(true, PivotAngleDeg, bPivotLeft);
 	}
 
 	// Plant dip: additive kick into the landing-cushion spring (composes with a
@@ -923,7 +929,7 @@ void ACatBase::ExitPivot()
 	ApplyPivotBraking(false);
 	if (!HasAuthority())
 	{
-		Server_SetPivotBraking(false, 0.0f);
+		Server_SetPivotBraking(false, 0.0f, false);
 	}
 
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot EXIT — Speed %.0f"), *GetName(), Speed);
@@ -937,13 +943,14 @@ void ACatBase::ApplyPivotBraking(bool bApply)
 	}
 }
 
-void ACatBase::Server_SetPivotBraking_Implementation(bool bApply, float EntryAngleDeg)
+void ACatBase::Server_SetPivotBraking_Implementation(bool bApply, float EntryAngleDeg, bool bLeft)
 {
 	ApplyPivotBraking(bApply);
 	bGoPivot = bApply;   // server copy → replicates on to simulated proxies (COND_SkipOwner)
 	if (bApply)
 	{
 		PivotAngleDeg = EntryAngleDeg;   // proxies select the same 90°/180° clip variant
+		bPivotLeft    = bLeft;           // …and the same side (BB-08)
 		// Reset rides THIS reliable edge, not the Unreliable progress stream, which
 		// can be dropped or arrive out of order — a proxy would then render the
 		// previous pivot's end-of-clip pose for the first frames. Same shape the
@@ -2014,6 +2021,7 @@ void ACatBase::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetime
 	DOREPLIFETIME_CONDITION(ACatBase, bGoPivot, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, PivotProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, PivotAngleDeg, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(ACatBase, bPivotLeft, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoSkid, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, SkidProgress, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(ACatBase, bGoStartStep, COND_SkipOwner);

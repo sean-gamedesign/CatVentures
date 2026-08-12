@@ -283,14 +283,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "60.0", ClampMax = "720.0"))
 	float PivotTurnSpeedDegPerSec = 120.0f;
 
-	/** Scale on the pivot's footwork blend param (TurnRateAnim). The A_Cat_Move_Turn clips
-	 *  are the kit's MOVING-turn clips — stride-elevated footwork through their WHOLE range
-	 *  (2026-07-18 paw sampler: paws hover 3–7 cm and never fully plant at any sustained
-	 *  blend position; ground contact −22.5, "planted" paw ≥ −20). There is no cap value
-	 *  that reads planted — lower slides, higher paddles; 0.4 is the accepted interim.
-	 *  Real fix = a dedicated CtrlRig-authored plant-pivot clip (M5 asset batch). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.1", ClampMax = "1.0"))
-	float PivotFootworkCap = 0.4f;
+	// PivotFootworkCap was DELETED 2026-08-09 (BB-09). It scaled PivotTurnRateTarget, which
+	// only reaches TurnRateAnim while pivoting — and during a pivot the ABP consumed
+	// TurnRateAnim purely as a sign test for L/R, so the magnitude changed nothing. Latching
+	// the side into bPivotLeft (BB-08) removed even that, leaving a knob that read meaningful
+	// and did nothing. Its original job (taming the stride-elevated Move_Turn rim clips) was
+	// retired when the authored Pivot90/180 clips shipped; turn-in-place footwork is handled
+	// by TurnStanceDrop instead.
 
 	/** Remaining angle (deg) to the input direction at which the pivot releases and input flows again. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "2.0", ClampMax = "60.0"))
@@ -962,7 +961,7 @@ protected:
 	 *  a lost restore would leave the server braking hard forever. EntryAngleDeg carries the
 	 *  latched pivot angle on the enter edge (0 on exit) so proxies select the same clip variant. */
 	UFUNCTION(Server, Reliable)
-	void Server_SetPivotBraking(bool bApply, float EntryAngleDeg);
+	void Server_SetPivotBraking(bool bApply, float EntryAngleDeg, bool bLeft);
 
 	/** Client → Server: throttled pivot-clip scrub position (the Server_SetTurnRate
 	 *  streaming pattern). Unreliable — loss just holds the last scrub for a frame. */
@@ -1225,6 +1224,14 @@ protected:
 	 *  mid-pivot clip switch would pop). Rides the Server_SetPivotBraking enter edge. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
 	float PivotAngleDeg = 0.0f;
+
+	/** Pivot SIDE latched at entry — true = left. Latched for exactly the same reason as
+	 *  PivotAngleDeg above, which is the bug this fixes (BB-08): the ABP used to pick the
+	 *  L/R clip from live TurnRateAnim, which interps at speed 30, so a left pivot arming
+	 *  while a previous turn-in-place still held e.g. +0.6 played 1–2 frames of the RIGHT
+	 *  clip before the value crossed zero. Rides the Server_SetPivotBraking enter edge. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Animation|Cosmetic")
+	bool bPivotLeft = false;
 
 	/** True while a sprint-band weighty stop drives the Skid state — the ABP swaps the gait
 	 *  run-out for the skid-stop clip. Trot-band stops keep the plain gait run-out (their
