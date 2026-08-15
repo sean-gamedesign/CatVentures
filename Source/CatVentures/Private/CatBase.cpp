@@ -1732,6 +1732,17 @@ void ACatBase::PerformInteractTrace()
 // TriggerGrab/TriggerRelease used to hand-dispatch to _Implementation on authority —
 // harmless, but a third shape that implied the doctrine was real.
 
+// Grab logging runs on every machine, and PawPrint's log tap is process-wide — in a
+// single-process PIE session both machines' lines land in ONE stream. Without a role
+// tag you cannot tell the server's teardown from the client's, which is the entire
+// question the grab lines exist to answer.
+static const TCHAR* GrabRoleTag(const ACatBase* Cat)
+{
+	if (Cat->HasAuthority())        return TEXT("SRV");
+	if (Cat->IsLocallyControlled()) return TEXT("OWN");
+	return TEXT("SIM");
+}
+
 void ACatBase::TriggerGrab()
 {
 	// Client-side prediction: apply drag settings immediately so there is no
@@ -1825,6 +1836,9 @@ void ACatBase::Client_GrabFailed_Implementation()
 	if (!bIsGrabbing)
 	{
 		RestoreNormalMovementSettings();
+
+		UE_LOG(LogCatVentures, Log, TEXT("[%s] Grab FAILED (%s) — drag prediction rolled back"),
+			*GetName(), GrabRoleTag(this));
 	}
 }
 
@@ -1873,6 +1887,10 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 	GrabbedComponent = GrabbedComp;
 	bIsGrabbing      = true;
 	ApplyDragMovementSettings();
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Grab START (%s) — '%s' comp '%s' bone '%s'"),
+		*GetName(), GrabRoleTag(this), *GetNameSafe(GrabbedComp->GetOwner()),
+		*GrabbedComp->GetName(), *BoneName.ToString());
 }
 
 void ACatBase::Server_ReleaseGrab_Implementation()
@@ -1883,6 +1901,12 @@ void ACatBase::Server_ReleaseGrab_Implementation()
 
 void ACatBase::Multicast_ReleaseGrab_Implementation()
 {
+	// Captured before the reset below — the log line is the only place that still
+	// wants to name what was being held.
+	const FString HeldActor = GrabbedComponent.IsValid()
+		? GetNameSafe(GrabbedComponent->GetOwner())
+		: TEXT("<already gone>");
+
 	// Re-enable collision strain on THIS machine's Chaos solver.
 	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()))
 	{
@@ -1896,6 +1920,9 @@ void ACatBase::Multicast_ReleaseGrab_Implementation()
 	GrabbedComponent.Reset();
 	bIsGrabbing = false;
 	RestoreNormalMovementSettings();
+
+	UE_LOG(LogCatVentures, Log, TEXT("[%s] Grab RELEASE (%s) — '%s'"),
+		*GetName(), GrabRoleTag(this), *HeldActor);
 }
 
 void ACatBase::UpdateGrab(float DeltaTime)
@@ -1908,10 +1935,23 @@ void ACatBase::UpdateGrab(float DeltaTime)
 	// component can go invalid on a client while the server still holds it).
 	if (!GrabbedComponent.IsValid())
 	{
+		// On a client bIsGrabbing stays true until the server's OnRep lands, so this
+		// branch re-enters every tick until then. The constraint only exists on the
+		// FIRST of those ticks, which makes it the natural once-per-machine log gate.
+		const bool bToreDownConstraint = (GrabConstraint != nullptr);
+
 		if (GrabConstraint)
 		{
 			GrabConstraint->DestroyComponent();
 			GrabConstraint = nullptr;
+		}
+
+		if (bToreDownConstraint)
+		{
+			UE_LOG(LogCatVentures, Log,
+				TEXT("[%s] Grab AUTO-RELEASE (%s) — held component destroyed; constraint torn down, movement %s"),
+				*GetName(), GrabRoleTag(this),
+				(HasAuthority() || IsLocallyControlled()) ? TEXT("restored here") : TEXT("left to OnRep"));
 		}
 
 		// bIsGrabbing is replicated gameplay state and keeps ONE owner: the server
@@ -1944,6 +1984,8 @@ void ACatBase::UpdateGrab(float DeltaTime)
 
 		if (Dist > MaxGrabDistance)
 		{
+			UE_LOG(LogCatVentures, Log, TEXT("[%s] Grab AUTO-RELEASE (%s) — drift %.0f > %.0f"),
+				*GetName(), GrabRoleTag(this), Dist, MaxGrabDistance);
 			Multicast_ReleaseGrab();
 			return;
 		}
