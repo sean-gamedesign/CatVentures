@@ -385,6 +385,7 @@ void UCatTraversalComponent::TryDetectMantle()
 
 	UCapsuleComponent* Capsule = Cat->GetCapsuleComponent();
 	const float HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const float Radius     = Capsule->GetScaledCapsuleRadius();
 	const FVector Center = Cat->GetActorLocation();
 	const float CapsuleBottomZ = Center.Z - HalfHeight;
 
@@ -484,12 +485,19 @@ void UCatTraversalComponent::TryDetectMantle()
 		}
 	}
 
-	// 3. Headroom: the landing spot must fit the capsule.
+	// 3. Headroom: the landing spot must fit the CAPSULE, not a line. The old test was a
+	//    single ray from target-centre to target-top, which checked neither the radius nor
+	//    the lower half — a narrow ledge, a pillar beside the landing spot and a low side
+	//    overhang all passed it (BB-15). Shrunk 1 uu: the target deliberately floats 2 uu
+	//    above the lip (that float is what makes EndMantle produce a real Landed()), and a
+	//    full-size shape can graze the ledge surface or the face below it into a false
+	//    reject — a reject here is invisible except as a mantle that silently never arms.
 	const FVector Target = LipHit.ImpactPoint + IntoWall * 12.0f + CornerShift
 		+ FVector(0, 0, HalfHeight + 2.0f);
-	FHitResult RoomHit;
-	if (GetWorld()->LineTraceSingleByChannel(RoomHit, Target,
-			Target + FVector(0, 0, HalfHeight), ECC_Visibility, Params))
+	const FCollisionShape FitShape = FCollisionShape::MakeCapsule(
+		FMath::Max(Radius - 1.0f, 1.0f), FMath::Max(HalfHeight - 1.0f, 1.0f));
+	if (GetWorld()->OverlapBlockingTestByChannel(Target, FQuat::Identity,
+			ECC_Visibility, FitShape, Params))
 	{
 		NoteReject(ETraversalReject::NoHeadroom);
 		return;
@@ -1052,6 +1060,28 @@ void UCatTraversalComponent::EndWallAttach(EWallAttachEnd Reason)
 		}
 	}
 	AttachNormal = FVector::ZeroVector;
+}
+
+void UCatTraversalComponent::AbortAllTraversal()
+{
+	// The live takeover first — each End* restores its own movement mode and clears its
+	// own anim flags. The three states are mutually exclusive, so this is one branch.
+	switch (TraversalState)
+	{
+	case ECatTraversalState::Mantle:       EndMantle(false);                       break;
+	case ECatTraversalState::WallTransfer: EndWallTransfer(false);                 break;
+	case ECatTraversalState::WallAttach:   EndWallAttach(EWallAttachEnd::Aborted); break;
+	default: break;
+	}
+
+	// Then the two overrides that outlive any state: the bounce's lateral-friction
+	// window and the kick's orient-to-movement hold. Both are timer-driven, so both
+	// can be live with TraversalState already None.
+	EndReboundWindow();
+	if (ACatBase* Cat = GetCat())
+	{
+		Cat->FinishWallKickYawHold(/*bSnapToLaunchYaw=*/false);
+	}
 }
 
 void UCatTraversalComponent::EndReboundWindow()

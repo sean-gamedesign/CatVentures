@@ -83,6 +83,13 @@ public:
 
 	bool IsMantling() const { return TraversalState == ECatTraversalState::Mantle; }
 
+	/** Ends whatever traversal state is live and hands back every CMC value this component
+	 *  can hold (movement mode, the rebound friction window, the wall-kick yaw hold). Safe
+	 *  to call at any time — each branch is a no-op when its state isn't live. This is the
+	 *  component's half of ACatBase::RestoreAllCMCOverrides (BB-16): the pawn owns the
+	 *  grounded overrides, traversal owns its own, and neither reaches into the other. */
+	void AbortAllTraversal();
+
 	// ── Server-side validation of client takeover requests ──────────────
 	// A takeover RPC hands the server two points and it lerps its own authoritative
 	// capsule between them with SetActorLocation, outside the CMC. Unvalidated, a

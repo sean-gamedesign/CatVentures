@@ -633,10 +633,12 @@ public:
 protected:
 	//~ Begin AActor Interface
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	//~ End AActor Interface
 
 	//~ Begin APawn Interface
 	virtual void PossessedBy(AController* NewController) override;
+	virtual void UnPossessed() override;
 	virtual void OnRep_PlayerState() override;
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	//~ End APawn Interface
@@ -1635,6 +1637,14 @@ private:
 	/** Forces the CharacterMovementComponent into Walking mode if it is currently None. */
 	void ForceWalkingMovementMode();
 
+	/** Hands every CMC override this pawn can hold back to its default, and clears the flags
+	 *  that own them. Each of stop / pivot / start-burst / grab-drag / traversal restores only
+	 *  from its own tick path, so being unpossessed, destroyed or travelled mid-state strands
+	 *  the override on a pawn that outlives the state (a cat unpossessed mid-mantle keeps
+	 *  MOVE_Flying and floats). Called from EndPlay and UnPossessed (BB-16). Traversal restores
+	 *  through the component, which stays the single restore point for its own takeovers. */
+	void RestoreAllCMCOverrides();
+
 	// ── Swat State (per-instance — CDO-safe) ───────────────────────────
 
 	/** Paw socket location from the previous tick (for sweep start point). */
@@ -1783,7 +1793,9 @@ private:
 	/** Performs the sphere trace and calls Interact on any hit IInteractableInterface actor. Authority only. */
 	void PerformInteractTrace();
 
-	/** Checks auto-release conditions (destroyed or drifted too far). Authority only. */
+	/** Checks auto-release conditions. Runs on ALL roles: the destroyed-component cleanup is
+	 *  per-machine (fracture is simulated locally, so a client can see the grabbed component
+	 *  die before the server does — BB-17). The drift auto-release inside is authority-only. */
 	void UpdateGrab(float DeltaTime);
 
 	/** Sets CMC to drag-movement state: reduced MaxWalkSpeed, bOrientRotationToMovement disabled. */

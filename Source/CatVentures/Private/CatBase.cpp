@@ -266,11 +266,12 @@ void ACatBase::Tick(float DeltaTime)
 	// ── Jump gravity: authority + autonomous proxy only ────────────────
 	UpdateJumpGravity();
 
-	// ── Mouth Grab: authority only — moves the physics handle target ──
-	if (HasAuthority())
-	{
-		UpdateGrab(DeltaTime);
-	}
+	// ── Mouth Grab: ALL roles — the local-constraint cleanup is per-machine ───
+	// The drift auto-release inside is still authority-gated. The gate used to live
+	// here, which made the local cleanup unreachable on clients (BB-17): GC fracture
+	// is simulated locally, so a client whose grabbed component goes invalid held a
+	// dangling constraint and a stale bIsGrabbing until the server noticed.
+	UpdateGrab(DeltaTime);
 
 	// Turn-in-place is now driven by root-motion turn montages (see TryTurnInPlace),
 	// not a procedural rotation commitment — the montage's root motion rotates the actor
@@ -1711,20 +1712,33 @@ void ACatBase::PerformInteractTrace()
 // ── Mouth Grab ──────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 
+// ── Listen-server RPC convention (BB-13) ──────────────────────────────────
+// There are TWO shapes in this file and both are correct — the choice is decided by
+// what the Server function does, not by taste:
+//
+//   ACTION RPC — the server function IS the work (traces, spawns, multicasts).
+//     Call it UNCONDITIONALLY. On authority UE resolves a FUNC_NetServer call to
+//     FunctionCallspace::Local and runs it in place, so the host executes the action
+//     directly. Swat, Interact and Grab/Release are this shape.
+//
+//   MIRROR RPC — the owner already did the work locally and the RPC only tells the
+//     server to match (the M1/M2/traversal pattern). Guard with
+//     `if (!HasAuthority())`, because on the host the local call already ran and the
+//     RPC would be a redundant second application.
+//
+// CLAUDE.md used to state that a Server RPC is "a no-op on the host" and must always
+// be bypassed. That is wrong, and the proof shipped: TriggerSwat and TriggerInteract
+// have always called theirs unconditionally and the host's swat multicasts fine.
+// TriggerGrab/TriggerRelease used to hand-dispatch to _Implementation on authority —
+// harmless, but a third shape that implied the doctrine was real.
+
 void ACatBase::TriggerGrab()
 {
 	// Client-side prediction: apply drag settings immediately so there is no
 	// rubber-band stutter waiting for the server round-trip.
 	ApplyDragMovementSettings();
 
-	if (HasAuthority())
-	{
-		Server_Grab_Implementation();
-	}
-	else
-	{
-		Server_Grab();
-	}
+	Server_Grab();
 }
 
 void ACatBase::TriggerRelease()
@@ -1732,14 +1746,7 @@ void ACatBase::TriggerRelease()
 	// Client-side prediction: restore settings before the RPC so input feels instant.
 	RestoreNormalMovementSettings();
 
-	if (HasAuthority())
-	{
-		Server_ReleaseGrab_Implementation();
-	}
-	else
-	{
-		Server_ReleaseGrab();
-	}
+	Server_ReleaseGrab();
 }
 
 void ACatBase::Server_Grab_Implementation()
@@ -1897,7 +1904,8 @@ void ACatBase::UpdateGrab(float DeltaTime)
 
 	// Local cleanup: if the grabbed actor was destroyed on this machine, tear down
 	// the local constraint immediately. No multicast needed — each machine detects
-	// destruction independently.
+	// destruction independently (GC fracture is simulated per-machine, so the grabbed
+	// component can go invalid on a client while the server still holds it).
 	if (!GrabbedComponent.IsValid())
 	{
 		if (GrabConstraint)
@@ -1905,8 +1913,24 @@ void ACatBase::UpdateGrab(float DeltaTime)
 			GrabConstraint->DestroyComponent();
 			GrabConstraint = nullptr;
 		}
-		bIsGrabbing = false;
-		RestoreNormalMovementSettings();
+
+		// bIsGrabbing is replicated gameplay state and keeps ONE owner: the server
+		// clears it and clients follow through OnRep_bIsGrabbing. A client clearing it
+		// locally would just be overwritten on the next update — and would suppress the
+		// very OnRep that restores its movement (a RepNotify doesn't fire when the value
+		// arrives already matching).
+		if (HasAuthority())
+		{
+			bIsGrabbing = false;
+		}
+
+		// The drag settings were client-PREDICTED on press (see TriggerGrab), so the
+		// owner un-predicts them here rather than walking slow until the server notices.
+		// Idempotent with the OnRep that follows.
+		if (HasAuthority() || IsLocallyControlled())
+		{
+			RestoreNormalMovementSettings();
+		}
 		return;
 	}
 
@@ -2043,6 +2067,61 @@ void ACatBase::PossessedBy(AController* NewController)
 {
 	Super::PossessedBy(NewController);
 	ForceWalkingMovementMode();
+}
+
+void ACatBase::UnPossessed()
+{
+	// The pawn OUTLIVES the controller here, which is what makes this the case that bites:
+	// every CMC override is restored only by its own tick path, and those paths stop when
+	// the input driving them does. An unpossessed cat mid-mantle keeps MOVE_Flying and
+	// floats; mid-stop it brakes at StopBrakingDeceleration forever (BB-16).
+	RestoreAllCMCOverrides();
+	Super::UnPossessed();
+}
+
+void ACatBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// Belt-and-braces next to UnPossessed: on a plain Destroy the CMC dies with the pawn,
+	// but level transitions and seamless travel can carry a pawn across, and this also
+	// stops a live takeover driving SetActorLocation into teardown.
+	RestoreAllCMCOverrides();
+	Super::EndPlay(EndPlayReason);
+}
+
+void ACatBase::RestoreAllCMCOverrides()
+{
+	// Traversal owns its own takeovers (movement mode, the rebound friction window, the
+	// wall-kick yaw hold) — the component is the single restore point for all of them,
+	// per the growth-watch decision. Run it FIRST: its aborts hand back the movement mode
+	// the grounded restores below assume.
+	if (Traversal)
+	{
+		Traversal->AbortAllTraversal();
+	}
+
+	// Grounded systems: clear the owning flags BEFORE restoring, because the restores
+	// consult them — ApplyStopBraking(false) re-asserts the pivot boost if bIsPivoting is
+	// still set, which would leave exactly the override this function exists to clear.
+	bIsPivoting      = false;
+	bIsStopping      = false;
+	bIsStartCoiling  = false;
+	bIsStartBursting = false;
+	ApplyStopBraking(false);
+	ApplyPivotBraking(false);
+	ApplyStartBurstAccel(false);
+
+	// Grab: the CMC half only. The constraint is a component and dies with the pawn, and
+	// tearing down a live grab here would be a gameplay decision, not a restore.
+	RestoreNormalMovementSettings();
+
+	// Anim flags of the same class: each is set on a reliable enter edge and cleared on
+	// the matching exit, so a stranded state freezes the scrub pose on every proxy.
+	if (HasAuthority())
+	{
+		bGoPivot      = false;
+		bGoSkid       = false;
+		bGoStartStep  = false;
+	}
 }
 
 void ACatBase::OnRep_PlayerState()
@@ -3446,7 +3525,12 @@ void ACatBase::Landed(const FHitResult& Hit)
 	{
 		const float MoveScale = (Speed > 150.0f) ? 0.4f : 1.0f;
 		const float DipTarget = FMath::Min(ImpactZ * LandCushionDipPerImpact, LandCushionMaxDip) * MoveScale;
-		MeshCushionVelocity = -DipTarget * LandCushionFrequency * UE_EULERS_NUMBER;
+		// -= not =, so a same-frame pivot-plant / stop-plant / start-coil kick composes
+		// instead of being discarded (BB-18) — every other kick site already does this,
+		// and their comments claim composition. Bounded by construction: the integrator
+		// clamps MeshCushionOffset to ±LandCushionMaxDip every step regardless of how
+		// much velocity is stored.
+		MeshCushionVelocity -= DipTarget * LandCushionFrequency * UE_EULERS_NUMBER;
 	}
 
 	// Camera weight (M3): landing dip on the local player's camera. Additive into the
