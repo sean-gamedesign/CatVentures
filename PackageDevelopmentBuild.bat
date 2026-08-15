@@ -2,7 +2,7 @@
 setlocal
 
 REM ── Edit UE_ROOT if your engine install lives elsewhere ──
-set "UE_ROOT=C:\Program Files\Epic Games\UE_5.7"
+set "UE_ROOT=C:\Program Files\Epic Games\UE_5.8"
 set "PROJECT_PATH=%~dp0CatVentures.uproject"
 set "ARCHIVE_DIR=%~dp0ArchivedBuilds"
 

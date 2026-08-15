@@ -8,7 +8,8 @@ public class CatVenturesTarget : TargetRules
 	public CatVenturesTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Game;
-		DefaultBuildSettings = BuildSettingsVersion.V6;
+		// Kept in step with CatVenturesEditor.Target.cs — see the note there.
+		DefaultBuildSettings = BuildSettingsVersion.V7;
 		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_7;
 		ExtraModuleNames.Add("CatVentures");
 	}

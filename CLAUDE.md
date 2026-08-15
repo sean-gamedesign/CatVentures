@@ -1,13 +1,24 @@
 # CLAUDE.md
 
 ## Specific Instructions
-Before changing code explain what you've discorved in your investigations. I want to know whats up before you make edits
+
+**THESE ARE THE GOLDEN RULES. They outrank every other instruction in this file.**
+
+Before changing code explain what you've discorved in your investigations. I want to know whats up before you make edits.
+
+**Precedence.** Parts of this file are GENERATED — currently the `<!-- BEGIN VibeUE -->` … `<!-- END VibeUE -->` block at the bottom, written by `VibeUE.GenerateAgentConfig` and overwritten wholesale on every re-run (so never edit inside it, and never put anything you want to keep there). Generated guidance is a *reference for how to drive the tools*, not a mandate about how to work with me. **Wherever it conflicts with this section, this section wins.** Three conflicts exist today and are resolved as follows:
+
+- It says *"execute multi-step tasks straight through — don't pause"*. **No.** Report findings and wait for my go before making edits, per the rule above. The checkpoint is the point.
+- It says *"commit at milestones"*. **No.** Commit only when I ask.
+- It says *"append gotchas to this file"* as you go. **No.** This file is curated and mirrored into a Gemini Gem; propose additions and let me decide.
+
+If a future generated block adds a directive that contradicts this section, follow this section and tell me about the conflict.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-CatVentures is an Unreal Engine 5.7 multiplayer third-person cat game. There is a single C++ module (`CatVentures`) with a Blueprint layer on top. The primary C++ class is `ACatBase`, a multiplayer-ready character; alongside it the C++ layer provides the multiplayer framework (`ACatGameMode`/`ACatGameState`/`ACatPlayerState`/`ACatPlayerController`) and a Steam session backend (`UCatGameInstance`). The core gameplay loop is **"chaos"**: players smash Geometry-Collection props to fill a Chaos Meter, which triggers a cinematic match-end sequence and scoreboard. Most gameplay actors, the AnimBP, and all UI are Blueprints under `Content/`, edited live through the **VibeUE** MCP editor-control layer (see *VibeUE* below).
+CatVentures is an Unreal Engine 5.8 multiplayer third-person cat game (upgraded from 5.7 on 2026-08-14 — see *Build & Development*). There is a single C++ module (`CatVentures`) with a Blueprint layer on top. The primary C++ class is `ACatBase`, a multiplayer-ready character; alongside it the C++ layer provides the multiplayer framework (`ACatGameMode`/`ACatGameState`/`ACatPlayerState`/`ACatPlayerController`) and a Steam session backend (`UCatGameInstance`). The core gameplay loop is **"chaos"**: players smash Geometry-Collection props to fill a Chaos Meter, which triggers a cinematic match-end sequence and scoreboard. Most gameplay actors, the AnimBP, and all UI are Blueprints under `Content/`, edited live through the **VibeUE** MCP editor-control layer (see *VibeUE* below).
 
 ## Character Controller — current feel & tuning (reference)
 
@@ -48,16 +59,20 @@ All movement tuning UPROPERTYs are re-applied to the CMC in `ACatBase::BeginPlay
 - Or: `"C:\Program Files (x86)\Epic Games\Launcher\Engine\Binaries\Win64\UnrealVersionSelector.exe" -projectfiles "C:\Projects\CatVentures\CatVentures.uproject"`
 - Note: UE 5.7 removed `GenerateProjectFiles.bat` from `Engine\Build\BatchFiles\`. Use `UnrealVersionSelector.exe` instead. It runs silently — no output on success.
 
+**Engine version: UE 5.8** (upgraded 2026-08-14 on branch `chore/ue58-upgrade`; UE_5.7 kept installed until the upgrade is committed). The bump needed exactly **one** code-side change: `BuildSettingsVersion.V6` → **`V7`** in both `Source/CatVentures.Target.cs` and `CatVenturesEditor.Target.cs`. That is not optional — on an installed engine the Editor target shares build products with `UnrealEditor`, which 5.8 builds with `ReturnType`/`Dangling`/`UnreachableCode` promoted to **Error**, and UBT hard-refuses a target that differs. After that: 76 TUs, zero warnings, **zero C++ changes**. `IncludeOrderVersion` is deliberately left at `Unreal5_7` (backward-compatible, warns only; include-order changes are their own class of breakage and belong in their own pass).
+
 **Build** (Development Editor config):
 - Open `CatVentures.sln` in Visual Studio and build `CatVentures` target
-- Or: `"C:\Program Files\Epic Games\UE_5.7\Engine\Build\BatchFiles\Build.bat" CatVenturesEditor Win64 Development "C:\Projects\CatVentures\CatVentures.uproject"`
+- Or: `"C:\Program Files\Epic Games\UE_5.8\Engine\Build\BatchFiles\Build.bat" CatVenturesEditor Win64 Development "C:\Projects\CatVentures\CatVentures.uproject"`
 - Live Coding (in-editor): `LiveCoding.Compile` via console, or Ctrl+Alt+F11. Requires the editor to be open.
 - External build requires the editor to be **closed** — UE will refuse to build while Live Coding is active.
 
 **Sandbox note for agent-driven builds:**
 - The harness sandbox blocks execution of binaries under `C:\Program Files\...`. Build/regen invocations require `dangerouslyDisableSandbox: true` on the tool call. Reads (`Test-Path`, etc.) work without it.
 
-**Run/Test:** Launch from the UE 5.7 Editor (PIE). For multiplayer tests, use *Play → Number of Players: 2* with *Net Mode: Play As Listen Server*.
+**Run/Test:** Launch from the UE 5.8 Editor (PIE). For multiplayer tests, use *Play → Number of Players: 2* with *Net Mode: Play As Listen Server*.
+
+**Packaging:** `PackageDevelopmentBuild.bat` (UAT BuildCookRun → `ArchivedBuilds\Windows\`). It hardcodes `UE_ROOT`, which **must** track the engine version — it sat at `UE_5.7` after the 5.8 upgrade, which would have packaged a 5.8 project with the old engine's UAT (fixed 2026-08-15). A full Development package takes ~3 min with a warm DDC and produces ~1.1 GB.
 
 There are no automated tests in this project. Verification is done via PIE.
 
@@ -300,6 +315,8 @@ C++ session backend only — no UI or `ServerTravel` here. Uses Online Subsystem
 - **`bUseSteamNetworking=false` is required**, not optional. Left at the engine default (true), SteamSockets registers as the process-**default** socket subsystem. `SteamSocketsNetDriver` doesn't care (it asks for its subsystem by name), but `IpNetDriver` takes the default — so any fallback to IpNetDriver gets handed Steam sockets, tries to bind the local SteamID, fails `setsockopt SO_BROADCAST`, and **the host cannot listen at all**. That converts a silent degradation into a hard failure. Note the LAN beacon is *not* affected (it takes `PLATFORM_SOCKETSUBSYSTEM` explicitly) — checking only the beacon and concluding the flag was safe is exactly the mistake that shipped this.
 - **Steam transport cannot be tested in the editor**, by design (`SteamSocketsModule.cpp:15` gates init on `IsRunningDedicatedServer() || IsRunningGame()`); PIE always falls back to IpNetDriver and is unaffected by all of the above. Verification = packaged builds. A packaged host can be smoke-tested headlessly in ~30 s without a second machine: `CatVentures.exe /Game/Maps/TestMap_02?listen -log -nullrhi -unattended -nosplash`. Also: only ONE instance per machine can init Steam (`bInitServerOnClient=true` makes the client grab the Game Server API too), so a single-box two-instance Steam test is impossible — the second instance falls back to the NULL subsystem. For direct-IP testing use `-nosteam` on both ends (SteamSockets' address parser rejects dotted IPs).
 
+**Re-verified on UE 5.8 (2026-08-15), packaged Development build.** `SteamSockets` lives at `Engine/Plugins/Runtime/Steam/SteamSockets` in **both** 5.7 and 5.8 — the plugin did not move and `/Script/SteamSockets.SteamSocketsNetDriver` still resolves. A headless packaged host logged `Class=SteamSocketsNetDriver`, `SteamSockets: Initializing Network Relay`, `Now tracking socket … for addr <SteamID64>:7777`, `started listening on 7777`, and `RelayNetworkStatus: avail=OK config=OK anyrelay=OK` — 0 errors, and the only two warnings (no Steam stats configured; one transient SDR config fetch that retried) also appear in the working 5.7 reference log. Still outstanding: the 2-PC cross-account join on 5.8. Also confirmed still true: `steam_appid.txt` is **not** in the staging manifest — the Development runtime writes it from `SteamDevAppId`, so the gap remains real for Shipping.
+
 **`[Net] NetDriver created  Def=... Class=... Obj=...`** is logged from `UCatGameInstance` (bound to `FWorldDelegates::OnNetDriverCreated`, before the OSS early-returns so it still reports under `-nosteam`). It exists specifically because the fallback is silent, and it covers the client's `PendingNetDriver` too. `Class=IpNetDriver` on a Steam build means the fallback fired. `WarnIfNotSteam` additionally warns when a non-LAN Host/Find runs on a non-Steam OSS. `-ForceLAN` on the command line sets `bForceLANMatch` (packaged builds have no CDO to tick); pair with `-nosteam`.
 
 Known/deferred: `steam_appid.txt` never actually stages into the archive (the `AdditionalNonUFSFiles` entry matches nothing) — harmless for non-Shipping builds, which auto-write it from `SteamDevAppId`; real for Shipping. `BuildUniqueId` mismatch silently hides sessions between different builds (engine drops them with only an engine-log warning), so 2-PC tests must use the same archive on both ends. Test protocol: `Saved/.Aura/plans/steam-mp-test-protocol.md`.
@@ -319,18 +336,28 @@ Known/deferred: `steam_appid.txt` never actually stages into the archive (the `A
 - **Two capture surfaces:** (1) a **process-wide ref-counted log tap** (`FOutputDevice` on `GLog`, thread-safe, ≤ Verbose) capturing every engine log line with its category — registered once even in multi-world PIE; (2) **named float sample channels** (capped ring buffers, per world). `ACatBase::Tick` feeds a 15-channel set for the locally controlled cat (Speed/SpeedType/JumpPhase/LeanAmount/AccelLean/CushionZ/CamDipZ/TurnRateAnim + stop/coil/burst/pivot/sprint/turn-in-place flags + TurnDropZ); `UpdateFootIK` feeds 11 more `IK_*` channels (2026-07-21: per-paw offsets, front floor-hit flags, ChestDropZ, SlopePitch, InclineF, Alpha, HandL rot-pitch). Timebase = real seconds since capture start, shared across both surfaces.
 - **Retrieval:** (a) auto-dump to `Saved/PawPrint/<stamp>_<role>_{channels,log}.csv` per world on teardown (host/client tagged in MP; sample-less transition worlds skip — PIE clients traverse an empty world before ClientTravel); (b) reflected query API (`GetChannelSamples`, `GetCapturedCategories`, `GetCapturedLines` with category filter + incremental poll cursor) — **VibeUE python reaches it live during PIE**: `unreal.find_object(game_world, 'PawPrintSubsystem_0')` (note: `SubsystemBlueprintLibrary` is absent from the VibeUE python surface, and the pawn's cached `PawPrint` pointer is a protected property python can't read — `find_object` on the world is the access path); (c) `DumpToCSV()` on demand.
 - **Diagnostic doctrine:** new per-tick numeric investigation channels belong HERE (add a `SampleChannel` call), not in Verbose logs or bespoke slate samplers. Channels CSV is long-format (`Time,Channel,Value`).
+- **The two dump files use DIFFERENT encodings** — the `_log.csv` is **UTF-16LE with a BOM**, the `_channels.csv` is plain **UTF-8**. Reading either with the other's encoding yields mojibake or a "UTF-16 stream does not start with BOM" error, so any parser must handle both (worth fixing in `DumpToCSV` one day; noted 2026-08-15).
+- **Verified working on UE 5.8** (2026-08-15): a 65 s single-player PIE captured **41 channels / ~238k samples** plus the log tap (`LogCatVentures` + `[CatMatch]`), dumped cleanly on teardown, 0 warnings/errors. Same round confirmed live on 5.8: held jump **240.3 cm in 0.53 s** (scrub 0.99 at apex — exactly the documented spec), 8 vault mantles over ledges 28–70 uu, cling/kick/scramble, the pivot, weighty stops, and the **entire match-end phase chain** (Warning 3.00 s @ 0.20 dilation → FinalCut → Fade → Aftermath hotspot + orbit cuts).
 - **v2 — the PawPrint window (shipped 2026-07-19, commit `5f2e5cb`, Sean-verified).** A **C++ Slate nomad tab** (NOT an EUW — the UI is all dynamic checkbox rows and a virtualized log list, which UMG BP graphs are worst at; Slate was already a dependency), `WITH_EDITOR`-guarded in the game module (`PawPrintWindow.cpp`, registered from `FCatVenturesModule::StartupModule`). **Opens from Tools → Miscellaneous → PawPrint** (Session Frontend's neighborhood). Left = category checkboxes auto-populated as the tap sees categories (new ones arrive **unchecked** — firehose is opt-in), All/None/Curated buttons, state persisted per-user; right = watch pane of live channel values over a log view polling `GetCapturedLines` at 10 Hz. Survives across PIE sessions (rebinds via `GetActive()`, shows the last capture frozen between runs). `UPawPrintSettings` (per-user config, **Project Settings → Game → PawPrint**): `bAutoOpenOnPIE` + checkbox persistence.
 - **Editor-tooling gotchas burned into v2 (each cost a PIE round):** (1) **`UDeveloperSettings` auto-discovery never surfaced the settings class** (even with `CategoryName` pinned) — register explicitly via `ISettingsModule::RegisterSettings("Project", "Game", ...)`; (2) an **ungrouped `RegisterNomadTabSpawner` entry appears TWICE in the Window menu** — `SetGroup(GetDeveloperToolsMiscCategory())` fixes the duplicate and relocates the entry to the Tools menu; (3) VibeUE-python quirks: `hasattr(unreal, 'NewClass')` is a stale-stub lie for classes added since stub generation (use `unreal.load_class(None, '/Script/CatVentures.X')`), `save_config` isn't exposed (in-memory `set_editor_property` only lasts the session), and the property shim reads only editor-visible UPROPERTYs (exact-name works for `bAutoOpenOnPIE`, config-only properties are refused).
 
 ## VibeUE (Blueprint/asset editor-control layer)
 
-The Blueprint and asset layer is edited live through the **VibeUE MCP server**, which controls the running UE 5.7 Editor (`http://127.0.0.1:8088/mcp`, registered as server `VibeUE` in repo-root `.mcp.json`). This is the established, active workflow — used to inspect `ABP_Cat_V2`, edit widgets, and tune Blueprint CDO defaults live.
+The Blueprint and asset layer is edited live through **VibeUE**, which since **v5.0 (2026-08-14) is no longer its own MCP server** — it is an *expansion of Unreal 5.8's native MCP*, registering 33 service toolsets + 86 AgentSkills onto Epic's endpoint. This is the established, active workflow — used to inspect `ABP_Cat_V2`, edit widgets, and tune Blueprint defaults live.
 
-- **Editor must be OPEN** — the server auto-starts with the Editor and dies when it closes. If tools are unreachable, open the Editor (it's not a code problem).
-- **Auth**: every `tools/call` requires a valid API key. The Editor's startup log prints a "NO API key set / any local process can connect" SECURITY WARNING that is **misleading** — `initialize`/`tools/list` work keyless, but all real tool calls are gated. Key lives in `Saved/Config/VibeUE.ini` (UE side) + injected via `.mcp.json` (client side); both gitignored. Never commit or paste the key.
-- **Tools**: `manage_asset` is the discovery/CRUD layer; `execute_python_code` is the deep-edit surface. The plugin registers rich Python services on the `unreal` module — **`unreal.BlueprintService`** is the node-level Blueprint API (`get_blueprint_info`, `get_nodes_in_graph`, `get_connections`, `get_node_details`, `connect_nodes`, `disconnect_pin`, `delete_node`, `add_function_call_node`, `add_cast_node`, `add_branch_node`, `set_node_pin_value`, `remove_variable`, `compile_blueprint`, ...). Also `WidgetService`, `AnimGraphService`, `DataTableService`, `ActorService`, etc. CDO defaults: `unreal.get_default_object(bp.generated_class())` + `get/set_editor_property`.
+- **Endpoint: `http://127.0.0.1:8000/mcp`, NO auth**, registered as server `unreal-mcp` in repo-root `.mcp.json`. **Port 8088, the bearer token and `Saved/Config/VibeUE.ini` are all obsolete** — that was VibeUE's own server, which upstream deleted (commit `0d05478`, "VibeUE is now a pure extension"). **The same commit deleted the in-editor UI**, so there is no VibeUE tab/window in the editor any more — its absence is correct, not a broken install.
+- **Editor must be OPEN** — the endpoint lives in the editor process and dies with it. If tools are unreachable, open the Editor (it's not a code problem). The plugin is a git clone of `github.com/kevinpbuckley/VibeUE` at `Plugins/VibeUE` (gitignored, built with the project); Fab is just the author's distribution channel, nothing to download.
+- **`bAutoStartServer` defaults to FALSE.** Without `Config/DefaultEditorPerProjectUserSettings.ini` → `[/Script/ModelContextProtocolEngine.ModelContextProtocolSettings] bAutoStartServer=True`, the editor loads, registers every toolset, and **nothing listens** — an agent-side silent failure with the editor looking perfectly healthy. Note the section is the settings class's *module* (`ModelContextProtocolEngine`), not the plugin folder. Confirm with `LogModelContextProtocol: Starting MCP server on port 8000` in the editor log.
+- **Tool search is on**: `tools/list` returns only `list_toolsets` / `describe_toolset` / `call_tool`, and toolsets load on demand. A low tool count is NOT a reduced surface. The transport is **session-based** — carry the `Mcp-Session-Id` response header from `initialize` on every later call (relevant when probing by hand with curl, which works fine as a fallback when the client didn't connect at session start).
+- **Epic's own `EditorToolset` plugin is enabled** (added to the .uproject 2026-08-15, editor-only, prebuilt in the engine so no rebuild). It ships with 5.8 but is **not** enabled by default and VibeUE does not depend on it — without it every `EditorToolset.*` call returns "Toolset not found". It adds 20 toolsets: `EditorToolset.EditorAppToolset` (CaptureViewport, StartPIE/StopPIE, camera, selection), `EditorToolset.LogsToolset`, and `editor_toolset.toolsets.<area>.<Name>` for AssetTools, BlueprintTools, DataTableTools, ActorTools, SceneTools, Static/SkeletalMesh, Texture, Material, ObjectTools.
+- **Toolset dispatch gotchas (2026-08-15, each cost a round):** tool names must be the **short** form (`CaptureViewport`, `list_rows`) — the fully-qualified name the listing prints returns "Unknown tool"; both `execute_tool` and `call_tool` require **every optional parameter explicitly**, including all required sub-fields of nested objects (`CaptureViewport` needs `captureTransform` + `bShowUI` + all six fields of `annotations`); a returned image arrives **inside a text block** as `returnValue.image.data`, not as an MCP image block; and python's `ToolsetRegistry.get_toolset_json_schema` takes a **UClass**, not the string name — use the MCP `describe_toolset` meta-tool for schemas.
+- **Tools**: `execute_python_code` is the workhorse (batch a whole task into one round-trip). The plugin registers rich Python services on the `unreal` module — **`unreal.BlueprintService`** is the node-level Blueprint API (`get_blueprint_info`, `get_nodes_in_graph`, `get_connections`, `get_node_details`, `connect_nodes`, `disconnect_pin`, `delete_node`, `add_function_call_node`, `add_cast_node`, `add_branch_node`, `set_node_pin_value`, `create_node_by_key`, `remove_variable`, ...). Also `WidgetService`, `AnimGraphService`, `ActorService`, `InputService`, `SkeletonService`, `AnimSequenceService`, `TransactionService` (undo/redo), `PerformanceService`, etc. **`DataTableService` was removed in v5.0** — use Epic's `DataTableTools` (`list_rows`, arg name `data_table`) or native `unreal.DataTableFunctionLibrary`.
+- **Blueprint CDO writes from Python are BLOCKED** (2026-08-15): `get_default_object(...).set_editor_property(...)` — the old recipe — now fails with `PYTHON_UNSAFE_CODE: Modifying Class Default Objects from Python causes crashes`. **Reads still work.** The sanctioned write is `unreal.BlueprintService.set_property(bp_path, name, "value")` / `get_property` (values are **strings**), verified to persist across a real package reload **without** an explicit compile. **The blocker is a textual scan of the submitted source** — a script that merely *mentions* the call in a comment or string is rejected whole, which reads as a nonsense error.
+- **`AnimGraphService` now does state-machine surgery directly** (5.8), which retires the worst raw-graph traps: `list_state_machines`, `list_states_in_machine`, `get_state_transitions`, `add_state`, `add_transition(path, sm, src, dst, blend)`, **`set_transition_rule_from_bool` / `set_transition_rule_comparison` / `set_transition_rule_automatic`**, `set_transition_blend`, `set_transition_priority`, `remove_state/remove_transition`, `set_state_animation`, `set_sequence_player_asset`, `set_blend_space_asset`, and **`validate_state_machine`** (returns `is_valid` + real state/transition counts + warnings such as "state has no animation connected"). Prefer these over hand-wiring rule graphs. Two reading notes: the machine's name includes a newline (`"Locomotion_v2\nState Machine"` — take it from `list_state_machines`, don't type it), and `list_states_in_machine` returns states **and** transitions as entries, so trust `validate_state_machine` for real counts (Locomotion_v2 = 13 states / 62 transitions).
+- **`InputService` is the sanctioned input path**: `get_mappings`, `add_key_mapping`, `create_mapping_context`, `list_input_actions`, `get_available_keys`. `add_key_mapping` persists across a disk round-trip with **no** `modify(True)` needed (unlike the raw `map_key`, below).
 - **Limitations**: `add_function_call_node` cannot create custom-event *call* nodes (silent no-op) — rewire the caller's exec into the event's chain instead. `EdGraph.Nodes` is not readable via vanilla Python — use BlueprintService. When BP can't express something, add a `BlueprintCallable` C++ helper (e.g. `ACatPlayerController::PopulateScoreboard`).
-- **Python-edit serialization traps (2026-07-08, each cost a PIE round):** (1) a CDO `set_editor_property` needs `BlueprintService.compile_blueprint` + `save_asset` to serialize the override into the BP — set-then-save alone leaves spawned pawns on the C++ default (the M1 sprint binding shipped dead this way); (2) `InputMappingContext.map_key` needs `obj.modify(True)` **before** the call, or `save_asset` returns True while writing a **clean** package (the sprint keys evaporated on editor restart). **Verify any python asset edit with a `reload_packages` round-trip** — read the value back after reloading from disk; a save that "succeeded" proves nothing. (3) `AnimGraphService`/`BlueprintService` can't resolve assets **while PIE is running** (`is_anim_blueprint` returns False) — end PIE for graph work; live-instance `set_editor_property` pokes still work during PIE (that's the isolation-probe recipe). (4) **Python-authored blendspaces ship a dead eval grid (2026-07-14):** `sample_data`/`blend_parameters` serialize fine but the runtime sample grid is never rebuilt — the blendspace outputs a frozen ref-pose in PIE (legs don't move, tail straight). Neither scripted `open_editor_for_assets`+save (the async open races the save) nor a reflection property re-set rebuilds it; **only a real UI open of the blendspace editor + Ctrl+S does** — after any scripted blendspace edit, have a human open the asset and save before the PIE round. (5) **An aborted script that touched `seq.controller` leaves a transient `AnimSequencerController` referencing the asset (2026-07-20)** — a later delete/recreate of that asset pops a MODAL "Overwrite Existing Object" dialog that freezes the game thread (every VibeUE call times out "game thread blocked"; diagnose from outside via window-title enumeration + the frozen frame counter in the log). Rewrite anim assets **in place** (`controller.remove_all_bone_tracks()` + re-key) instead of delete/recreate. (6) Anim-graph node recipes (2026-07-20): `AnimGraphService` has no evaluator spawner — `BlueprintService.create_node_by_key(path, graph, 'NODE AnimGraphNode_SequenceEvaluator')` works; anim-node struct fields (player loop flags, evaluator sequences) are not pins — `ObjectIterator` the AnimGraphNode class, `get_editor_property('node')`, mutate, write back with `modify(True)`; anim **pose input** pins do NOT auto-break on connect (compile error "more than one connection" — `disconnect_pin` first); the MCP python wrapper hard-fails the whole script on any `DeprecationWarning` for *property* access even with `filterwarnings('ignore')` (function deprecations ARE suppressible) — prefer non-deprecated APIs outright.
+- **Python-edit serialization traps (2026-07-08, each cost a PIE round; re-verified against 5.8 on 2026-08-15):** (1) *superseded* — CDO writes now go through `BlueprintService.set_property` (see above), which serializes without a separate compile; the old set-then-save-leaves-pawns-on-the-C++-default failure belonged to the raw CDO path, which is now blocked outright; (2) **still true in 5.8** — `InputMappingContext.map_key` needs `obj.modify(True)` **before** the call, or `save_asset` returns True while writing a **clean** package (measured: mapping count reverts on reload without it, persists with it; this is how the sprint keys evaporated on editor restart). Prefer `InputService.add_key_mapping`, which needs no such dance. **Verify any python asset edit with a `reload_packages` round-trip** — read the value back after reloading from disk; a save that "succeeded" proves nothing. Two ways that verification itself lies: `reload_packages` takes `unreal.ReloadPackagesInteractionMode.ASSUME_POSITIVE` as its **second argument** (passing `True` throws, and swallowing that exception in a `try` silently downgrades your "from disk" read to an in-memory one); and **`InputMappingContext.mappings` is DEPRECATED in 5.8** — the real data lives in **`default_key_mappings.mappings`**, so reading the old property returns **0** and looks exactly like "the bindings are gone" (IMC_Cat has 17, intact). (3) `AnimGraphService`/`BlueprintService` can't resolve assets **while PIE is running** (`is_anim_blueprint` returns False) — end PIE for graph work; live-instance `set_editor_property` pokes still work during PIE (that's the isolation-probe recipe). (4) **Python-authored blendspaces ship a dead eval grid (2026-07-14):** `sample_data`/`blend_parameters` serialize fine but the runtime sample grid is never rebuilt — the blendspace outputs a frozen ref-pose in PIE (legs don't move, tail straight). Neither scripted `open_editor_for_assets`+save (the async open races the save) nor a reflection property re-set rebuilds it; **only a real UI open of the blendspace editor + Ctrl+S does** — after any scripted blendspace edit, have a human open the asset and save before the PIE round. (5) **An aborted script that touched `seq.controller` leaves a transient `AnimSequencerController` referencing the asset (2026-07-20)** — a later delete/recreate of that asset pops a MODAL "Overwrite Existing Object" dialog that freezes the game thread (every VibeUE call times out "game thread blocked"; diagnose from outside via window-title enumeration + the frozen frame counter in the log). Rewrite anim assets **in place** (`controller.remove_all_bone_tracks()` + re-key) instead of delete/recreate. (6) Anim-graph node recipes (2026-07-20): `AnimGraphService` has no evaluator spawner — `BlueprintService.create_node_by_key(path, graph, 'NODE AnimGraphNode_SequenceEvaluator')` works; anim-node struct fields (player loop flags, evaluator sequences) are not pins — `ObjectIterator` the AnimGraphNode class, `get_editor_property('node')`, mutate, write back with `modify(True)`; anim **pose input** pins do NOT auto-break on connect (compile error "more than one connection" — `disconnect_pin` first); the MCP python wrapper hard-fails the whole script on any `DeprecationWarning` for *property* access even with `filterwarnings('ignore')` (function deprecations ARE suppressible) — prefer non-deprecated APIs outright.
+- **Screenshots (look at what you built):** either `EditorToolset.EditorAppToolset.CaptureViewport` (returns a PNG; see the dispatch gotchas above) or native `unreal.AutomationLibrary.take_high_res_screenshot(w, h, path)`. The native one writes **asynchronously** — the file appears *after* the call returns, so check the path on a later step rather than concluding it failed. Decode any base64 editor-side and write it to disk; never pipe a megabyte of it back through the tool result.
 - For BP/asset/AnimBP/widget/DataTable work, use VibeUE against the live Editor — don't hand-edit `.uasset` files or assume the change belongs in C++.
 
 ## Key Blueprint Assets (Content/)
@@ -362,4 +389,245 @@ Design plans are stored in `Saved/.Aura/plans/` as Markdown files. These documen
 - **Two "Chaos"**: the physics solver (Geometry Collection fracture) and the gameplay "Chaos score" share the name but are unrelated. Don't conflate them.
 - **Never hardcode prop scores**: chaos values are authored in `DT_ChaosRewards` rows, keyed by each prop's `ChaosRewardKey`. An unknown/`None` key silently scores `DefaultChaosValue`.
 - **Engine OSS keys drift between versions**: `SEARCH_PRESENCE` existed in older engines and is gone in 5.7 (`SEARCH_LOBBIES` replaced it for the Steam lobby path). Always use the engine macros from `Online/OnlineSessionNames.h`, never hand-rolled FName strings — a wrong key fails silently.
-- **BP/asset edits need the Editor open**: the VibeUE MCP server dies when the UE Editor closes. "Tools unreachable" almost always means "open the Editor," not a code change.
+- **BP/asset edits need the Editor open**: the MCP endpoint lives in the editor process and dies with it. "Tools unreachable" almost always means "open the Editor," not a code change — but on 5.8 also check that something is actually **listening on :8000** before suspecting the plugin, since `bAutoStartServer` defaults to false (see *VibeUE*).
+
+<!-- BEGIN VibeUE (v5.0) — generated by VibeUE.GenerateAgentConfig; re-run to refresh -->
+# VibeUE — AI agent guide (Unreal Engine 5.8)
+
+VibeUE **extends Unreal 5.8's native AI toolset system** — its services, tools, and skills register
+into the engine's `ToolsetRegistry` and are reachable through the MCP tools you already have.
+
+**ALWAYS use the MCP tools / Python API for Unreal operations — NEVER read `.uasset` files from disk.**
+
+---
+
+## 1. The efficient interaction model (read this first)
+
+There are two ways to act on the editor. Pick the cheap one:
+
+- **`execute_python_code` — your workhorse.** Runs an arbitrary Python script in the editor in **one
+  round-trip**. Every VibeUE service is exposed to Python (`unreal.BlueprintService.build_graph(...)`)
+  and sits next to the whole native `unreal.*` API in the same script. **Batch aggressively** — do a
+  whole multi-step task (create + edit + compile + verify) in a single call, and `print()` only what
+  you need back.
+- **`call_tool` — one tool per round-trip.** Genuinely needed only for **skills**
+  (`AgentSkillToolset`) and for the few Epic tools whose **result the MCP layer must surface for
+  you** (image returns like `CaptureViewport`). **Everything else from Epic's engine toolsets is
+  also reachable from inside `execute_python_code`** via `unreal.ToolsetRegistry.execute_tool(...)`
+  (see §2), so batch engine-toolset calls with your Python instead of spending a round-trip. Don't
+  use `call_tool` for work `execute_python_code` can batch.
+
+**Speed + tokens:** **avoid `describe_toolset` as a habit** — it dumps the full JSON schema of every
+tool in a toolset (the most token-heavy thing here); reach for a **skill** plus a narrow
+`discover_python_class('unreal.BlueprintService', method_filter='variable')` instead.
+
+---
+
+## 2. Tool roster — what's where
+
+**VibeUE MCP tools (call directly):**
+- `execute_python_code` — run Python (must start with `import unreal`). The workhorse.
+- `discover_python_module` / `discover_python_class` / `discover_python_function` — inspect the API
+  (use `unreal` lowercase; narrow with `name_filter` / `method_filter`).
+- `list_python_subsystems` — list editor subsystems.
+- `deep_research` — web search / page fetch / geocode (see §5).
+- `terrain_data` — real-world heightmaps + water splines (see §5).
+
+**VibeUE services (call from Python inside `execute_python_code`):** `unreal.<Name>Service.<method>()`
+— Blueprint, BlueprintGraph (via BlueprintService), Material(+Node), Widget, Skeleton, AnimSequence,
+AnimMontage, AnimGraph, Landscape(+Material), Foliage, MetaSound, SoundCue, Niagara(+Emitter,
++ScratchPad), StateTree, BehaviorTree, Blackboard, Input, EnumStruct, UVMapping,
+RuntimeVirtualTexture, MapBlockout, GameplayTag, Viewport, Actor, Engine/ProjectSettings,
+**Performance** (`unreal.PerformanceService.frame_timing()`).
+These overlap-trimmed services keep only what the engine lacks — for plain asset/actor/blueprint
+basics the engine's own tools may be simpler (below).
+
+**Calling Epic's engine toolsets from Python (`execute_tool`).** Epic's engine toolset *classes*
+exist as `unreal.*` (e.g. `unreal.EditorAppToolset`) but their AICallable functions are **not**
+exposed as Python methods — `unreal.EditorAppToolset.get_selected_assets()` fails. Invoke them
+through the registry instead (same dispatch `call_tool` uses, but in-process and batchable):
+```python
+import unreal, json
+res = unreal.ToolsetRegistry.execute_tool(
+    "EditorToolset.EditorAppToolset",   # registered (namespaced) toolset name
+    "GetSelectedAssets",                # tool name
+    "{}")                               # args as a JSON string
+assert res.is_complete and not res.error, res.error
+out = json.loads(res.get_value_as_json_string())     # -> {"returnValue": ...}
+```
+Discover exact names/schemas from Python: `unreal.ToolsetRegistry.get_all_toolset_json_schemas()`
+(all of them) or `get_toolset_json_schema("EditorToolset.EditorAppToolset")` (one). Names are
+namespaced — `EditorToolset.EditorAppToolset`, `NiagaraToolsets.NiagaraToolset_System`, etc. (a bare
+`"EditorAppToolset"` returns "Toolset not found"). Note `execute_tool` returns an **async** result:
+the editor tools above complete synchronously (`is_complete=True`), but for a long-running tool check
+`is_complete` / bind `on_completed` rather than assuming `value` is ready.
+
+**Use the engine's native tools for these (VibeUE intentionally doesn't duplicate them):**
+- **Assets** (find / save / move / delete / duplicate / metadata): native Python
+  `unreal.EditorAssetLibrary` / `EditorAssetSubsystem` inside `execute_python_code` (batchable), or
+  Epic's `AssetTools` toolset (via `execute_tool` in-Python, or `call_tool`).
+- **Screenshots / vision**: Epic's `EditorAppToolset` — `CaptureViewport` (returns a PNG, and can
+  overlay a world grid + actor labels), `CaptureEditorImage`, `CaptureAssetImage`. **Use `call_tool`
+  for these** so the MCP layer surfaces the image for you to view (`execute_tool` would only hand
+  back a base64 string).
+- **PIE**: `EditorAppToolset.StartPIE` / `StopPIE` / `IsPIERunning` — batchable via `execute_tool`
+  (`"EditorToolset.EditorAppToolset"`), or `call_tool`.
+- **Logs**: `LogsToolset.GetLogEntries` — via `execute_tool` or `call_tool` (or read the `.log` file).
+- **DataTables / DataAssets / enum-struct basics**: Epic's `DataTableTools` / `DataAssetTools` /
+  `ObjectTools` (via `execute_tool` or `call_tool`). (VibeUE keeps only `EnumStructService` for
+  create/edit of user enums & structs.)
+
+---
+
+## 3. Skills — native `AgentSkill` (lazy domain knowledge)
+
+VibeUE's ~88 skill packs are registered as Unreal **AgentSkills** and served by the engine's
+`AgentSkillToolset`. Skills tell you **what to do and why**; they do **not** replace discovery of exact
+signatures.
+
+**Discover + load (both are `call_tool` on `ToolsetRegistry.AgentSkillToolset`):**
+```
+call_tool(tool_name="ListSkills", toolset_name="ToolsetRegistry.AgentSkillToolset")
+  → { "/VibeUE/Python/init_unreal_PY.VibeUE_blueprints": "Create and modify Blueprint assets…", … }
+
+call_tool(tool_name="GetSkills", toolset_name="ToolsetRegistry.AgentSkillToolset",
+          arguments={"skillPaths": ["/VibeUE/Python/init_unreal_PY.VibeUE_blueprints"]})
+  → full markdown for that pack
+```
+- `ListSkills` returns **summaries only** (cheap) — call it once per session to see what exists. VibeUE
+  packs are `/VibeUE/Python/init_unreal_PY.VibeUE_<name>`; the engine's own skills appear alongside.
+- `GetSkills` returns full instructions **lazily** — request only the packs you need.
+- **Sub-docs are their own skill entries** (e.g. `…VibeUE_blueprint_graphs__build_graph`,
+  `…VibeUE_state_trees__api_reference`) — load them by path the same way; no `skill/section` argument.
+
+**When to load a skill:** the user names a domain ("create a blueprint", "build a state tree"), or you
+hit a non-obvious workflow. Then: read the pack → `discover_python_class` the classes it names → write
+the Python. Don't reload a pack you already loaded this session.
+
+---
+
+## 4. Python basics
+
+```python
+import unreal  # lowercase
+
+# Editor subsystems:
+sub = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+
+# VibeUE services are static classes, called directly:
+info = unreal.BlueprintService.get_blueprint_info("/Game/MyBP")
+
+# Batch a whole task in ONE execute_python_code call, printing evidence as you go.
+# Blueprint create / variables / compile are ENGINE-side (native libs + BlueprintTools toolset),
+# NOT BlueprintService (it owns graphs/components/timelines — see discover_python_class):
+import json
+factory = unreal.BlueprintFactory(); factory.set_editor_property("ParentClass", unreal.Actor)
+bp = unreal.AssetToolsHelpers.get_asset_tools().create_asset("BP_Enemy", "/Game/Blueprints", unreal.Blueprint, factory); print("CREATED:", bp)
+unreal.ToolsetRegistry.execute_tool("editor_toolset.toolsets.blueprint.BlueprintTools", "add_variable",
+    json.dumps({"blueprint": {"refPath": "/Game/Blueprints/BP_Enemy.BP_Enemy"},   # refPath = full object path
+                "name": "Health", "type_name": "float"})); print("ADDED: Health")
+unreal.BlueprintEditorLibrary.compile_blueprint(bp); print("COMPILED: BP_Enemy")
+```
+
+---
+
+## 5. When to use `deep_research` and `terrain_data`
+
+**`deep_research`** — when you need information that isn't in the editor:
+- `action="search"` / `action="fetch_page"` — research a UE topic, API, or technique before writing code.
+- `action="geocode"` / `action="reverse_geocode"` — turn a place name into lat/lng (feeds `terrain_data`).
+
+**`terrain_data`** — when the user wants terrain from a **real-world location**:
+- `preview_elevation` → use the suggested `base_level`/`height_scale` → `generate_heightmap`
+  (`resolution` MUST match the landscape) → import via `unreal.LandscapeService` → `get_water_features`
+  for rivers/lakes.
+
+**The real-world-terrain chain:** `deep_research(geocode "Mount Fuji")` → `terrain_data(generate_heightmap, lng/lat)`
+→ `LandscapeService` import → `terrain_data(get_water_features)` → landscape splines. Load the
+`terrain-data` and `landscape` skills for the resolution formulas and water workflow.
+
+---
+
+## 6. See what you built (screenshots)
+
+After any **visible** change, capture and actually look before claiming success:
+```
+call_tool(tool_name="CaptureViewport", toolset_name="EditorToolset.EditorAppToolset")
+```
+It returns a PNG (base64) and can overlay a world-space grid + actor labels for spatial awareness. For
+a running game, `StartPIE` first. **Open/read the image, judge it against the request, fix, re-capture.**
+
+---
+
+## 7. Diagnose performance
+
+`PerformanceService` is VibeUE's net-new capability (the engine has no perf tooling). **STEP 0 is
+always CPU-bound vs GPU-bound** — optimising the GPU does nothing on a CPU-bound frame:
+```python
+import unreal, json
+print(unreal.PerformanceService.frame_timing())            # game/render/gpu ms + bound verdict — RUN FIRST
+unreal.PerformanceService.start_trace("cap", "")           # Unreal Insights trace
+# … reproduce the workload (ideally under PIE / standalone) …
+unreal.PerformanceService.stop_trace()
+print(unreal.PerformanceService.analyse("both", ""))       # frame stats + worst frames + log hitches
+```
+Load the `profiling` and `frame-rate` skills for the full drill-down.
+
+---
+
+## 8. Build & launch
+
+When asked to rebuild / relaunch / test, use the project script — not manual `Build.bat`/editor commands:
+- `./Plugins/VibeUE/BuildAndLaunchGame.ps1` (stops the editor, builds, relaunches).
+- `-StrictRebuild` for a full plugin recompile under warnings-as-errors; `-Clean` to wipe artifacts;
+  `-SkipBuild` to relaunch only.
+- On Linux or macOS: `./Plugins/VibeUE/BuildAndLaunchGame.sh --engine /path/to/UE5`.
+  Use `--strict-rebuild`, `--clean`, or `--skip-build` for the corresponding operations.
+
+**Readiness gate (required after launch, both platforms):**
+- Parse `Editor-PID=<pid>` from the launch script's output.
+- Check once, then watch `<ProjectDir>/Saved/VibeUE/Signals/editor-<pid>-true.json` using filesystem events.
+- Wait at most 180 seconds; do not poll MCP. Fail if that Editor process exits or the timeout expires.
+- Ignore signal files for other or dead PIDs. The signal only means `RegisterToolsets()` reached its end;
+  Python, World, and level readiness remain separate checks.
+- The file is JSON (`signal`, `pid`, `createdUtc`, `sessionStartUtc`, `pluginVersion`) and is written
+  atomically, so it is complete as soon as it appears. PIDs get recycled: the launch scripts clear a
+  stale same-PID signal on start, but if you launch the Editor yourself, check that `sessionStartUtc`
+  is later than your launch time before trusting it.
+
+---
+
+## 9. Critical rules (evergreen)
+
+- **Log every change for rollback.** Python has no auto-rollback — `print("CREATED:/ADDED:/MODIFIED:/DELETED:", path)`
+  after each op so a mid-script failure can be undone.
+- **Idempotent: check before create.** Use the service `*_exists()` (or `unreal.EditorAssetLibrary.does_asset_exist`)
+  before creating, to avoid duplicates.
+- **Compile after structure changes.** `unreal.BlueprintEditorLibrary.compile_blueprint(unreal.EditorAssetLibrary.load_asset(path))`
+  after adding variables/functions/components (there is no `BlueprintService.compile_blueprint`;
+  `build_graph`'s compile flag also works for graph edits).
+- **Verify success with evidence.** For Blueprint/Widget/Material/AnimGraph/StateTree edits, a successful
+  tool call isn't proof — re-read the asset (`get_nodes_in_graph`, `get_connections`, compile result)
+  and report brief evidence.
+- **Non-destructive.** Never remove-and-recreate to change a value, clear data to make a write succeed,
+  or replace a whole object to change one field. Discover the supported setter; if none exists, report
+  the gap. (StateTree reparenting: `move_state`, never remove+add.)
+- **Loop prevention.** Track *outcomes*. Never repeat the same call with the same args >2× when output
+  is unchanged; after 2 failed attempts at a goal, stop and report — don't try a 3rd variation.
+- **Never** use modal dialogs, `input()`, blocking ops, long `time.sleep()`, or infinite loops.
+- **Full asset paths** (`/Game/Blueprints/BP_Name`). **Colors are 0.0–1.0** (`{"R":1.0,"G":0.5,"B":0.0,"A":1.0}`).
+- **`unreal.EditorLevelLibrary` is deprecated** — use `EditorActorSubsystem` (`get_all_level_actors()`
+  + `isinstance` filtering; `get_all_level_actors_of_class` does not exist).
+
+---
+
+## 10. Communication & working style
+
+- **Be concise** — this is an IDE tool. Before each tool call, one sentence on what/why; after, 1–2 on
+  the result. Execute multi-step tasks straight through — don't pause for "continue".
+- **Discover before you call.** Method signatures come from `discover_python_class`, not memory or skill
+  prose. Skills say *which* class and *why*; discovery gives the exact call shape.
+- **Commit at milestones** if the project is a git repo, so a bad experiment reverts cleanly.
+- **Living gotchas:** when you solve a real problem, append a one-line gotcha+fix to this file so the
+  next session doesn't relearn it.
+<!-- END VibeUE -->
