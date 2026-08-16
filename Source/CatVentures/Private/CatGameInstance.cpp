@@ -10,11 +10,29 @@
 #include "Engine/World.h"                // FWorldDelegates::OnNetDriverCreated
 #include "GameFramework/PlayerController.h"
 #include "Kismet/KismetSystemLibrary.h"  // QuitGame
+#include "Kismet/GameplayStatics.h"      // OpenLevel
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 
 // ── Session name shared across all methods ────────────────────────────────
 static const FName SESSION_NAME = FName("CatVenturesSession");
+
+// ── Menu map, travelled to by LeaveToMainMenu ─────────────────────────────
+static const FName MAIN_MENU_LEVEL = FName("Map_Title");
+
+// ── Diagnostic helper: stringify the deferred-destroy action ──────────────
+static FString PendingActionToString(ECatPendingSessionAction Action)
+{
+	switch (Action)
+	{
+	case ECatPendingSessionAction::None:        return TEXT("None");
+	case ECatPendingSessionAction::Host:        return TEXT("Host");
+	case ECatPendingSessionAction::Join:        return TEXT("Join");
+	case ECatPendingSessionAction::LeaveToMenu: return TEXT("LeaveToMenu");
+	case ECatPendingSessionAction::Quit:        return TEXT("Quit");
+	default:                                    return TEXT("Unknown");
+	}
+}
 
 // ── Diagnostic helper: stringify EOnJoinSessionCompleteResult ─────────────
 static FString JoinResultToString(EOnJoinSessionCompleteResult::Type Result)
@@ -164,6 +182,7 @@ void UCatGameInstance::HostSession(int32 MaxPlayers, bool bIsLAN)
 	{
 		PendingHostMaxPlayers = MaxPlayers;
 		bPendingHostIsLAN     = bIsLAN;
+		PendingSessionAction  = ECatPendingSessionAction::Host;
 
 		DestroySessionCompleteDelegateHandle =
 			SessionInterface->AddOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegate);
@@ -172,6 +191,7 @@ void UCatGameInstance::HostSession(int32 MaxPlayers, bool bIsLAN)
 		if (!SessionInterface->DestroySession(SESSION_NAME))
 		{
 			SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
+			PendingSessionAction = ECatPendingSessionAction::None;
 			UE_LOG(LogCatVentures, Warning, TEXT("[Session] HostSession — DestroySession call failed immediately."));
 			OnHostSessionResult.Broadcast(false);
 		}
@@ -185,15 +205,18 @@ void UCatGameInstance::HandleDestroySessionComplete(FName SessionName, bool bWas
 {
 	SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
 
-	UE_LOG(LogCatVentures, Log, TEXT("[Session] HandleDestroySessionComplete  Session=%s  Success=%d"),
-		*SessionName.ToString(), bWasSuccessful ? 1 : 0);
+	// Consume the action BEFORE dispatching. Every branch below can re-enter the
+	// session system (a join issues JoinSession, a host issues CreateSession), and
+	// a stale action left set here would misroute the NEXT destroy that completes.
+	const ECatPendingSessionAction Action = PendingSessionAction;
+	PendingSessionAction = ECatPendingSessionAction::None;
 
-	// This delegate is shared with the quit path. Check it FIRST — otherwise a quit
-	// would fall through and re-create the session we just tore down.
-	if (bPendingQuitAfterDestroy)
+	UE_LOG(LogCatVentures, Log, TEXT("[Session] HandleDestroySessionComplete  Session=%s  Success=%d  Action=%s"),
+		*SessionName.ToString(), bWasSuccessful ? 1 : 0, *PendingActionToString(Action));
+
+	switch (Action)
 	{
-		bPendingQuitAfterDestroy = false;
-
+	case ECatPendingSessionAction::Quit:
 		// Deliberately ignores bWasSuccessful: the player asked to leave, so a failed
 		// teardown must not strand them in the menu. Worst case is a stale lobby that
 		// Steam times out on its own.
@@ -203,15 +226,43 @@ void UCatGameInstance::HandleDestroySessionComplete(FName SessionName, bool bWas
 		}
 		ExecuteQuit();
 		return;
-	}
 
-	if (!bWasSuccessful)
-	{
-		OnHostSessionResult.Broadcast(false);
+	case ECatPendingSessionAction::LeaveToMenu:
+		// Same reasoning as Quit — travel regardless. A player stuck on a scoreboard
+		// is a worse outcome than a lobby Steam will expire on its own.
+		if (!bWasSuccessful)
+		{
+			UE_LOG(LogCatVentures, Warning, TEXT("[Session] Session teardown failed on leave — travelling to the menu anyway; the next Host/Join will retry the destroy."));
+		}
+		TravelToMainMenu();
+		return;
+
+	case ECatPendingSessionAction::Join:
+		// Unlike Quit/Leave this one MUST honour the result: joining with the old
+		// session still registered is exactly the failure this destroy exists to
+		// prevent, so proceeding anyway would just reproduce it.
+		if (!bWasSuccessful)
+		{
+			UE_LOG(LogCatVentures, Warning, TEXT("[Session] Session teardown failed before join — aborting; JoinSession would fail with UnknownError."));
+			OnJoinSessionResult.Broadcast(false, FString());
+			return;
+		}
+		JoinSessionInternal(PendingJoinResult);
+		return;
+
+	case ECatPendingSessionAction::Host:
+		if (!bWasSuccessful)
+		{
+			OnHostSessionResult.Broadcast(false);
+			return;
+		}
+		CreateSessionInternal(PendingHostMaxPlayers, bPendingHostIsLAN);
+		return;
+
+	default:
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] HandleDestroySessionComplete fired with no pending action — ignoring."));
 		return;
 	}
-
-	CreateSessionInternal(PendingHostMaxPlayers, bPendingHostIsLAN);
 }
 
 void UCatGameInstance::CreateSessionInternal(int32 MaxPlayers, bool bIsLAN)
@@ -358,13 +409,51 @@ void UCatGameInstance::JoinFoundSession(const FBlueprintSessionResult& SessionRe
 		return;
 	}
 
+	// Exactly the async trap HostSession has guarded since the re-host-after-match
+	// bug: JoinSession under a name that still holds a live session fails
+	// SYNCHRONOUSLY with UnknownError. Hosting handled it, joining did not — so a
+	// player who had hosted (or joined) once could never join again without
+	// restarting the game, because nothing on the way back to the menu tore the
+	// session down. Defer the join into HandleDestroySessionComplete.
+	if (SessionInterface->GetNamedSession(SESSION_NAME))
+	{
+		PendingJoinResult    = SessionResult.OnlineResult;
+		PendingSessionAction = ECatPendingSessionAction::Join;
+
+		DestroySessionCompleteDelegateHandle =
+			SessionInterface->AddOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegate);
+
+		UE_LOG(LogCatVentures, Log, TEXT("[Session] JoinFoundSession — existing session found, destroying first."));
+		if (!SessionInterface->DestroySession(SESSION_NAME))
+		{
+			SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
+			PendingSessionAction = ECatPendingSessionAction::None;
+			UE_LOG(LogCatVentures, Warning, TEXT("[Session] JoinFoundSession — DestroySession call failed immediately."));
+			OnJoinSessionResult.Broadcast(false, FString());
+		}
+		return;
+	}
+
+	JoinSessionInternal(SessionResult.OnlineResult);
+}
+
+void UCatGameInstance::JoinSessionInternal(const FOnlineSessionSearchResult& SearchResult)
+{
+	const ULocalPlayer* LocalPlayer = GetFirstGamePlayer();
+	if (!LocalPlayer || !LocalPlayer->GetPreferredUniqueNetId().IsValid())
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] JoinSessionInternal — no local player / net id."));
+		OnJoinSessionResult.Broadcast(false, FString());
+		return;
+	}
+
 	JoinSessionCompleteDelegateHandle =
 		SessionInterface->AddOnJoinSessionCompleteDelegate_Handle(JoinSessionCompleteDelegate);
 
-	if (!SessionInterface->JoinSession(*LocalPlayer->GetPreferredUniqueNetId(), SESSION_NAME, SessionResult.OnlineResult))
+	if (!SessionInterface->JoinSession(*LocalPlayer->GetPreferredUniqueNetId(), SESSION_NAME, SearchResult))
 	{
 		SessionInterface->ClearOnJoinSessionCompleteDelegate_Handle(JoinSessionCompleteDelegateHandle);
-		UE_LOG(LogCatVentures, Warning, TEXT("[Session] JoinFoundSession — JoinSession call failed immediately."));
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] JoinSessionInternal — JoinSession call failed immediately."));
 		OnJoinSessionResult.Broadcast(false, FString());
 	}
 }
@@ -419,6 +508,43 @@ void UCatGameInstance::HandleJoinSessionComplete(FName SessionName, EOnJoinSessi
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// ── Leave ────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void UCatGameInstance::LeaveToMainMenu()
+{
+	if (SessionInterface.IsValid() && SessionInterface->GetNamedSession(SESSION_NAME))
+	{
+		PendingSessionAction = ECatPendingSessionAction::LeaveToMenu;
+
+		DestroySessionCompleteDelegateHandle =
+			SessionInterface->AddOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegate);
+
+		UE_LOG(LogCatVentures, Log, TEXT("[Session] LeaveToMainMenu — live session found, destroying before travel."));
+		if (SessionInterface->DestroySession(SESSION_NAME))
+		{
+			return;   // TravelToMainMenu runs from HandleDestroySessionComplete.
+		}
+
+		SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
+		PendingSessionAction = ECatPendingSessionAction::None;
+		UE_LOG(LogCatVentures, Warning, TEXT("[Session] LeaveToMainMenu — DestroySession call failed immediately; travelling anyway."));
+	}
+
+	TravelToMainMenu();
+}
+
+void UCatGameInstance::TravelToMainMenu()
+{
+	// Absolute travel with NO options. The `?listen` the host's old ServerTravel
+	// carried is what made the menu return fail: the new net driver tried to bind
+	// P2P vport 7777 while the outgoing driver still held it, so the listen failed
+	// and the machine fell through to Map_Title?closed. A menu is never a server.
+	UE_LOG(LogCatVentures, Log, TEXT("[Session] Travelling to the main menu (%s)."), *MAIN_MENU_LEVEL.ToString());
+	UGameplayStatics::OpenLevel(this, MAIN_MENU_LEVEL, /*bAbsolute=*/true);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // ── Quit ─────────────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -429,7 +555,7 @@ void UCatGameInstance::QuitToDesktop()
 	// button to it would report success while destroying nothing.
 	if (SessionInterface.IsValid() && SessionInterface->GetNamedSession(SESSION_NAME))
 	{
-		bPendingQuitAfterDestroy = true;
+		PendingSessionAction = ECatPendingSessionAction::Quit;
 
 		DestroySessionCompleteDelegateHandle =
 			SessionInterface->AddOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegate);
@@ -441,7 +567,7 @@ void UCatGameInstance::QuitToDesktop()
 		}
 
 		SessionInterface->ClearOnDestroySessionCompleteDelegate_Handle(DestroySessionCompleteDelegateHandle);
-		bPendingQuitAfterDestroy = false;
+		PendingSessionAction = ECatPendingSessionAction::None;
 		UE_LOG(LogCatVentures, Warning, TEXT("[Session] QuitToDesktop — DestroySession call failed immediately; quitting anyway."));
 	}
 

@@ -27,6 +27,24 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnJoinSessionResult,
 	FString, ConnectionString);
 
 
+/** Which caller issued the DestroySession that is currently in flight.
+ *
+ *  DestroySession is async and there is exactly ONE completion delegate, so the
+ *  callback has to be told what to do next. Four different entry points now tear
+ *  a session down before doing their real work (re-host, join, leave-to-menu,
+ *  quit) — this was a single bool while only two existed, and adding a third
+ *  boolean would have been the point where a missed check silently re-created a
+ *  session someone was trying to leave. */
+enum class ECatPendingSessionAction : uint8
+{
+	None,
+	Host,         // → CreateSessionInternal
+	Join,         // → JoinSessionInternal(PendingJoinResult)
+	LeaveToMenu,  // → TravelToMainMenu
+	Quit          // → ExecuteQuit
+};
+
+
 UCLASS()
 class CATVENTURES_API UCatGameInstance : public UGameInstance
 {
@@ -81,6 +99,27 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Session")
 	FOnJoinSessionResult OnJoinSessionResult;
 
+	// ── Leave ─────────────────────────────────────────────────────────────
+
+	/** Tears down any live session, then returns this machine to the main menu.
+	 *  Every "return to menu" button — host and client alike — must call THIS.
+	 *
+	 *  What it replaces, and why both were broken:
+	 *   - The client button used a bare Open Level. That travels fine but leaves
+	 *     the joined session registered under SESSION_NAME, so the next JoinSession
+	 *     fails synchronously with UnknownError.
+	 *   - The host button used Host_ServerTravel, which carries `?listen` through
+	 *     the travel. The old SteamSockets listen socket is not released before the
+	 *     new net driver binds, so it dies on "Already have a listen socket on P2P
+	 *     vport 7777", falls through to Map_Title?closed, and leaves the machine on
+	 *     the title screen still advertising a session it can no longer serve.
+	 *
+	 *  Travel is absolute and carries NO listen option, so no socket collision is
+	 *  possible. Travels anyway if the teardown fails: a menu button that does
+	 *  nothing is worse than a stale lobby. */
+	UFUNCTION(BlueprintCallable, Category = "Session")
+	void LeaveToMainMenu();
+
 	// ── Quit ──────────────────────────────────────────────────────────────
 
 	/** Tears down any live session, then closes the game. Menus must call THIS and
@@ -125,11 +164,23 @@ private:
 	int32 PendingHostMaxPlayers = 0;
 	bool  bPendingHostIsLAN = false;
 
-	// ── Pending quit state ────────────────────────────────────────────────
-	// DestroySessionCompleteDelegate is shared between the re-host path and the
-	// quit path. This flag is what tells the completion callback which one issued
-	// the destroy, so a quit never falls through into re-creating a session.
-	bool bPendingQuitAfterDestroy = false;
+	// ── Pending destroy-then-X state ──────────────────────────────────────
+	// DestroySessionCompleteDelegate is shared by every path that must tear a
+	// session down first. This says which one issued the in-flight destroy, so a
+	// quit or a menu return never falls through into re-creating a session.
+	ECatPendingSessionAction PendingSessionAction = ECatPendingSessionAction::None;
+
+	// The join being deferred across a destroy. Held by value: the search result
+	// must outlive the async gap, and the caller's FBlueprintSessionResult does not.
+	FOnlineSessionSearchResult PendingJoinResult;
+
+	/** Issues the actual JoinSession call. Shared by the direct join path and the
+	 *  deferred destroy-then-join path. */
+	void JoinSessionInternal(const FOnlineSessionSearchResult& SearchResult);
+
+	/** Absolute, non-listen travel to the menu map. Shared by the immediate and
+	 *  post-teardown leave paths. */
+	void TravelToMainMenu();
 
 	/** Closes the game. Shared by the immediate and post-teardown quit paths. */
 	void ExecuteQuit();
