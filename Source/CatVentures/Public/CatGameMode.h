@@ -5,9 +5,11 @@
 #include "CoreMinimal.h"
 #include "GameFramework/GameModeBase.h"
 #include "CatMatchTypes.h"
+#include "CatObjectiveTypes.h"
 #include "CatGameMode.generated.h"
 
 class UDataTable;
+class UCatObjectiveTargetComponent;
 
 UCLASS()
 class CATVENTURES_API ACatGameMode : public AGameModeBase
@@ -24,6 +26,23 @@ public:
 	 *  display name, and stinger authoritatively. Triggers match-end if threshold is reached. */
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	void ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey);
+
+	// ── Objectives ──────────────────────────────────────────────────
+
+	/** Called from UCatObjectiveTargetComponent::BeginPlay. Registration CLOSES at
+	 *  StartPlay — see the comment there for why that is the correct anchor. */
+	void RegisterObjectiveTarget(UCatObjectiveTargetComponent* Target);
+	void UnregisterObjectiveTarget(UCatObjectiveTargetComponent* Target);
+
+	/** A target's condition state changed (destroyed / entered volume / left region).
+	 *  Re-evaluates every objective that references the target's tag. */
+	void NotifyObjectiveTargetChanged(UCatObjectiveTargetComponent* Target);
+
+	/** DataTable of FMapObjectiveRow rows — the map's checklist.
+	 *  Assign DT_MapObjectives on GM_CatVentures. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Match|Objectives",
+	          meta = (RequiredAssetDataTags = "RowStructure=/Script/CatVentures.MapObjectiveRow"))
+	TObjectPtr<UDataTable> MapObjectiveTable;
 
 	// ── Tuning ──────────────────────────────────────────────────────
 
@@ -77,6 +96,20 @@ public:
 protected:
 	virtual void BeginPlay() override;
 
+	/** Closes objective-target registration, runs startup validation, and performs
+	 *  the first evaluation.
+	 *
+	 *  AGameModeBase::StartPlay calls GetWorldSettings()->NotifyBeginPlay(), which
+	 *  dispatches BeginPlay to every spawned actor — so the point immediately AFTER
+	 *  Super::StartPlay() is the concrete "world init has settled" anchor, and no
+	 *  condition is ever evaluated against a possibly-partial registry.
+	 *
+	 *  NOT HandleMatchHasStarted: that hook is declared on AGameMode, and this class
+	 *  derives from AGameModeBase. Do not reparent to obtain it — AGameMode drags in
+	 *  a MatchState machine that would sit alongside ECatMatchPhase as a second owner
+	 *  of "what phase is the match in". */
+	virtual void StartPlay() override;
+
 	/** Override AGameModeBase to force AdjustIfPossibleButAlwaysSpawn on the pawn spawn.
 	 *  Prevents the "black screen on join" failure when multiple players share a PlayerStart. */
 	virtual APawn* SpawnDefaultPawnAtTransform_Implementation(AController* NewPlayer, const FTransform& SpawnTransform) override;
@@ -104,6 +137,42 @@ private:
 	 *  highest-value cluster. Called once per match at Aftermath entry.
 	 *  Returns FinalBreakLocation as a sane fallback if the destruction list is empty. */
 	FVector ComputeChaosHotspot() const;
+
+	// ── Objectives ──────────────────────────────────────────────────
+
+	/** Validates every condition resolves against the registry. Catches the
+	 *  VACUOUS-COMPLETION hole: "all matching tags" over an EMPTY set is trivially
+	 *  true, so a typo'd TargetTag would complete conditions at spawn and unlock the
+	 *  finale before anyone moved. Warnings only — a bad table must not hard-fail a
+	 *  playtest, but it must be loud. */
+	void ValidateObjectives();
+
+	/** Builds one FObjectiveState per row, sized to that row's condition count. */
+	void InitializeObjectiveStates();
+
+	/** THE single evaluation point. Latch-on-true: bits only ever go false->true.
+	 *  Future operators (OR / ordering / temporal) become new cases HERE and
+	 *  nowhere else. Returns true if anything changed. */
+	bool EvaluateObjective(FName RowName);
+
+	/** Counts registered targets carrying Tag, and how many satisfy Condition. */
+	void CountTargetsForCondition(const FObjectiveCondition& Condition,
+	                              int32& OutTotal, int32& OutSatisfied) const;
+
+	/** Copies the server's objective state onto the GameState for replication. */
+	void PushObjectiveStatesToGameState();
+
+	/** Registered objective targets. Weak: a target destroyed mid-match must not
+	 *  keep its component alive, and the evaluator skips stale entries. */
+	TArray<TWeakObjectPtr<UCatObjectiveTargetComponent>> ObjectiveTargets;
+
+	/** Server-side authoritative objective state; mirrored to GameState on change. */
+	TArray<FObjectiveState> ObjectiveStates;
+
+	/** Set in StartPlay. Late registrations after this are a level-authoring error
+	 *  (a streamed objective target) and are warned about rather than silently
+	 *  changing the HUD denominator mid-match. */
+	bool bObjectiveRegistrationClosed = false;
 
 	// ── State ───────────────────────────────────────────────────────
 

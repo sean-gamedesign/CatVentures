@@ -3,6 +3,7 @@
 #include "CatGameMode.h"
 #include "CatVenturesLog.h"
 #include "CatGameState.h"
+#include "CatObjectiveTargetComponent.h"
 #include "CatPlayerController.h"
 #include "CatPlayerState.h"
 #include "Engine/DataTable.h"
@@ -26,6 +27,285 @@ void ACatGameMode::BeginPlay()
 	if (ACatGameState* GS = GetGameState<ACatGameState>())
 	{
 		GS->ChaosThreshold = ChaosThreshold;
+	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Objectives ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+void ACatGameMode::StartPlay()
+{
+	// Super dispatches BeginPlay to every spawned actor (via WorldSettings->
+	// NotifyBeginPlay), so every UCatObjectiveTargetComponent has registered by the
+	// time this returns. That makes the line below the "world init settled" anchor.
+	Super::StartPlay();
+
+	bObjectiveRegistrationClosed = true;
+
+	UE_LOG(LogCatVentures, Log, TEXT("[Objective] Registration closed — %d target(s) registered."),
+		ObjectiveTargets.Num());
+
+	ValidateObjectives();
+	InitializeObjectiveStates();
+
+	// First evaluation runs against the COMPLETE registry, never a partial one.
+	if (MapObjectiveTable)
+	{
+		for (const FName& RowName : MapObjectiveTable->GetRowNames())
+		{
+			EvaluateObjective(RowName);
+		}
+	}
+	PushObjectiveStatesToGameState();
+}
+
+void ACatGameMode::RegisterObjectiveTarget(UCatObjectiveTargetComponent* Target)
+{
+	if (!Target) return;
+
+	ObjectiveTargets.AddUnique(Target);
+
+	// A late registration means a streamed objective target — which silently changes
+	// the HUD denominator mid-match and invalidates the one-shot validation. The fix
+	// is an authoring one (put objective targets on an always-loaded data layer), so
+	// say so loudly rather than papering over it.
+	if (bObjectiveRegistrationClosed)
+	{
+		UE_LOG(LogCatVentures, Warning,
+			TEXT("[Objective] Target '%s' (tag %s) registered AFTER registration closed — ")
+			TEXT("objective targets must live on an always-loaded data layer."),
+			*GetNameSafe(Target->GetOwner()), *Target->ObjectiveTag.ToString());
+	}
+}
+
+void ACatGameMode::UnregisterObjectiveTarget(UCatObjectiveTargetComponent* Target)
+{
+	ObjectiveTargets.Remove(Target);
+}
+
+void ACatGameMode::NotifyObjectiveTargetChanged(UCatObjectiveTargetComponent* Target)
+{
+	if (!Target || !MapObjectiveTable) return;
+
+	bool bAnyChanged = false;
+	for (const FName& RowName : MapObjectiveTable->GetRowNames())
+	{
+		const FMapObjectiveRow* Row = MapObjectiveTable->FindRow<FMapObjectiveRow>(RowName, TEXT("NotifyObjectiveTargetChanged"));
+		if (!Row) continue;
+
+		// Only re-evaluate rows that actually reference this tag.
+		const bool bReferencesTag = Row->Conditions.ContainsByPredicate(
+			[Target](const FObjectiveCondition& C) { return C.TargetTag == Target->ObjectiveTag; });
+
+		if (bReferencesTag)
+		{
+			bAnyChanged |= EvaluateObjective(RowName);
+		}
+	}
+
+	if (bAnyChanged)
+	{
+		PushObjectiveStatesToGameState();
+	}
+}
+
+void ACatGameMode::ValidateObjectives()
+{
+	if (!MapObjectiveTable)
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[Objective] No MapObjectiveTable assigned — objective system inert."));
+		return;
+	}
+
+	int32 FinaleRows = 0;
+	for (const FName& RowName : MapObjectiveTable->GetRowNames())
+	{
+		const FMapObjectiveRow* Row = MapObjectiveTable->FindRow<FMapObjectiveRow>(RowName, TEXT("ValidateObjectives"));
+		if (!Row) continue;
+
+		if (Row->bIsFinaleSetPiece) { ++FinaleRows; }
+
+		if (Row->Conditions.Num() == 0)
+		{
+			UE_LOG(LogCatVentures, Warning, TEXT("[Objective] Row '%s' has NO conditions — it would complete vacuously."),
+				*RowName.ToString());
+			continue;
+		}
+
+		for (int32 i = 0; i < Row->Conditions.Num(); ++i)
+		{
+			const FObjectiveCondition& C = Row->Conditions[i];
+
+			if (C.TargetTag.IsNone())
+			{
+				UE_LOG(LogCatVentures, Warning, TEXT("[Objective] Row '%s' condition %d has no TargetTag."),
+					*RowName.ToString(), i);
+				continue;
+			}
+
+			// THE vacuous-completion guard: "all matching tags" over an empty set is
+			// trivially true, so a typo'd tag would complete at spawn.
+			int32 Total = 0, Satisfied = 0;
+			CountTargetsForCondition(C, Total, Satisfied);
+			if (Total == 0)
+			{
+				UE_LOG(LogCatVentures, Warning,
+					TEXT("[Objective] Row '%s' condition %d targets tag '%s' — NO registered targets carry it. ")
+					TEXT("This condition would complete vacuously."),
+					*RowName.ToString(), i, *C.TargetTag.ToString());
+			}
+			else if (C.CountRequired > Total)
+			{
+				UE_LOG(LogCatVentures, Warning,
+					TEXT("[Objective] Row '%s' condition %d needs %d of tag '%s' but only %d exist — unreachable."),
+					*RowName.ToString(), i, C.CountRequired, *C.TargetTag.ToString(), Total);
+			}
+		}
+	}
+
+	if (FinaleRows != 1)
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[Objective] Expected exactly 1 finale set-piece row, found %d."), FinaleRows);
+	}
+}
+
+void ACatGameMode::InitializeObjectiveStates()
+{
+	ObjectiveStates.Reset();
+	if (!MapObjectiveTable) return;
+
+	for (const FName& RowName : MapObjectiveTable->GetRowNames())
+	{
+		const FMapObjectiveRow* Row = MapObjectiveTable->FindRow<FMapObjectiveRow>(RowName, TEXT("InitializeObjectiveStates"));
+		if (!Row) continue;
+
+		FObjectiveState State;
+		State.RowName     = RowName;
+		State.DisplayName = Row->DisplayName;
+		State.bIsFinale   = Row->bIsFinaleSetPiece;
+		State.ConditionProgress.SetNumZeroed(Row->Conditions.Num());
+		State.ConditionRequired.SetNumZeroed(Row->Conditions.Num());
+
+		// Resolve each condition's denominator ONCE, here — registration has closed,
+		// so the registry count is final and cannot drift mid-match.
+		for (int32 i = 0; i < Row->Conditions.Num(); ++i)
+		{
+			int32 Total = 0, Satisfied = 0;
+			CountTargetsForCondition(Row->Conditions[i], Total, Satisfied);
+			const int32 Required = (Row->Conditions[i].CountRequired > 0) ? Row->Conditions[i].CountRequired : Total;
+			State.ConditionRequired[i] = static_cast<uint8>(FMath::Clamp(Required, 0, 255));
+		}
+
+		ObjectiveStates.Add(MoveTemp(State));
+	}
+}
+
+void ACatGameMode::CountTargetsForCondition(const FObjectiveCondition& Condition,
+                                            int32& OutTotal, int32& OutSatisfied) const
+{
+	OutTotal = 0;
+	OutSatisfied = 0;
+
+	for (const TWeakObjectPtr<UCatObjectiveTargetComponent>& Weak : ObjectiveTargets)
+	{
+		const UCatObjectiveTargetComponent* Target = Weak.Get();
+		if (!Target || Target->ObjectiveTag != Condition.TargetTag) continue;
+
+		++OutTotal;
+
+		switch (Condition.Type)
+		{
+		case EObjectiveConditionType::Destroy:
+			if (Target->IsDestroyed()) { ++OutSatisfied; }
+			break;
+
+		// Milestone 1a evaluates Destroy only. Relocate/KnockOff are in the schema
+		// so the table and the HUD do not change shape when they land; their
+		// machinery is the shared overlap path and arrives with milestone 1b.
+		case EObjectiveConditionType::Relocate:
+		case EObjectiveConditionType::KnockOff:
+		default:
+			break;
+		}
+	}
+}
+
+bool ACatGameMode::EvaluateObjective(FName RowName)
+{
+	if (!MapObjectiveTable) return false;
+
+	const FMapObjectiveRow* Row = MapObjectiveTable->FindRow<FMapObjectiveRow>(RowName, TEXT("EvaluateObjective"));
+	if (!Row) return false;
+
+	FObjectiveState* State = ObjectiveStates.FindByPredicate(
+		[RowName](const FObjectiveState& S) { return S.RowName == RowName; });
+	if (!State) return false;
+
+	bool bChanged = false;
+
+	for (int32 i = 0; i < Row->Conditions.Num(); ++i)
+	{
+		const int32 Bit = 1 << i;
+
+		// LATCH-ON-TRUE: once set, never re-examined. The naive level-triggered
+		// re-check is WRONG — a prop settling back out of a volume must not
+		// un-complete anything.
+		if ((State->LatchedMask & Bit) != 0) continue;
+
+		int32 Total = 0, Satisfied = 0;
+		CountTargetsForCondition(Row->Conditions[i], Total, Satisfied);
+
+		if (State->ConditionProgress.IsValidIndex(i))
+		{
+			const uint8 Clamped = static_cast<uint8>(FMath::Clamp(Satisfied, 0, 255));
+			if (State->ConditionProgress[i] != Clamped)
+			{
+				State->ConditionProgress[i] = Clamped;
+				bChanged = true;
+			}
+		}
+
+		// CountRequired 0 = ALL matching tags; >0 = any N of them. Guard Total>0 so
+		// an empty tag set can never satisfy "all of them" vacuously.
+		const int32 Required = (Row->Conditions[i].CountRequired > 0) ? Row->Conditions[i].CountRequired : Total;
+		const bool bSatisfied = (Total > 0) && (Satisfied >= Required);
+
+		if (bSatisfied)
+		{
+			State->LatchedMask |= Bit;
+			bChanged = true;
+
+			UE_LOG(LogCatVentures, Log, TEXT("[Objective] '%s' condition %d LATCHED (%d/%d of tag '%s')."),
+				*RowName.ToString(), i, Satisfied, Required, *Row->Conditions[i].TargetTag.ToString());
+		}
+	}
+
+	// Objective complete iff every condition latched (AND).
+	const int32 AllBits = (Row->Conditions.Num() >= 32) ? ~0 : ((1 << Row->Conditions.Num()) - 1);
+	const bool bNowComplete = (Row->Conditions.Num() > 0) && ((State->LatchedMask & AllBits) == AllBits);
+
+	if (bNowComplete && !State->bComplete)
+	{
+		State->bComplete = true;
+		bChanged = true;
+
+		UE_LOG(LogCatVentures, Log, TEXT("[Objective] === COMPLETE: '%s' (%s) ==="),
+			*RowName.ToString(), *Row->DisplayName.ToString());
+	}
+
+	return bChanged;
+}
+
+void ACatGameMode::PushObjectiveStatesToGameState()
+{
+	if (ACatGameState* GS = GetGameState<ACatGameState>())
+	{
+		GS->ObjectiveStates = ObjectiveStates;
+
+		// The host is also a client: replication does not fire OnRep locally, so the
+		// listen server's own HUD would never update without this.
+		GS->OnObjectiveStatesChanged.Broadcast();
 	}
 }
 
@@ -100,6 +380,18 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 	Record.Value    = Value;
 	Record.ItemName = ItemName;
 	DestroyedItems.Add(Record);
+
+	// Objective routing. Every objective target today is also a chaos prop, so the
+	// existing break path is a free, zero-Blueprint-edit report. Targets that are
+	// NOT chaos props call UCatObjectiveTargetComponent::ReportDestroyed directly —
+	// the pipeline must not assume "objective target" implies "scores chaos".
+	if (Item)
+	{
+		if (UCatObjectiveTargetComponent* ObjTarget = Item->FindComponentByClass<UCatObjectiveTargetComponent>())
+		{
+			ObjTarget->ReportDestroyed();
+		}
+	}
 
 	// Accumulate score and push to GameState for HUD replication.
 	TotalChaosScore += Value;
