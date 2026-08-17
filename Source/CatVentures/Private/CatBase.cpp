@@ -228,6 +228,21 @@ void ACatBase::Server_BumperHitGC_Implementation(AActor* GCActor, FVector Origin
 void ACatBase::Multicast_BumperHitGC_Implementation(AActor* GCActor, FVector Origin)
 {
 	if (!GCActor) return;
+
+	// HEAVY LOCKOUT (Objective System §3). The bumper's contact shatter is
+	// unconditional by design — no strain or threshold knobs on this path — so it
+	// would otherwise pop the map's finale set piece on a walk-past. Gated HERE
+	// rather than in Server_BumperHitGC because the listen-server host calls this
+	// multicast directly and would bypass a server-only check; the tag is applied
+	// identically on every machine, so the decision stays deterministic.
+	static const FName HeavyPropTag(TEXT("HeavyProp"));
+	if (GCActor->ActorHasTag(HeavyPropTag))
+	{
+		UE_LOG(LogCatVentures, Verbose, TEXT("[Heavy] Bumper contact on '%s' IGNORED — Heavy tier."),
+			*GCActor->GetName());
+		return;
+	}
+
 	UGeometryCollectionComponent* GCC = GCActor->FindComponentByClass<UGeometryCollectionComponent>();
 	if (!GCC) return;
 

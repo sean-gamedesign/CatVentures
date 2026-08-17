@@ -6,6 +6,7 @@
 #include "CatObjectiveTargetComponent.h"
 #include "CatPlayerController.h"
 #include "CatPlayerState.h"
+#include "Components/PrimitiveComponent.h"
 #include "Engine/DataTable.h"
 #include "Engine/World.h"
 #include "GameFramework/WorldSettings.h"
@@ -28,6 +29,86 @@ void ACatGameMode::BeginPlay()
 	{
 		GS->ChaosThreshold = ChaosThreshold;
 	}
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Heavy tier ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+
+/** Resolves the authoritative GameMode from any world context. Returns null on
+ *  clients — the same shape ReportItemDestroyed relies on. */
+static ACatGameMode* ResolveCatGameMode(const UObject* WorldContextObject)
+{
+	const UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::ReturnNull) : nullptr;
+	return World ? World->GetAuthGameMode<ACatGameMode>() : nullptr;
+}
+
+bool ACatGameMode::IsHeavyProp(UObject* WorldContextObject, FName ChaosRewardKey)
+{
+	const ACatGameMode* GM = ResolveCatGameMode(WorldContextObject);
+	if (!GM || !GM->ChaosRewardTable || ChaosRewardKey.IsNone()) return false;
+
+	const FChaosRewardData* Row = GM->ChaosRewardTable->FindRow<FChaosRewardData>(ChaosRewardKey, TEXT("IsHeavyProp"));
+	return Row && Row->bHeavyTier;
+}
+
+bool ACatGameMode::ShouldImpactShatter(UObject* WorldContextObject,
+                                       FName ChaosRewardKey,
+                                       UPrimitiveComponent* VictimComp,
+                                       UPrimitiveComponent* ImpactorComp,
+                                       FVector NormalImpulse)
+{
+	const ACatGameMode* GM = ResolveCatGameMode(WorldContextObject);
+	if (!GM)
+	{
+		return false;   // no authority here; the server's decision is the real one.
+	}
+
+	bool  bHeavy       = false;
+	float VelThreshold = GM->DefaultImpactVelocityThreshold;
+	float ImpThreshold = GM->DefaultImpactImpulseThreshold;
+
+	if (GM->ChaosRewardTable && !ChaosRewardKey.IsNone())
+	{
+		if (const FChaosRewardData* Row = GM->ChaosRewardTable->FindRow<FChaosRewardData>(ChaosRewardKey, TEXT("ShouldImpactShatter")))
+		{
+			bHeavy = Row->bHeavyTier;
+			if (Row->ImpactVelocityThreshold > 0.0f) VelThreshold = Row->ImpactVelocityThreshold;
+			if (Row->ImpactImpulseThreshold  > 0.0f) ImpThreshold = Row->ImpactImpulseThreshold;
+		}
+	}
+
+	// The victim's own speed — the quantity the original graph measured.
+	const float VictimSpeed = VictimComp ? VictimComp->GetComponentVelocity().Size() : 0.0f;
+
+	if (!bHeavy)
+	{
+		return VictimSpeed > VelThreshold;
+	}
+
+	// ── Heavy: measure the IMPACTOR, two ways, and record both. ──
+	const float ImpulseMag = NormalImpulse.Size();
+
+	// Deterministic fallback: it is the impactor's own numbers, which is what
+	// "how hard did the thing that hit it hit it" actually means.
+	float ImpactorMass  = 0.0f;
+	float ImpactorSpeed = 0.0f;
+	if (ImpactorComp)
+	{
+		ImpactorMass  = ImpactorComp->GetMass();
+		ImpactorSpeed = ImpactorComp->GetComponentVelocity().Size();
+	}
+	const float MassBySpeed = ImpactorMass * ImpactorSpeed;
+
+	const bool bShatter = ImpulseMag > ImpThreshold;
+
+	UE_LOG(LogCatVentures, Log,
+		TEXT("[Heavy] impact on '%s' — NormalImpulse=%.1f (threshold %.1f) | fallback mass*speed=%.1f ")
+		TEXT("(mass %.1f x speed %.1f) | victimSpeed=%.1f -> %s"),
+		*ChaosRewardKey.ToString(), ImpulseMag, ImpThreshold, MassBySpeed,
+		ImpactorMass, ImpactorSpeed, VictimSpeed, bShatter ? TEXT("SHATTER") : TEXT("no"));
+
+	return bShatter;
 }
 
 // ══════════════════════════════════════════════════════════════════════════

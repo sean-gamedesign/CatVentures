@@ -77,4 +77,32 @@ struct FChaosRewardData : public FTableRowBase
 	/** Optional scoreboard icon. Soft pointer for the same reason as MeowStinger. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly)
 	TSoftObjectPtr<class UTexture2D> Icon;
+
+	// ── Heavy tier (Objective System §3) ────────────────────────────────
+	//
+	// Heavies are the map's untouchables — "you'll get to break that later",
+	// legible with zero tutorial text. Swat accumulation and the bumper's
+	// guaranteed shatter are BOTH off for them (the bumper must not leak the
+	// finale's toy); only the hard-impact path can break a Heavy.
+
+	/** Marks this prop type as a Heavy. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Heavy")
+	bool bHeavyTier = false;
+
+	/** NON-Heavy impact threshold, in cm/s of the VICTIM's own speed — the
+	 *  quantity the existing path measures, kept for props already tuned to it.
+	 *  0 = use the GameMode's project default. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Heavy", meta = (ClampMin = "0.0"))
+	float ImpactVelocityThreshold = 0.0f;
+
+	/** HEAVY impact threshold, in impulse units of the IMPACTOR.
+	 *
+	 *  Two named columns rather than one float whose units flip on bHeavyTier:
+	 *  a single value differing by orders of magnitude between rows, meaning
+	 *  different things depending on a sibling bool, is a designer trap. And
+	 *  moving every prop to impulse would silently re-tune every shipped
+	 *  breakable's playtested threshold, which is the wrong side of that trade.
+	 *  0 = use the GameMode's project default. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Heavy", meta = (ClampMin = "0.0"))
+	float ImpactImpulseThreshold = 0.0f;
 };

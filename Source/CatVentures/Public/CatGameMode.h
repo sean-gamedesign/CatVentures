@@ -27,6 +27,52 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	void ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey);
 
+	// ── Heavy tier (§3) ─────────────────────────────────────────────
+
+	/** True if this prop type is a Heavy. Drives the swat/bumper lockouts.
+	 *
+	 *  STATIC + WorldContext deliberately: BPC_ChaosItem would otherwise need a
+	 *  Get Game Mode -> Cast chain at each of three call sites, and every one of
+	 *  those is an exec node that has to be spliced into a working graph. This
+	 *  resolves the GameMode internally, so each Blueprint edit is ONE node. */
+	UFUNCTION(BlueprintPure, Category = "Match|Heavy", meta = (WorldContext = "WorldContextObject"))
+	static bool IsHeavyProp(UObject* WorldContextObject, FName ChaosRewardKey);
+
+	/** THE impact decision, for both tiers. Called from BPC_ChaosItem's hit event.
+	 *
+	 *  Non-Heavy props keep the existing quantity — the VICTIM's own speed — so
+	 *  every shipped breakable keeps its playtested feel.
+	 *
+	 *  Heavies cannot use that quantity: a high-mass prop struck by a flowerpot
+	 *  barely moves, and massive props are precisely the ones that never reach
+	 *  high velocities — that is what makes them heavy. Per-prop threshold tuning
+	 *  cannot fix a wrong quantity, so Heavies measure the IMPACTOR instead.
+	 *
+	 *  VERIFY-IN-BUILD: this logs NormalImpulse alongside the impactor's
+	 *  mass x speed on every Heavy hit. NormalImpulse is solver/substep dependent
+	 *  and may read zero-or-noise against an unfractured, effectively-static
+	 *  Geometry Collection; mass x speed is less physically pure but fully
+	 *  deterministic and trivially debuggable. One PIE round of these log lines
+	 *  decides which quantity ships — the fallback is pre-approved (§3), so no
+	 *  further design call is needed either way. */
+	UFUNCTION(BlueprintCallable, Category = "Match|Heavy", meta = (WorldContext = "WorldContextObject"))
+	static bool ShouldImpactShatter(UObject* WorldContextObject,
+	                                FName ChaosRewardKey,
+	                                class UPrimitiveComponent* VictimComp,
+	                                class UPrimitiveComponent* ImpactorComp,
+	                                FVector NormalImpulse);
+
+	/** Fallback impact threshold for NON-Heavy props, in cm/s of the victim's own
+	 *  speed. 1200 mirrors the value the BPC_ChaosItem graph actually hardcoded —
+	 *  note CLAUDE.md documented 600, which the graph disproved. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
+	float DefaultImpactVelocityThreshold = 1200.0f;
+
+	/** Fallback impact threshold for HEAVY props, in impulse units of the impactor.
+	 *  Provisional until the verify-in-build logging lands a real number. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
+	float DefaultImpactImpulseThreshold = 25000.0f;
+
 	// ── Objectives ──────────────────────────────────────────────────
 
 	/** Called from UCatObjectiveTargetComponent::BeginPlay. Registration CLOSES at
