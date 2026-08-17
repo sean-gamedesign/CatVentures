@@ -29,7 +29,15 @@ Three break paths, all funneling into `ForceShatterGC` (deterministic, bypasses 
 
 1. **Physics Bumper** (C++): bumper contact with a GC → `Server_BumperHitGC` → `Multicast_BumperHitGC` → guaranteed shatter on every machine's solver.
 2. **Swat accumulation** (BPC_ChaosItem): `OnTakePointDamage` (server) counts swats; the **4th swat** triggers `Multicast_TriggerShatter` → `ForceShatterGC`. Earlier swats apply `Multicast_ApplySwatImpulse` knockback (ShotFromDirection × 800, bVelChange).
-3. **Hard impact** (BPC_ChaosItem): `OnComponentHit` with component velocity **> 600** (server) → `Multicast_TriggerShatter`.
+3. **Hard impact** (BPC_ChaosItem): `OnComponentHit` (server) → `ACatGameMode::ShouldImpactShatter` → `Multicast_TriggerShatter`.
+
+   **Corrected 2026-08-16:** this doc previously said "component velocity > 600". The graph was verified directly and said **1200**, not 600 — and the quantity itself was respecced. Non-Heavy props still gate on the victim's own speed (threshold now `DefaultImpactVelocityThreshold`, or a per-row override); **Heavy props measure the impactor instead**, because a high-mass prop struck by a light one barely moves and would never break. Per-prop thresholds and the Heavy flag live on `DT_ChaosRewards` — see `Docs/objectives.md` for the tier, the two-named-columns rule, and the verify-in-build logging that will pick between `NormalImpulse` and mass×speed.
+
+   **The bumper path refuses Heavies** (`Multicast_BumperHitGC`, gated there because the listen-server host calls the multicast directly and would bypass a server-only check) — but that gate is **currently INERT**: it tests a `HeavyProp` actor tag that nothing sets yet.
+
+**A Geometry Collection SURVIVES its own fracture** (BB-17): the clusters break but the component and actor live on — they must, since the debris *is* that component and `RegisterDebrisActor` retains it. So a break path can fire more than once for one prop, and anything counting destructions must latch (see `Docs/objectives.md`).
+
+**Walking into fresh debris is broken today** (measured 2026-08-16, the MeowTime spike). Three defects, none caused by time dilation — all were *more* frequent at normal speed: the capsule gets stuck inside chunks and the CMC's depenetration snaps it out (reads as teleporting), wall-attach clings to chunks because `ProbeWalls` cannot tell a chunk from a wall, and foot IK rails at its ±25 clamp because every probe lands on a different chunk height. These are core-loop bugs, not finale bugs. Cheapest first win is gating `ProbeWalls` against Geometry Collection chunks. Full numbers in the plan doc's §4 SPIKE RESULT block.
 
 Fracture is simulated **locally per client** (the trigger is multicast, not the resulting chunks), so debris differs slightly per machine — hence the Aftermath camera uses per-client `RegisterDebrisActor` lists, not replicated chunk transforms. `ApplyExternalStrain` is a no-op on plain Static Mesh Actors (no cluster graph). The swat count (4) and velocity threshold (600) are currently hardcoded in the BPC_ChaosItem graph.
 
