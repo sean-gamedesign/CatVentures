@@ -2,6 +2,7 @@
 
 #include "CatBase.h"
 #include "CatVenturesLog.h"
+#include "CatImpactResponseComponent.h"
 #include "CatTraversalComponent.h"
 #include "PawPrintSubsystem.h"
 #include "CatAnimationTypes.h"
@@ -57,6 +58,7 @@ ACatBase::ACatBase()
 	GrabTargetLocation = CreateDefaultSubobject<USceneComponent>(TEXT("GrabTargetLocation"));
 
 	Traversal = CreateDefaultSubobject<UCatTraversalComponent>(TEXT("Traversal"));
+	ImpactResponse = CreateDefaultSubobject<UCatImpactResponseComponent>(TEXT("ImpactResponse"));
 	GrabTargetLocation->SetupAttachment(GetMesh(), TEXT("socket_mouth"));
 	// Push the hold point 80 cm forward in mouth-socket space so the held object sits
 	// in front of the cat's capsule rather than pressing against it.
@@ -581,6 +583,16 @@ void ACatBase::Move(const FInputActionValue& Value)
 			PivotInputStaleTime = 0.0f;
 		}
 
+		// A stagger owns locomotion outright: input is suppressed for the control-loss
+		// window (impact plan §3 tier 2 — the launch IS the movement; steering returns
+		// through the M4 ramp on exit). FIRST in the suppression chain, because impact
+		// outranks pivot/coil/traversal (plan §7 precedence). The steering cache above
+		// stays live, same contract as every other suppression here.
+		if (ImpactResponse && ImpactResponse->IsStaggerSuppressing())
+		{
+			return;
+		}
+
 		// During a pivot the plant owns locomotion: input keeps steering the pivot
 		// target (cache above) but must not feed the CMC — zero acceleration is what
 		// lets friction brake the cat and keeps orient-to-movement inert under the
@@ -705,6 +717,17 @@ void ACatBase::Multicast_Swat_Implementation()
 	if (IsLocallyControlled()) return;
 
 	PlaySwatMontageAndBindEnd();
+}
+
+void ACatBase::Multicast_ImpactReaction_Implementation(ECatImpactTier Tier, ECatImpactDirection Direction,
+                                                       FVector_NetQuantize LaunchVelocity)
+{
+	// No local-controller skip: the reaction plays on the VICTIM, who predicted
+	// nothing — every machine (victim's owner included) renders it from here.
+	if (ImpactResponse)
+	{
+		ImpactResponse->HandleImpactReactionMulticast(Tier, Direction, LaunchVelocity);
+	}
 }
 
 void ACatBase::PlaySwatMontageAndBindEnd()
@@ -1678,6 +1701,19 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 		UDamageType::StaticClass()
 	);
 
+	// Cat-vs-cat: route to the VICTIM's impact classifier (server-side by construction
+	// — the swat trace only runs on authority). A direct C++ call, deliberately NOT the
+	// damage event above: the swat sweep already hits ECC_Pawn and its ApplyPointDamage
+	// was a no-op sink on cats, and binding a damage handler here would be the first
+	// step toward the health system this project explicitly does not build.
+	if (ACatBase* VictimCat = Cast<ACatBase>(HitActor))
+	{
+		if (VictimCat->ImpactResponse)
+		{
+			VictimCat->ImpactResponse->ReportSwatImpact(this, ImpulseDir);
+		}
+	}
+
 	OnSwatHit.Broadcast(HitActor, HitResult.ImpactPoint);
 }
 
@@ -2147,10 +2183,21 @@ void ACatBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ACatBase::RestoreAllCMCOverrides()
 {
+	// Impact reactions sit ABOVE traversal in precedence (impact plan §7), so their
+	// abort runs first of all. CONTRACT (plan §2, v1.2): AbortAllImpactReactions
+	// touches ONLY impact-owned state — it must not clear or write any flag the
+	// traversal or grounded restores below consult, because this chain's ordering
+	// is deliberate and an early write here would re-introduce the BB-16
+	// stranded-override class.
+	if (ImpactResponse)
+	{
+		ImpactResponse->AbortAllImpactReactions();
+	}
+
 	// Traversal owns its own takeovers (movement mode, the rebound friction window, the
 	// wall-kick yaw hold) — the component is the single restore point for all of them,
-	// per the growth-watch decision. Run it FIRST: its aborts hand back the movement mode
-	// the grounded restores below assume.
+	// per the growth-watch decision. Run it FIRST among movement owners: its aborts hand
+	// back the movement mode the grounded restores below assume.
 	if (Traversal)
 	{
 		Traversal->AbortAllTraversal();

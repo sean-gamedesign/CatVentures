@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
 #include "CatAnimationTypes.h"
+#include "CatImpactTypes.h"
 #include "CatBase.generated.h"
 
 class UInputMappingContext;
@@ -46,6 +47,11 @@ class CATVENTURES_API ACatBase : public ACharacter
 	// The traversal component is an extension of the character (owns traversal verbs'
 	// movement takeovers) — it reaches the mantle mirror RPC and anim-state setters.
 	friend class UCatTraversalComponent;
+
+	// Same relationship for the impact-response component (flinch/stagger/ragdoll —
+	// Saved/.Aura/plans/cat-impact-response-v1.2.md): it reaches the reaction
+	// multicast, and will reach the CMC takeover surface when the ragdoll tier lands.
+	friend class UCatImpactResponseComponent;
 
 public:
 	ACatBase();
@@ -570,6 +576,11 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Traversal")
 	TObjectPtr<class UCatTraversalComponent> Traversal;
 
+	/** Impact response (flinch/stagger/ragdoll severity tiers). Owns the impact
+	 *  classifier and every reaction — the one restore point for impact state. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Impact")
+	TObjectPtr<class UCatImpactResponseComponent> ImpactResponse;
+
 	/** Radius (cm) of the mouth sphere trace used to detect grabbable objects. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "5.0"))
 	float GrabTraceRadius = 35.0f;
@@ -900,6 +911,18 @@ protected:
 	/** Server → All: play swat montage on all machines (instigator skips — already predicted). */
 	UFUNCTION(NetMulticast, Unreliable)
 	void Multicast_Swat();
+
+	// ── Networked Impact Response ───────────────────────────────────────
+
+	/** Server → All: play the classified impact reaction on every machine. The RPC
+	 *  carries its values (no replication race — the Client_OnMatchPhaseChanged
+	 *  doctrine) and NOBODY skips: the victim predicted nothing. Reliable because a
+	 *  reaction is a rare server-classified one-shot, not predicted spam like the
+	 *  swat montage. LaunchVelocity is zero below Stagger tier.
+	 *  Routes to UCatImpactResponseComponent. */
+	UFUNCTION(NetMulticast, Reliable)
+	void Multicast_ImpactReaction(ECatImpactTier Tier, ECatImpactDirection Direction,
+	                              FVector_NetQuantize LaunchVelocity);
 
 	// ── Networked Interact ──────────────────────────────────────────────
 
