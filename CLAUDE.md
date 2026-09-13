@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CatVentures is an Unreal Engine 5.8 multiplayer third-person cat game (upgraded from 5.7 on 2026-08-14 — see *Build & Development*). There is a single C++ module (`CatVentures`) with a Blueprint layer on top. The primary C++ class is `ACatBase`, a multiplayer-ready character; alongside it the C++ layer provides the multiplayer framework (`ACatGameMode`/`ACatGameState`/`ACatPlayerState`/`ACatPlayerController`) and a Steam session backend (`UCatGameInstance`). The core gameplay loop is **"chaos"**: players smash Geometry-Collection props to fill a Chaos Meter, which triggers a cinematic match-end sequence and scoreboard. Most gameplay actors, the AnimBP, and all UI are Blueprints under `Content/`, edited live through the **VibeUE** MCP editor-control layer (see `Docs/tooling.md`).
+CatVentures is an Unreal Engine 5.8 multiplayer third-person cat game (upgraded from 5.7 on 2026-08-14 — see *Build & Development*). There is a single C++ module (`CatVentures`) with a Blueprint layer on top. The primary C++ class is `ACatBase`, a multiplayer-ready character, with two owned components (`UCatTraversalComponent`, `UCatImpactResponseComponent`); alongside it the C++ layer provides the multiplayer framework (`ACatGameMode`/`ACatGameState`/`ACatPlayerState`/`ACatPlayerController`) and a Steam session backend (`UCatGameInstance`). The core gameplay loop is **"chaos"**: players smash Geometry-Collection props to fill a Chaos Meter, which triggers a cinematic match-end sequence and scoreboard. Most gameplay actors, the AnimBP, and all UI are Blueprints under `Content/`, edited live through the **VibeUE** MCP editor-control layer (see `Docs/tooling.md`).
 
 ## Documentation Map — read the owning doc BEFORE you edit
 
@@ -31,6 +31,7 @@ The deep knowledge for each system lives in `Docs/`, split out of this file on 2
 | `Docs/traversal.md` | `UCatTraversalComponent` — mantle/clamber, wall bounce, wall attach (cling + vertical scramble), wall transfer, balance assist, the traversal anim batch, detection logging | any traversal verb, any `ProbeWalls` caller, or a new movement-mode takeover |
 | `Docs/match-destruction.md` | Match phase machine, data-driven Chaos scoring, match-end cinematics, rematch gate, Geometry Collection break paths | GameMode / GameState / PlayerController match code, or breakable props |
 | `Docs/objectives.md` | Objective System — condition/objective schema, target registry + validation, the evaluator, checklist HUD, Heavy tier | any objective condition type, `UCatObjectiveTargetComponent`, `EvaluateObjective`, the checklist HUD, or Heavy-tier impact config |
+| `Docs/impact-response.md` | `UCatImpactResponseComponent` — the impact classifier (mass×speed thresholds), Flinch + Stagger tiers, the reaction multicast, precedence in `Move()`/`RestoreAllCMCOverrides`, PIE evidence; FROZEN at step 2 for Playtest 1 | `CatImpactResponseComponent.h/.cpp`, `CatImpactTypes.h`, `Multicast_ImpactReaction`, the swat's cat-vs-cat branch, or any new CMC takeover that must order against a stagger |
 | `Docs/multiplayer-steam.md` | `UCatGameInstance`, SteamSockets transport config, session UI, packaging + the 2-PC test protocol | session code, net-driver config, or packaging a build for a multiplayer test |
 | `Docs/tooling.md` | VibeUE MCP workflow and its serialization traps; PawPrint runtime telemetry | any Blueprint / AnimBP / widget / asset edit driven through the editor, or adding telemetry |
 
@@ -50,7 +51,7 @@ The deep knowledge for each system lives in `Docs/`, split out of this file on 2
 **Build** (Development Editor config):
 - Open `CatVentures.sln` in Visual Studio and build `CatVentures` target
 - Or: `"C:\Program Files\Epic Games\UE_5.8\Engine\Build\BatchFiles\Build.bat" CatVenturesEditor Win64 Development "C:\Projects\CatVentures\CatVentures.uproject"`
-- Live Coding (in-editor): `LiveCoding.Compile` via console, or Ctrl+Alt+F11. Requires the editor to be open.
+- Live Coding (in-editor): `LiveCoding.Compile` via console, or Ctrl+Alt+F11. Requires the editor to be open. **Verified working on 5.8** (2026-09-13, ~10 patches in one session, ~15 s each) for function-body edits — PIE picks the patch up with no restart. Reflection changes (new `UPROPERTY`/`UFUNCTION`/`UCLASS`) still need the closed-editor `Build.bat` cycle.
 - External build requires the editor to be **closed** — UE will refuse to build while Live Coding is active.
 
 **Sandbox note for agent-driven builds:**
@@ -85,7 +86,12 @@ Source/CatVentures/
     CatGameInstance.h            — Steam Online Subsystem session backend
     PauseMenuWidget.h            — Pause menu C++ base
     PawPrintSubsystem.h          — PawPrint in-memory runtime telemetry (Docs/tooling.md)
+    PawPrintSettings.h           — PawPrint per-user settings (Project Settings → Game → PawPrint)
     CatTraversalComponent.h      — Traversal verbs component (Docs/traversal.md)
+    CatImpactTypes.h             — Impact enums/struct (ECatImpactTier/Source/Direction, FCatImpactParams)
+    CatImpactResponseComponent.h — Flinch/Stagger/(Ragdoll) impact response component (Docs/impact-response.md)
+    CatObjectiveTypes.h          — Objective/condition schema (Docs/objectives.md)
+    CatObjectiveTargetComponent.h— Objective target registry component (Docs/objectives.md)
   Private/
     (matching .cpp for each of the above)
 ```
@@ -104,6 +110,7 @@ Dependencies (Build.cs):
 - **CMC overrides must be restorable from outside their own tick path** (2026-08-11, BB-16): stop braking, pivot braking, start-burst acceleration, grab drag and every traversal takeover each restore only from the path that set them, so a pawn that is unpossessed or destroyed mid-state strands the override (an unpossessed cat mid-mantle keeps `MOVE_Flying` and floats). `ACatBase::RestoreAllCMCOverrides()` — called from `EndPlay` and `UnPossessed` — clears the owning flags then restores through each system's own `Apply*(false)`, and delegates traversal to `UCatTraversalComponent::AbortAllTraversal()`, which stays the single restore point for its own takeovers. **Add new CMC-owning systems to both.**
 - **Replicated vs cosmetic split**: When adding new animation-driving variables, decide whether they need replication (gameplay-authoritative) or can be derived locally (cosmetic). Prefer local derivation for anything the AnimBP uses for blending. Don't add speculative replicated state — the 2026-06 cleanup deleted eight never-written replicated properties.
 - **UHT after header changes**: Adding new UCLASS/UPROPERTY/UFUNCTION requires a full rebuild (not just incremental compile) if reflection data changes.
+- **Geometry Collections emit NO begin-overlap events** (2026-09-13): any `OnComponentBeginOverlap` path is dead for our props — the PhysicsBumper's GC branch never fired once. Find GCs with an overlap **query** (`OverlapMultiByObjectType` on `ECC_Destructible`, the `UpdateBulldozerPush` precedent) instead. Also: **settled Chaos chunks sleep and drop out of overlap queries** — the project raises `p.Chaos.Solver.Sleep.Defaults.SleepCounterThreshold` to 900 in `DefaultEngine.ini` so debris stays queryable ~15 s; anything that needs to find old debris beyond that must wake it first. And once fractured, a chunk is **Pawn=Overlap / Visibility=Ignore / Camera=Ignore** (Layer 1 in `ForceShatterGC`) — a Visibility trace passes straight through debris by design; query by object type if you need to hit it. See `Docs/match-destruction.md`.
 - **Two "Chaos"**: the physics solver (Geometry Collection fracture) and the gameplay "Chaos score" share the name but are unrelated. Don't conflate them.
 - **Never hardcode prop scores**: chaos values are authored in `DT_ChaosRewards` rows, keyed by each prop's `ChaosRewardKey`. An unknown/`None` key silently scores `DefaultChaosValue`.
 - **Engine OSS keys drift between versions**: `SEARCH_PRESENCE` existed in older engines and is gone in 5.7 (`SEARCH_LOBBIES` replaced it for the Steam lobby path). Always use the engine macros from `Online/OnlineSessionNames.h`, never hand-rolled FName strings — a wrong key fails silently.

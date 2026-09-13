@@ -64,7 +64,7 @@ Config lives on `DT_ChaosRewards` rows (Sean's call): `bHeavyTier`, `ImpactVeloc
 
 - **The bumper lockout is written but INERT.** `Multicast_BumperHitGC` refuses actors tagged `HeavyProp` — gated there rather than in `Server_BumperHitGC` because the listen-server host calls the multicast directly and would bypass a server-only check. **Nothing sets that tag yet**, so a Heavy is still bumper-breakable. Closing it needs a `RegisterPropKey` helper called from `BPC_ChaosItem`'s BeginPlay.
 - No Heavy row is authored in `DT_ChaosRewards` yet, and no prop is tagged as one.
-- The impulse-vs-mass×speed PIE round has not been run.
+- The impulse-vs-mass×speed PIE round has not been run **for Heavy props**. The impact-response stagger round (2026-09-12, `Docs/impact-response.md`) logged both quantities on cat-vs-prop hits: they agree at the band edges but diverged on a hard-decelerating light prop (mass×speed 11.5k vs impulse 65k) — evidence for mass×speed as the primary, not yet the Heavy decision itself.
 
 ## Live test scaffolding (not shipping content)
 

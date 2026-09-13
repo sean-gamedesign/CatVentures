@@ -78,9 +78,13 @@ Local prediction pattern: client plays montage immediately + fires `Server_Swat(
 
 `Server_Grab` → `Multicast_Grab` creates a dynamic `UPhysicsConstraintComponent` from the `socket_mouth` anchor to the grabbed body on **every machine's** local Chaos solver. `UpdateGrab()` auto-releases on drift past `MaxGrabDistance`. CMC swaps to drag settings (`DragWalkSpeed`, orient-to-movement off) while held; the client predicts the drag settings on press, and `Client_GrabFailed` rolls the prediction back when the server trace misses (otherwise a missed grab would leave the player slow until release). `bIsGrabbing` is replicated so the AnimBP can drive a jaw-open blend on all machines. **`UpdateGrab` runs on ALL roles** (fixed 2026-08-11, BB-17 — the `Tick` call used to be authority-gated, which made its own local-cleanup path unreachable on clients): fracture is simulated per-machine, so a client can see the grabbed component die before the server does and would otherwise hold a dangling constraint. Each machine tears down its own constraint; **`bIsGrabbing` keeps one owner** — only the server clears it, clients follow through `OnRep_bIsGrabbing` (a client clearing it locally would also suppress the very RepNotify that restores its movement, since a RepNotify doesn't fire when the value arrives already matching). The owner un-predicts the drag settings, mirroring the press-time prediction. The drift auto-release stays authority-only.
 
-### Physics Bumper & Destruction
+### Physics Bumper, Bulldozer & Destruction
 
-A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes physics bodies (`BumperPushForce`) before the capsule reaches them. When the contacted body is a **Geometry Collection**, bumper contact is a **guaranteed full shatter** (`ForceShatterGC`) by design — there are no strain/threshold knobs on this path. See *Destruction* below.
+A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes plain physics bodies (`BumperPushForce`) before the capsule reaches them. **Its overlap-EVENT path is dead for Geometry Collections** — GC components emit no begin-overlap events (2026-09-13), so the working prop interaction is `UpdateBulldozerPush`, a per-tick sphere overlap **query** (`ECC_Destructible` + `ECC_PhysicsBody`, `BulldozerRadius`) that (a) **charge-shatters** an intact prop when the cat's horizontal speed is ≥ `ChargeShatterSpeed` (500 — a walk/trot just bumps), and (b) **bulldozes** fractured debris aside per chunk. A shatter is still `ForceShatterGC` on every machine — deterministic, no strain/threshold knobs — and `ForceShatterGC` also flips the fractured component to Pawn=Overlap / Visibility=Ignore / Camera=Ignore (Layer 1). Tunables: `Physics Bumper|Bulldozer`. Role gating: GC chunks are pushed on the **locally controlled** machine only (they live in each machine's own solver; the known client-parity gap), replicated physics props on **authority** only. Full model, the sleep-threshold dependency and the open parity item: `Docs/match-destruction.md`.
+
+### Impact Response
+
+`ImpactResponse` (`UCatImpactResponseComponent`) owns cat-vs-world reactions — Flinch and Stagger shipped, Ragdoll schema-only, frozen at that for Playtest 1. Touch points on `ACatBase`: `HandleSwatHit` routes a cat victim to `ImpactResponse->ReportSwatImpact` (a direct C++ call, deliberately not the damage event); `Multicast_ImpactReaction` (reliable, value-carrying, nobody skips) forwards to the component; `Move()` checks `IsStaggerSuppressing()` **first** in its suppression chain; `RestoreAllCMCOverrides` calls `AbortAllImpactReactions()` **first of all** (impact sits above traversal), under a contract that it touches only impact-owned state. Everything else — classifier, thresholds, tiers, PIE evidence — is in `Docs/impact-response.md`.
 
 ### Tick Subsystems (called from `Tick`)
 
@@ -88,5 +92,6 @@ A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes physics bodies (`Bumpe
 |---|---|
 | `UpdateAnimationStates()` | All roles |
 | `UpdateJumpGravity()` | Authority + autonomous proxy |
+| `UpdateBulldozerPush()` | Called on all roles; gates inside — GC chunks on the locally controlled machine, replicated props on authority (Phase B, 2026-09-13) |
 | `UpdateCosmeticInterpolation()` | Skipped on dedicated server |
 
