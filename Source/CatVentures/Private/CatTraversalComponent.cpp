@@ -5,6 +5,7 @@
 #include "PawPrintSubsystem.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GeometryCollection/GeometryCollectionComponent.h"
 
 UCatTraversalComponent::UCatTraversalComponent()
 {
@@ -193,6 +194,15 @@ bool UCatTraversalComponent::ProbeWalls(float Reach, int32 NumDirections,
 		FHitResult Hit;
 		if (!GetWorld()->LineTraceSingleByChannel(Hit, Center, Center + Dir * Reach,
 			ECC_Visibility, Params))
+		{
+			continue;
+		}
+		// Phase B belt-and-suspenders (2026-09-12): a Geometry-Collection chunk is never
+		// a wall. Layer 1 already flips fractured chunks to Ignore ECC_Visibility, but an
+		// INTACT prop still blocks Visibility and we don't want the cat wall-clinging to a
+		// vase either — filter every GC here regardless of fracture state. Not even counted
+		// as "a wall near me" (bOutAnyHit), so bounce/cling detection ignores debris cleanly.
+		if (Cast<UGeometryCollectionComponent>(Hit.GetComponent()))
 		{
 			continue;
 		}

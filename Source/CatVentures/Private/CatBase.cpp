@@ -18,6 +18,7 @@
 #include "InteractableInterface.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "GeometryCollection/GeometryCollectionComponent.h"
+#include "Engine/OverlapResult.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
@@ -198,9 +199,19 @@ void ACatBase::OnBumperOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
 	// it independently for deterministic simultaneous fracture. Only the cat's owning
 	// machine reports the hit (IsLocallyControlled gate), preventing the server copy of a
 	// remote pawn from racing the client's Server RPC and double-triggering the multicast.
+	// Path B — GC fracture on a CHARGE. NOTE (2026-09-13): this overlap-EVENT path does NOT
+	// fire for our Geometry-Collection props — they don't emit begin-overlap events, so the
+	// working charge-to-shatter lives in UpdateBulldozerPush, which finds props via an overlap
+	// QUERY instead. This branch is kept for any GC that DOES emit events and shares
+	// ChargeShatterSpeed with the bulldozer so the two stay in lockstep: only a charge shatters
+	// on contact; a walk/trot leaves the prop intact (swat + impact paths untouched).
 	if (Cast<UGeometryCollectionComponent>(OtherComp))
 	{
 		if (!IsLocallyControlled()) return;
+
+		FVector ChargeVel = GetVelocity();
+		ChargeVel.Z = 0.0f;
+		if (ChargeVel.Size() < ChargeShatterSpeed) return;
 
 		if (HasAuthority())
 		{
@@ -269,6 +280,141 @@ void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLoca
 		/*PropagationFactor=*/ 1.0f,
 		/*Strain=*/            ShatterStrain
 	);
+
+	// ── Phase B (2026-09-12): once a prop becomes DEBRIS it must stop obstructing the
+	// cat. The intact prop blocks every channel (you bump into it and smash it); the
+	// loose chunks must not. This is a multicast target, so it runs on every machine —
+	// consistent with each machine's own LOCAL fracture (GC chunks are simulated
+	// locally, not replicated). Intact props are untouched (they only reach here on
+	// shatter), so they keep blocking normally.
+	//   Pawn       → Overlap : the capsule no longer sticks and depenetration-snaps on a
+	//                          chunk (the "teleport"); the bumper's bulldozer push
+	//                          (UpdateBulldozerPush) still scatters the debris aside.
+	//   Visibility → Ignore  : ProbeWalls (wall-attach) and the foot-IK trace stop
+	//                          reading a chunk as a wall face / a floor at a random height.
+	//   Camera     → Ignore  : the camera boom stops colliding with flying debris.
+	// WorldStatic/WorldDynamic/PhysicsBody stay Block so chunks still pile on the floor
+	// and on each other.
+	GCC->SetCollisionResponseToChannel(ECC_Pawn,       ECR_Overlap);
+	GCC->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
+	GCC->SetCollisionResponseToChannel(ECC_Camera,     ECR_Ignore);
+}
+
+void ACatBase::UpdateBulldozerPush(float DeltaTime)
+{
+	UWorld* World = GetWorld();
+	if (!World || DeltaTime <= 0.0f) return;
+
+	// Only shove while actually moving — a standing cat does not bulldoze.
+	FVector Vel = GetVelocity();
+	Vel.Z = 0.0f;
+	const float MoveSpeed = Vel.Size();
+	if (MoveSpeed < BulldozerMinSpeed) return;
+	const FVector MoveDir = Vel / MoveSpeed;
+
+	// GC chunks live in each machine's LOCAL solver (fracture is not replicated), so
+	// they must be pushed on the owning machine; replicated physics props are
+	// server-authoritative. A proxy of a remote cat drives neither.
+	const bool bLocal = IsLocallyControlled();
+	const bool bAuth  = HasAuthority();
+	if (!bLocal && !bAuth) return;
+
+	const FVector Center = GetActorLocation();
+
+	FCollisionObjectQueryParams ObjParams;
+	ObjParams.AddObjectTypesToQuery(ECC_Destructible);
+	ObjParams.AddObjectTypesToQuery(ECC_PhysicsBody);
+	FCollisionQueryParams QParams(FName(TEXT("CatBulldozer")), /*bTraceComplex=*/ false, this);
+
+	TArray<FOverlapResult> Overlaps;
+	World->OverlapMultiByObjectType(Overlaps, Center, FQuat::Identity, ObjParams,
+		FCollisionShape::MakeSphere(BulldozerRadius), QParams);
+	if (Overlaps.Num() == 0) return;
+
+	// Per-tick velocity-change imparted to debris. The GC field ADDS delta-v each tick,
+	// so this is scaled to a 60 fps baseline (FrameScale, capped for a frame hitch) to
+	// keep the accumulated scatter frame-rate independent — NOT by raw dt, which made the
+	// old value microscopic (~4 cm/s/tick, the "no bulldozer" feel). A faster charge
+	// scatters harder (SpeedFactor); the hard cap stops a physics explosion.
+	const float SpeedFactor = FMath::Clamp(MoveSpeed / 300.0f, 0.5f, 1.75f);
+	const float FrameScale  = FMath::Min(DeltaTime * 60.0f, 2.0f);
+	const float Impulse = FMath::Min(BulldozerPushStrength * SpeedFactor * FrameScale, 1500.0f);
+
+	UPrimitiveComponent* FloorComp = GetCharacterMovement()
+		? GetCharacterMovement()->CurrentFloor.HitResult.GetComponent() : nullptr;
+
+	TSet<UPrimitiveComponent*> Done;
+	for (const FOverlapResult& O : Overlaps)
+	{
+		UPrimitiveComponent* Comp = O.GetComponent();
+		if (!Comp || Comp == FloorComp || Comp == GrabbedComponent.Get()) continue;
+		if (Done.Contains(Comp) || !Comp->IsSimulatingPhysics()) continue;
+		Done.Add(Comp);
+
+		UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(Comp);
+		if (GCC ? !bLocal : !bAuth) continue;   // chunks: local; props: authority
+
+		if (GCC)
+		{
+			// Layer 1 flips a prop to Pawn=Overlap the instant it fractures, so Pawn=Block
+			// still means INTACT. The two cases are handled completely differently:
+			const bool bIntact = (GCC->GetCollisionResponseToChannel(ECC_Pawn) != ECR_Overlap);
+			if (bIntact)
+			{
+				// CHARGE-TO-SMASH. Done here, from the overlap QUERY, because the
+				// PhysicsBumper's overlap EVENTS never fire for these GC props (2026-09-13
+				// diag: zero bumper overlaps even on a sprint — that path is dead for GCs).
+				// A fast enough charge shatters the prop on contact; a walk/trot just bumps
+				// it (below the threshold we neither shatter NOR push — shoving an intact
+				// prop self-destructs it on collision strain, the "walking broke a bunch" bug).
+				if (MoveSpeed >= ChargeShatterSpeed)
+				{
+					AActor* PropActor = Comp->GetOwner();
+					if (HasAuthority()) Multicast_BumperHitGC(PropActor, GetActorLocation());
+					else                Server_BumperHitGC(PropActor, GetActorLocation());
+				}
+				continue;   // intact: shattered (breaks next frame) or left alone — never push
+			}
+
+			// FRACTURED DEBRIS → bulldoze it aside. Hard-won path (2026-09-13): the uniform
+			// LinearVelocity field (AddImpulse) never moved settled/declustered chunks even
+			// after waking; AddImpulseAtLocation routes through the physics proxy directly
+			// (ApplyImpulseAt_External) and DOES move a chunk — but only the one AT the point,
+			// so 3 guessed samples missed most of the pile. GetCurrentTransforms() gives the
+			// LIVE per-chunk positions, so we impulse EVERY chunk actually within range,
+			// radially away from the cat plus a forward plow bias. Mass-scaled (proxy impulse
+			// has no bVelChange), so BulldozerPushStrength is tuned for it.
+			GCC->WakeAllRigidBodies();
+			// COMPONENT-SPACE transforms (accumulated to the component root = the RENDERED
+			// chunk positions), NOT GetCurrentTransforms() which returns raw hierarchical
+			// locals — those gave wrong world positions, so most nearby chunks fell outside
+			// the range check and the few "hits" were far chunks landed on by accident (the
+			// 2026-09-13 "close clip, far impact" symptom).
+			const TArray<FTransform3f>& ChunkXf = GCC->GetComponentSpaceTransforms3f();
+			const FTransform CompToWorld = GCC->GetComponentTransform();
+			const float RangeSq = BulldozerRadius * BulldozerRadius;
+			const float ProxyMag = BulldozerPushStrength * SpeedFactor;
+			for (const FTransform3f& X : ChunkXf)
+			{
+				const FVector ChunkW = CompToWorld.TransformPosition(FVector(X.GetLocation()));
+				if (FVector::DistSquared(ChunkW, Center) > RangeSq) continue;
+				FVector Dir = ChunkW - Center;   // radially AWAY from the cat — clears the path, not "forward-chase"
+				Dir.Z = 0.0f;
+				if (!Dir.Normalize()) Dir = MoveDir;
+				GCC->AddImpulseAtLocation(Dir * ProxyMag, ChunkW);
+			}
+		}
+		else
+		{
+			// Single rigid body: scatter away from the cat, biased along its heading.
+			FVector Dir = Comp->GetComponentLocation() - Center;
+			Dir.Z = 0.0f;
+			Dir = Dir.GetSafeNormal() + MoveDir;
+			Dir.Z = 0.0f;
+			if (!Dir.Normalize()) Dir = MoveDir;
+			Comp->AddImpulse(Dir * Impulse, NAME_None, /*bVelChange=*/ true);
+		}
+	}
 }
 
 void ACatBase::Tick(float DeltaTime)
@@ -293,6 +439,11 @@ void ACatBase::Tick(float DeltaTime)
 	// Turn-in-place is now driven by root-motion turn montages (see TryTurnInPlace),
 	// not a procedural rotation commitment — the montage's root motion rotates the actor
 	// with real footwork. (The old CommitTurn RInterpTo block was removed.)
+
+	// ── Bulldozer: shove nearby debris out of the moving cat's path (Phase B) ──────
+	// Physics op, not cosmetic — runs on server + local machines (role-gated inside so
+	// replicated props push on authority and local GC chunks push on the owning machine).
+	UpdateBulldozerPush(DeltaTime);
 
 	// ── Cosmetic: skip on dedicated server (no visuals) ───────────
 	if (GetNetMode() != NM_DedicatedServer)
@@ -3236,7 +3387,13 @@ void ACatBase::UpdateFootIK(float DeltaTime)
 		// contact). A start-penetrating hit carries no floor information, and a
 		// near-vertical surface isn't floor either — treat both as a miss so the paw
 		// rides FK and the chest/incline aggregation sees no valid floor.
-		if (bHit && (Hit.bStartPenetrating || Hit.ImpactNormal.Z < 0.5f))
+		// A Geometry-Collection chunk is never valid floor either (Phase B, 2026-09-12):
+		// a fresh fracture pile presents a different chunk height under each paw, which
+		// railed the offset to its clamp. Layer 1 sets fractured chunks to Ignore
+		// ECC_Visibility, but this filter also covers an INTACT prop stood on and any
+		// frame before the flip lands — same shape as the wall-pin filter above.
+		if (bHit && (Hit.bStartPenetrating || Hit.ImpactNormal.Z < 0.5f
+			|| Cast<UGeometryCollectionComponent>(Hit.GetComponent())))
 		{
 			bHit = false;
 		}

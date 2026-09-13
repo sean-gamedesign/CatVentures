@@ -559,6 +559,45 @@ public:
 	// (ForceShatterGC) by design — there is no strain/threshold tuning on this path.
 	// To make a prop harder to break, gate it on the BP side, not here.
 
+	// ── Bulldozer push + charge-shatter (Phase B, 2026-09-13) ───────────────────
+	// While the cat MOVES, an overlap QUERY each tick finds nearby destructibles:
+	//  - INTACT props (Pawn=Block) shatter on a CHARGE (>= ChargeShatterSpeed); a
+	//    walk/trot leaves them intact (this is the real charge-to-smash path — the
+	//    PhysicsBumper's overlap-EVENT version never fires for GC props).
+	//  - FRACTURED debris (Pawn=Overlap, flipped by Layer 1) is shoved out of the path,
+	//    per-chunk via AddImpulseAtLocation at each chunk's live component-space position.
+	// Layer 1 (ForceShatterGC) stops the capsule sticking; this makes the walk-through
+	// read as a bulldozer. GC chunks act on the LOCAL machine (fracture is not replicated —
+	// so a remote proxy neither shatters nor scatters, the known client under-scatter);
+	// replicated physics props act on authority only.
+	// DEPENDENCY: settled Chaos chunks sleep and drop out of the overlap query, so the
+	// project raises p.Chaos.Solver.Sleep.Defaults.SleepCounterThreshold (DefaultEngine.ini
+	// [SystemSettings]) to keep debris pushable for ~15 s after it settles.
+
+	/** Radius (cm) of the sphere around the cat within which debris is shoved. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
+	float BulldozerRadius = 110.0f;
+
+	/** Per-chunk push impulse, scaled by cat speed. MASS-SCALED (proxy AddImpulseAtLocation
+	 *  has no velocity-change mode), so this is a large momentum value, not a cm/s velocity.
+	 *  ~5000 is a solid plow; raise for more violent scatter. (The non-GC single-body branch
+	 *  reuses it as a mass-independent velocity-change, hard-capped at 1500.) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
+	float BulldozerPushStrength = 5000.0f;
+
+	/** Below this cat speed (cm/s) the bulldozer is idle — debris is only shoved while moving. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
+	float BulldozerMinSpeed = 60.0f;
+
+	/** Cat speed (cm/s) at/above which charging into an intact prop shatters it on contact.
+	 *  Below it a walk/trot just bumps. Shared by the bulldozer charge-shatter and the
+	 *  (dead-for-GC) bumper Path B. Trot 400 leaves intact, sprint 650 smashes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
+	float ChargeShatterSpeed = 500.0f;
+
+	/** Per-tick: shove nearby fractured debris aside and charge-shatter intact props. */
+	void UpdateBulldozerPush(float DeltaTime);
+
 	// ── Mouth Grab ───────────────────────────────────────────────────────
 
 	/** Dynamically created physics constraint linking the mouth socket anchor to the
