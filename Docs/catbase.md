@@ -80,7 +80,7 @@ Local prediction pattern: client plays montage immediately + fires `Server_Swat(
 
 ### Physics Bumper, Bulldozer & Destruction
 
-A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes plain physics bodies (`BumperPushForce`) before the capsule reaches them. **Its overlap-EVENT path is dead for Geometry Collections** — GC components emit no begin-overlap events (2026-09-13), so the working prop interaction is `UpdateBulldozerPush`, a per-tick sphere overlap **query** (`ECC_Destructible` + `ECC_PhysicsBody`, `BulldozerRadius`) that (a) **charge-shatters** an intact prop when the cat's horizontal speed is ≥ `ChargeShatterSpeed` (500 — a walk/trot just bumps), and (b) **bulldozes** fractured debris aside per chunk. A shatter is still `ForceShatterGC` on every machine — deterministic, no strain/threshold knobs — and `ForceShatterGC` also flips the fractured component to Pawn=Overlap / Visibility=Ignore / Camera=Ignore (Layer 1). Tunables: `Physics Bumper|Bulldozer`. Role gating: GC chunks are pushed on the **locally controlled** machine only (they live in each machine's own solver; the known client-parity gap), replicated physics props on **authority** only. Full model, the sleep-threshold dependency and the open parity item: `Docs/match-destruction.md`.
+A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes plain physics bodies (`BumperPushForce`) before the capsule reaches them. **Its overlap-EVENT path is dead for Geometry Collections** — GC components emit no begin-overlap events (2026-09-13), so the working prop interaction is `UpdateBulldozerPush`, a per-tick sphere overlap **query** (`ECC_Destructible` + `ECC_PhysicsBody`, `BulldozerRadius`) that (a) **charge-shatters** an intact prop when the cat's horizontal speed is ≥ `ChargeShatterSpeed` (500 — a walk/trot just bumps), and (b) **bulldozes** fractured debris aside per chunk. A shatter is still `ForceShatterGC` on every machine — deterministic, no strain/threshold knobs — and `ForceShatterGC` also flips the fractured component to Pawn=Overlap / Visibility=Ignore / Camera=Ignore (Layer 1). Tunables: `Physics Bumper|Bulldozer`. Role gating (client-parity pass, 2026-09-13): GC debris is pushed on **every role** (each machine's copy of the cat plows that machine's chunks), the charge-shatter is **owner-only** (it fires RPCs), replicated physics props **authority** only. `ForceShatterGC` also schedules the next-tick scatter burst on a prop's first shatter. Full model, the sleep-threshold dependency and the open parity item: `Docs/match-destruction.md`.
 
 ### Impact Response
 
@@ -92,6 +92,6 @@ A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes plain physics bodies (
 |---|---|
 | `UpdateAnimationStates()` | All roles |
 | `UpdateJumpGravity()` | Authority + autonomous proxy |
-| `UpdateBulldozerPush()` | Called on all roles; gates inside — GC chunks on the locally controlled machine, replicated props on authority (Phase B, 2026-09-13) |
+| `UpdateBulldozerPush()` | All roles; gates inside — GC debris on every role, charge-shatter owner-only, replicated props on authority (Phase B + parity pass, 2026-09-13) |
 | `UpdateCosmeticInterpolation()` | Skipped on dedicated server |
 

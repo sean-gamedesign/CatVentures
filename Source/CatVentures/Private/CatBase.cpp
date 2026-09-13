@@ -18,6 +18,10 @@
 #include "InteractableInterface.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "GeometryCollection/GeometryCollectionComponent.h"
+#include "GeometryCollection/GeometryCollectionObject.h"
+#include "GeometryCollection/GeometryCollection.h"
+#include "PhysicsProxy/GeometryCollectionPhysicsProxy.h"
+#include "TimerManager.h"
 #include "Engine/OverlapResult.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
@@ -262,6 +266,102 @@ void ACatBase::Multicast_BumperHitGC_Implementation(AActor* GCActor, FVector Ori
 	ForceShatterGC(GCC, Origin);
 }
 
+// ── Shatter scatter burst (client-parity pass, 2026-09-13) ─────────────────────
+// Why this exists: the bulldozer (UpdateBulldozerPush) only shoves chunks on the
+// machine that DRIVES the cat, so a remote player watched props fracture in place —
+// "cracked, not destroyed". ForceShatterGC is the multicast target on every machine,
+// so a burst scheduled from here gives every machine the same "it blew apart" read
+// at the moment of the break, whichever path broke it (charge / 4th swat / impact —
+// each already passes a usable HitLocation: cat position / prop centre / contact point).
+//
+// Why it is DEFERRED one tick: an impulse applied in the same frame as the strain
+// lands on the still-intact ROOT cluster (ApplyImpulseAt_External targets the closest
+// top-level cluster parent; radial "fields" are the family that never moved chunks
+// last session). The children inherit that as one uniform shove — the whole vase
+// slides. Next tick the leaves ARE the top-level parents and the bulldozer's proven
+// per-chunk path (GetComponentSpaceTransforms3f -> AddImpulseAtLocation) scatters
+// them radially. Only FST_Rigid leaves are impulsed — internal cluster nodes would
+// double-tap whichever leaf is nearest.
+//
+// Why the CENTRE OF MASS and not the transform (2026-09-13, second round): GC_Cylinder
+// was fractured with every piece's PIVOT at the component origin — the geometry carries
+// the offset, the transform does not — so GetComponentSpaceTransforms3f() reports all
+// 20 leaves at ONE point on the tick after the break. The first burst missed every leaf
+// on the range check, and when it didn't, all 20 impulses landed on the same point and
+// ApplyImpulseAt_External (closest top-level parent to the point) fed them to ONE chunk.
+// The proxy's game-thread particle per piece (GetParticleByIndex_External(i)->GetX())
+// is the world COM — the very quantity the impulse code compares against — and it is
+// populated from the rest geometry at creation and refreshed after the break.
+//
+// Knobs are constexpr on purpose: ForceShatterGC is static (there is no instance to
+// hang a UPROPERTY on, and the BP shatter paths call it too) and a body-level edit
+// is Live-Coding tunable in ~15 s. Promote to a settings knob if they stop moving.
+namespace CatShatter
+{
+	constexpr float ScatterImpulse = 12000.0f;  // per-leaf momentum (mass-scaled, same model as BulldozerPushStrength)
+	constexpr float ScatterRadius  = 400.0f;    // sanity bound only — the whole prop should burst (chunk COMs sit ~100-200 cm from a charging cat)
+	constexpr float ScatterUpBias  = 0.25f;     // fraction of the impulse added straight up so pieces hop, not slide
+
+	static const TCHAR* NetTag(const UWorld* World)
+	{
+		if (!World) return TEXT("???");
+		switch (World->GetNetMode())
+		{
+		case NM_ListenServer:    return TEXT("SRV");
+		case NM_DedicatedServer: return TEXT("DED");
+		case NM_Client:          return TEXT("CLI");
+		default:                 return TEXT("SA");
+		}
+	}
+
+	/** World-space centre of mass of piece i (the proxy's game-thread particle), falling
+	 *  back to the transform pivot if the proxy has no particle for it. */
+	static FVector PieceWorldCOM(const UGeometryCollectionComponent* GCC, int32 i,
+	                             const TArray<FTransform3f>& Xf, const FTransform& C2W)
+	{
+		if (const FGeometryCollectionPhysicsProxy* Proxy = GCC->GetPhysicsProxy())
+		{
+			if (const FGeometryCollectionPhysicsProxy::FParticle* P = Proxy->GetParticleByIndex_External(i))
+			{
+				return FVector(P->GetX());
+			}
+		}
+		return Xf.IsValidIndex(i) ? C2W.TransformPosition(FVector(Xf[i].GetLocation())) : C2W.GetLocation();
+	}
+
+	static void ScatterDebris(UGeometryCollectionComponent* GCC, FVector Origin)
+	{
+		if (!GCC || !IsValid(GCC)) return;
+
+		const UGeometryCollection* Rest = GCC->GetRestCollection();
+		const TSharedPtr<FGeometryCollection, ESPMode::ThreadSafe> Coll = Rest ? Rest->GetGeometryCollection() : nullptr;
+		const int32 NumSim = Coll.IsValid() ? Coll->SimulationType.Num() : 0;
+
+		const TArray<FTransform3f>& ChunkXf = GCC->GetComponentSpaceTransforms3f();
+		const FTransform CompToWorld = GCC->GetComponentTransform();
+		const float RangeSq = ScatterRadius * ScatterRadius;
+
+		int32 Hit = 0;
+		for (int32 i = 0; i < ChunkXf.Num(); ++i)
+		{
+			if (i < NumSim && !Coll->IsRigid(i)) continue;   // leaves only
+			const FVector ChunkW = PieceWorldCOM(GCC, i, ChunkXf, CompToWorld);   // COM, not pivot (see above)
+			if (FVector::DistSquared(ChunkW, Origin) > RangeSq) continue;
+
+			FVector Dir = ChunkW - Origin;   // radially away from the break point
+			Dir.Z = 0.0f;
+			if (!Dir.Normalize()) Dir = FVector::ForwardVector;
+			Dir += FVector::UpVector * ScatterUpBias;
+			GCC->AddImpulseAtLocation(Dir * ScatterImpulse, ChunkW);
+			++Hit;
+		}
+
+		UE_LOG(LogCatVentures, Log, TEXT("[Chaos] %s scatter burst '%s': %d/%d leaves within %.0f cm of (%.0f,%.0f,%.0f), impulse %.0f"),
+			NetTag(GCC->GetWorld()), *GetNameSafe(GCC->GetOwner()), Hit, ChunkXf.Num(), ScatterRadius,
+			Origin.X, Origin.Y, Origin.Z, ScatterImpulse);
+	}
+}
+
 void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation)
 {
 	if (!GCC) return;
@@ -270,6 +370,11 @@ void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLoca
 	// regardless of the asset's Damage Threshold setting.
 	constexpr float ShatterRadius = 500.0f;
 	constexpr float ShatterStrain = 500000000.0f;
+
+	// "First shatter of this prop on this machine": Layer 1 below flips Pawn to Overlap,
+	// so reading it BEFORE the flip is an exact intact bit. Break paths can fire more than
+	// once per prop (BB-17) — the burst must not.
+	const bool bWasIntact = (GCC->GetCollisionResponseToChannel(ECC_Pawn) != ECR_Overlap);
 
 	GCC->ApplyKinematicField(ShatterRadius, HitLocation);
 	GCC->ApplyExternalStrain(
@@ -298,6 +403,19 @@ void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLoca
 	GCC->SetCollisionResponseToChannel(ECC_Pawn,       ECR_Overlap);
 	GCC->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
 	GCC->SetCollisionResponseToChannel(ECC_Camera,     ECR_Ignore);
+
+	// ── Scatter burst, next tick (see the CatShatter block above for why deferred) ──
+	if (bWasIntact)
+	{
+		if (UWorld* World = GCC->GetWorld())
+		{
+			World->GetTimerManager().SetTimerForNextTick(
+				FTimerDelegate::CreateWeakLambda(GCC, [GCC, HitLocation]()
+				{
+					CatShatter::ScatterDebris(GCC, HitLocation);
+				}));
+		}
+	}
 }
 
 void ACatBase::UpdateBulldozerPush(float DeltaTime)
@@ -312,12 +430,18 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 	if (MoveSpeed < BulldozerMinSpeed) return;
 	const FVector MoveDir = Vel / MoveSpeed;
 
-	// GC chunks live in each machine's LOCAL solver (fracture is not replicated), so
-	// they must be pushed on the owning machine; replicated physics props are
-	// server-authoritative. A proxy of a remote cat drives neither.
+	// Role model (client-parity pass, 2026-09-13):
+	//  - GC DEBRIS is pushed on EVERY role, including simulated proxies and the host's
+	//    copy of a client cat. Chunks live in each machine's own solver, so the only
+	//    way a remote viewer sees the plow is for THEIR copy of the cat to plow THEIR
+	//    chunks — the proxy's replicated velocity drives it. (Before this, only the
+	//    locally controlled cat pushed, so a remote player watched the row stay put:
+	//    "cracked, not destroyed".)
+	//  - CHARGE-SHATTER of an intact prop stays owner-only (bLocal): it fires the
+	//    Server/Multicast RPCs, and the host's copy of a client cat would double-fire.
+	//  - Replicated physics PROPS (non-GC) are pushed on authority only.
 	const bool bLocal = IsLocallyControlled();
 	const bool bAuth  = HasAuthority();
-	if (!bLocal && !bAuth) return;
 
 	const FVector Center = GetActorLocation();
 
@@ -352,7 +476,7 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 		Done.Add(Comp);
 
 		UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(Comp);
-		if (GCC ? !bLocal : !bAuth) continue;   // chunks: local; props: authority
+		if (!GCC && !bAuth) continue;   // props: authority only; GC: every role (see above)
 
 		if (GCC)
 		{
@@ -367,7 +491,7 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 				// A fast enough charge shatters the prop on contact; a walk/trot just bumps
 				// it (below the threshold we neither shatter NOR push — shoving an intact
 				// prop self-destructs it on collision strain, the "walking broke a bunch" bug).
-				if (MoveSpeed >= ChargeShatterSpeed)
+				if (bLocal && MoveSpeed >= ChargeShatterSpeed)   // owner-only: fires RPCs
 				{
 					AActor* PropActor = Comp->GetOwner();
 					if (HasAuthority()) Multicast_BumperHitGC(PropActor, GetActorLocation());

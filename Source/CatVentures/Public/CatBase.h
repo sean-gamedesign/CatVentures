@@ -567,9 +567,9 @@ public:
 	//  - FRACTURED debris (Pawn=Overlap, flipped by Layer 1) is shoved out of the path,
 	//    per-chunk via AddImpulseAtLocation at each chunk's live component-space position.
 	// Layer 1 (ForceShatterGC) stops the capsule sticking; this makes the walk-through
-	// read as a bulldozer. GC chunks act on the LOCAL machine (fracture is not replicated —
-	// so a remote proxy neither shatters nor scatters, the known client under-scatter);
-	// replicated physics props act on authority only.
+	// read as a bulldozer. GC debris is pushed on EVERY role (each machine's copy of the
+	// cat plows that machine's chunks — client-parity pass, 2026-09-13); the charge-shatter
+	// stays owner-only (it fires RPCs); replicated physics props act on authority only.
 	// DEPENDENCY: settled Chaos chunks sleep and drop out of the overlap query, so the
 	// project raises p.Chaos.Solver.Sleep.Defaults.SleepCounterThreshold (DefaultEngine.ini
 	// [SystemSettings]) to keep debris pushable for ~15 s after it settles.
@@ -997,13 +997,20 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_BumperHitGC(AActor* GCActor, FVector Origin);
 
-	/** Server → All: force-shatter the GC on every machine's local physics solver. */
-	UFUNCTION(NetMulticast, Unreliable)
+	/** Server → All: force-shatter the GC on every machine's local physics solver.
+	 *  RELIABLE (2026-09-13): fires once per prop and changes state on every machine —
+	 *  a dropped multicast left that client with an INTACT, still-BLOCKING prop (and no
+	 *  Layer 1 collision flip) while it was debris everywhere else. The BP shatter
+	 *  multicasts (swat / impact, BPC_ChaosItem) were already Reliable. */
+	UFUNCTION(NetMulticast, Reliable)
 	void Multicast_BumperHitGC(AActor* GCActor, FVector Origin);
 
 	/** Deterministic GC fracture — wakes the Chaos solver and injects overwhelming strain
 	 *  to guarantee immediate cluster-bond breakage. Call from Blueprints on high-speed
-	 *  impact events. Hardcoded radius/strain values bypass the asset's Damage Threshold. */
+	 *  impact events. Hardcoded radius/strain values bypass the asset's Damage Threshold.
+	 *  Also flips the fractured chunks off the cat's channels (Layer 1) and, on the prop's
+	 *  FIRST shatter, schedules a next-tick radial scatter burst from HitLocation so every
+	 *  machine sees "destroyed", not "cracked in place" (see the .cpp). */
 	UFUNCTION(BlueprintCallable, Category = "Chaos")
 	static void ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation);
 
