@@ -52,6 +52,20 @@ bool ACatGameMode::IsHeavyProp(UObject* WorldContextObject, FName ChaosRewardKey
 	return Row && Row->bHeavyTier;
 }
 
+int32 ACatGameMode::GetSwatsToBreak(UObject* WorldContextObject, FName ChaosRewardKey)
+{
+	const ACatGameMode* GM = ResolveCatGameMode(WorldContextObject);
+	int32 Swats = GM ? GM->DefaultSwatsToBreak : 4;
+	if (GM && GM->ChaosRewardTable && !ChaosRewardKey.IsNone())
+	{
+		if (const FChaosRewardData* Row = GM->ChaosRewardTable->FindRow<FChaosRewardData>(ChaosRewardKey, TEXT("GetSwatsToBreak")))
+		{
+			if (Row->SwatsToBreak > 0) Swats = Row->SwatsToBreak;
+		}
+	}
+	return FMath::Max(Swats, 1);
+}
+
 bool ACatGameMode::ShouldImpactShatter(UObject* WorldContextObject,
                                        FName ChaosRewardKey,
                                        UPrimitiveComponent* VictimComp,

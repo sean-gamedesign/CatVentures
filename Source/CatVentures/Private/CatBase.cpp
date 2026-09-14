@@ -496,8 +496,37 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 					AActor* PropActor = Comp->GetOwner();
 					if (HasAuthority()) Multicast_BumperHitGC(PropActor, GetActorLocation());
 					else                Server_BumperHitGC(PropActor, GetActorLocation());
+					continue;   // shattered (breaks next frame)
 				}
-				continue;   // intact: shattered (breaks next frame) or left alone — never push
+
+				// BUMP-PUSH (see the knobs in the header): below charge speed an intact prop
+				// is nudged, not smashed. Only when the cat is actually pressing into it —
+				// the prop must be ahead of the cat (within 60° of the move direction) and
+				// close enough for the capsule to be touching (prop radius + capsule + slack).
+				// Intact GC = one rigid cluster, so one impulse moves the whole prop; applied
+				// at the prop's centre at the cat's height so a top-heavy prop topples rather
+				// than slides. Every role runs it — an intact GC lives in each machine's own
+				// solver just like debris — but a prop is a LEVEL actor, not a replicated
+				// physics body, so each machine's copy is pushed by that machine's copy of the
+				// cat and the remote view is approximate (same contract as the debris plow).
+				{
+					const FVector PropLoc = Comp->GetComponentLocation();
+					FVector ToProp = PropLoc - Center; ToProp.Z = 0.0f;
+					const float Dist = ToProp.Size();
+					const float PropRadius = Comp->Bounds.SphereRadius * 0.75f;   // sphere over-reads a cylinder
+					const float Reach = PropRadius + 14.0f /*capsule r*/ + 25.0f;
+					if (Dist > KINDA_SMALL_NUMBER && Dist <= Reach
+						&& FVector::DotProduct(ToProp / Dist, MoveDir) >= 0.5f)
+					{
+						const float Mass = FMath::Max(Comp->GetMass(), 1.0f);
+						const float BumpImpulse = FMath::Min(Mass, BumpPushRefMass) * BumpPushAccel * DeltaTime;
+						const FVector At(PropLoc.X, PropLoc.Y, Center.Z);
+						GCC->AddImpulseAtLocation(MoveDir * BumpImpulse, At);
+						UE_LOG(LogCatVentures, Verbose, TEXT("[Chaos] bump-push '%s' mass %.0f impulse %.0f (cat %.0f cm/s)"),
+							*GetNameSafe(Comp->GetOwner()), Mass, BumpImpulse, MoveSpeed);
+					}
+				}
+				continue;
 			}
 
 			// FRACTURED DEBRIS → bulldoze it aside. Hard-won path (2026-09-13): the uniform

@@ -620,6 +620,24 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
 	float ChargeShatterSpeed = 500.0f;
 
+	// ── Bump-push for INTACT props (2026-09-13). Below ChargeShatterSpeed an intact prop
+	// used to be a wall: not pushed, not broken — fine on the floor, useless on a
+	// counter where there is no runway to reach charge speed. Now a walking/trotting cat
+	// nudges it: impulse = min(PropMass, BumpPushRefMass) × BumpPushAccel × dt, so a prop
+	// at or under the reference mass gains BumpPushAccel cm/s per second of contact and
+	// heavier props proportionally less (a vase topples off the shelf, a fridge rocks).
+	// Whether the fall then BREAKS it is the DT row's ImpactVelocityThreshold — this only
+	// moves things. Requires the GC component's bEnableDamageFromCollision OFF (it was on
+	// with a 50k level-1 threshold — the Phase B "shoving broke a bunch" cause).
+
+	/** Velocity (cm/s) a light prop gains per second of a walking cat pushing into it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "0.0"))
+	float BumpPushAccel = 400.0f;
+
+	/** Mass (kg) at which the bump push is full strength; heavier props scale down by RefMass/Mass. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Physics Bumper|Bulldozer", meta = (ClampMin = "1.0"))
+	float BumpPushRefMass = 250.0f;
+
 	/** Per-tick: shove nearby fractured debris aside and charge-shatter intact props. */
 	void UpdateBulldozerPush(float DeltaTime);
 

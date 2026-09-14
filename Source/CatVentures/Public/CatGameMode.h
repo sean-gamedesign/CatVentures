@@ -73,6 +73,19 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
 	float DefaultImpactImpulseThreshold = 25000.0f;
 
+	/** Swats needed to shatter a prop whose row leaves SwatsToBreak at 0 (or has no
+	 *  row). 4 = the value BPC_ChaosItem hardcoded before the per-row column existed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "1"))
+	int32 DefaultSwatsToBreak = 4;
+
+	/** Per-prop swat count for the swat-accumulation break path: the row's SwatsToBreak,
+	 *  or DefaultSwatsToBreak when the row is missing / leaves it at 0. Static with a
+	 *  WorldContext so the BPC_ChaosItem call site is one node (the ShouldImpactShatter
+	 *  pattern). Falls back to the default on clients too, so the comparison is the
+	 *  same on every machine even though only the server's decision matters. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Match|Break", meta = (WorldContext = "WorldContextObject"))
+	static int32 GetSwatsToBreak(UObject* WorldContextObject, FName ChaosRewardKey);
+
 	// ── Objectives ──────────────────────────────────────────────────
 
 	/** Called from UCatObjectiveTargetComponent::BeginPlay. Registration CLOSES at

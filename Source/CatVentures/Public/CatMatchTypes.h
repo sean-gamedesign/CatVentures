@@ -105,4 +105,10 @@ struct FChaosRewardData : public FTableRowBase
 	 *  0 = use the GameMode's project default. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Heavy", meta = (ClampMin = "0.0"))
 	float ImpactImpulseThreshold = 0.0f;
+
+	/** Swats needed to shatter this prop (the swat-accumulation break path). 0 = use
+	 *  ACatGameMode::DefaultSwatsToBreak. Data-driven since 2026-09-13 — BPC_ChaosItem
+	 *  used to hardcode 4, which made a vase as stubborn as a fridge. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Break", meta = (ClampMin = "0"))
+	int32 SwatsToBreak = 0;
 };

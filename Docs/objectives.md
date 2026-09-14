@@ -50,7 +50,7 @@ Two deliberate shortcuts, both flagged in code:
 
 ## Heavy tier (§3) — PARTIAL
 
-Config lives on `DT_ChaosRewards` rows (Sean's call): `bHeavyTier`, `ImpactVelocityThreshold`, `ImpactImpulseThreshold`.
+Config lives on `DT_ChaosRewards` rows (Sean's call): `bHeavyTier`, `ImpactVelocityThreshold`, `ImpactImpulseThreshold` — and since 2026-09-13 `SwatsToBreak` (the swat-accumulation count, read through `ACatGameMode::GetSwatsToBreak`; 0 = `DefaultSwatsToBreak` 4). Rows now: `Vase`, `TV`, `Small`, `Medium`, `Large` — see `Docs/match-destruction.md` for the placeholder pipeline.
 
 **Why two named columns and not one:** a single float whose units flip on a sibling bool, differing by orders of magnitude between rows, is a designer trap — and moving every prop to impulse would silently re-tune every shipped breakable's playtested threshold.
 

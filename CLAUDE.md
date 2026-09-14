@@ -122,7 +122,9 @@ Dependencies (Build.cs):
 - **`GM_CatVentures`** (`/Game/Core`) — the single GameMode BP (see `Docs/match-destruction.md`).
 - **`ABP_Cat_V2`** — Animation Blueprint. Polls the ABP consumption surface from the owning `ACatBase` (the exact variable list is in `Docs/catbase.md` — do not rename any of them without updating the ABP) and binds `OnMeow`.
 - **`BPC_ChaosItem`** — ActorComponent on breakable props (`BP_Destructible_Base`). Carries `ChaosRewardKey`, owns the swat-count/impact shatter logic, reports destruction (see `Docs/match-destruction.md`).
-- **`DT_ChaosRewards`** (`/Game/Data`) — DataTable of `FChaosRewardData` rows (currently `Vase`, `TV`). Assigned on `GM_CatVentures`.
+- **`DT_ChaosRewards`** (`/Game/Data`) — DataTable of `FChaosRewardData` rows (`Vase`, `TV`, and the placeholder classes `Small`/`Medium`/`Large` — value, impact threshold, `SwatsToBreak`). Assigned on `GM_CatVentures`.
+- **`BP_Destructible_S` / `_M` / `_L`** (`/Game/Blueprints`) — children of `BP_Destructible_Base` at GC scale 0.5/1.0/1.6 with their row key baked in as inherited-component overrides; the pipeline template real props follow (`Docs/match-destruction.md`). `M_Destructible` (`/Game/Materials`) is the orange placeholder material.
+- **`ScaleCalibration`** (`/Game/Maps`) — the C-0 scale graybox (uniform 1/1.5/2/2.5× house cells + plan-scaled 3/3.5/4× cells) and the prop test arena (the furnished 3.0×/2.0× cell). Non-OFPA; everything lives in the `.umap`.
 - **`WBP_*`** (`/Game/Blueprints/WBP` + `WBP_ChaosHUD` in `/Game/Blueprints`) — UI widgets: MainMenu (sessions), ServerRow, PauseMenu, MeowTime, RaidScoreboard (rematch gate), ScoreRow, ChaosHUD.
 - **`AnimX`** asset pack — source animations under `Content/AnimX/`. (Its `CharBP_Base`/`AnimBP_Cat` are the original pack assets, not part of the game.)
 - **`Content/Input/`** — `IMC_Cat` (+ `IMC_LookOnly`), `IA_Move`, `IA_Look`, `IA_Jump`, `IA_Meow`, `IA_Swat`, `IA_Interact`, `IA_Grab`, `IA_ToggleMenu`.
