@@ -920,6 +920,19 @@ void ACatBase::Move(const FInputActionValue& Value)
 		// steering along the wall or away from it still works (a blanket input lock would
 		// fix the rebound by removing the air control Sean is asking for more of).
 		FVector AppliedInput = WorldInput * InputScale;
+		// Rolling pivot exit: run out along the FACING, not the camera line. The raw input
+		// still steers (cached above → the rollout's turn target); only the CMC feed is
+		// redirected, so orient-to-movement has nothing to fight and the cat never
+		// moonwalks sideways while the body catches up (the released-plant symptom).
+		if (bPivotRollout)
+		{
+			FVector Fwd = GetActorForwardVector();
+			Fwd.Z = 0.0f;
+			if (Fwd.Normalize())
+			{
+				AppliedInput = Fwd * (WorldInput.Size() * InputScale);
+			}
+		}
 		if (Traversal && Traversal->IsRebounding())
 		{
 			const FVector Away = Traversal->GetReboundDirection();
@@ -1050,6 +1063,41 @@ void ACatBase::UpdateMovingPivot()
 
 	const bool bInputFresh = PivotInputStaleTime < 0.15f;
 
+	// ── Rolling exit ───────────────────────────────────────────────────
+	// Runs BEFORE the arm branch: that branch returns early whenever the cat is not
+	// eligible to arm (and a rollout is never eligible), which is exactly how the first
+	// build stranded this flag — tank controls until PIE restart (2026-09-13).
+	// Not a pivot any more (bIsPivoting is false: normal braking, the burst and stop
+	// systems see an ordinary running cat, SpeedType is the gait) — but the body still
+	// turns toward the live input while Move() feeds the CMC along the facing, so the
+	// run curves onto the input line instead of the cat sliding sideways under a
+	// 200°/s orient-to-movement swing.
+	if (bPivotRollout)
+	{
+		if (!bInputFresh || bIsGrabbing
+			|| MovementStage != ECatMovementStage::OnGround
+			|| JumpPhase != ECatJumpPhase::None)
+		{
+			bPivotRollout = false;
+			UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot rollout ABORT — Speed %.0f"), *GetName(), Speed);
+			return;
+		}
+
+		const float DesiredYaw   = PivotLiveInputDir.Rotation().Yaw;
+		const float CurrentYaw   = GetActorRotation().Yaw;
+		const float RemainingDeg = FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - CurrentYaw));
+		if (RemainingDeg <= PivotExitAngle)
+		{
+			bPivotRollout = false;   // aligned: orient-to-movement carries on from here with nothing to correct
+			UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot rollout END — Speed %.0f"), *GetName(), Speed);
+			return;
+		}
+
+		const float NewYaw = FMath::FixedTurn(CurrentYaw, DesiredYaw, PivotRolloutTurnRate * DeltaTime);
+		SetActorRotation(FRotator(0.0f, NewYaw, 0.0f));
+		return;
+	}
+
 	if (!bIsPivoting)
 	{
 		// ── Arm/detect ────────────────────────────────────────────────
@@ -1088,6 +1136,7 @@ void ACatBase::UpdateMovingPivot()
 
 		const bool bEligible = bEnableMovingPivot
 			&& PivotCooldownTimer <= 0.0f
+			&& !bPivotRollout
 			&& !bIsGrabbing
 			&& MovementStage == ECatMovementStage::OnGround
 			&& JumpPhase == ECatJumpPhase::None
@@ -1132,11 +1181,70 @@ void ACatBase::UpdateMovingPivot()
 			return;
 		}
 
-		const float DesiredYaw = PivotLiveInputDir.Rotation().Yaw;
-		const float CurrentYaw = GetActorRotation().Yaw;
-		if (FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - CurrentYaw)) <= PivotExitAngle)
+		// Gameplay exit into a run (shared by the angle-reached exit and the sweep-stall
+		// release below). Pivot → sprint burst hand-off (2026-09-13): the M5 pivot clips
+		// END on the gathered coil on the assumption that "the launch read comes free from
+		// the start-burst accel-lean rail" — but the weighty-start trigger is EDGE-only
+		// (fresh-input edge / sprint-press edge), rejects while bIsPivoting, and wants
+		// Speed <= StartCoilMaxSpeed at the edge, so with both keys already held at exit
+		// no burst ever fired: every pivot crawled out of 0 at plain accel (and a sprint
+		// pressed during the plant was eaten). The abort paths (release / airborne / grab)
+		// fail these checks by construction. The pivot's ending pose IS the coil, so go
+		// straight to the burst (physics only, no start-step clip); EnterStartBurst does
+		// the predicted + server-mirrored accel boost and EndStartBurst's cooldown.
+		auto FinishPivotIntoRun = [this, bInputFresh](const TCHAR* Why)
 		{
 			ExitPivot();
+			if (bEnableWeightyStarts && bIsSprinting && bInputFresh && !bIsGrabbing
+				&& !bIsStartCoiling && !bIsStartBursting
+				&& MovementStage == ECatMovementStage::OnGround
+				&& JumpPhase == ECatJumpPhase::None)
+			{
+				InputRampTimer    = 0.0f;               // the burst is its own envelope (M4 rule)
+				StartCoilLocation = GetActorLocation(); // for the per-launch spec log line
+				EnterStartBurst();
+				UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot -> Start burst hand-off (%s) — Speed %.0f"), *GetName(), Why, Speed);
+			}
+		};
+
+		const float DesiredYaw = PivotLiveInputDir.Rotation().Yaw;
+		const float CurrentYaw = GetActorRotation().Yaw;
+
+		// ── Sweep-stall release → ROLLING EXIT (see the Pivot knobs in the header). A
+		// mouse flick is over before the sustain filter finishes, so a camera-driven pivot
+		// typically enters with the camera already still and would otherwise plant to 0
+		// and hold 120–150° of turn at 120°/s (measured 2026-09-13: every release fired at
+		// ~15% of the clip). The stall timer borrows PivotSustainTimer, idle during a pivot
+		// (EnterPivot and ExitPivot both zero it).
+		{
+			constexpr float ForwardDominantCos = 0.5f;    // within 60° of camera-forward = a W-family hold
+
+			const float InputYawDelta = FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - PivotPrevInputYaw));
+			PivotPrevInputYaw = DesiredYaw;
+			const bool bInputStill = (DeltaTime > KINDA_SMALL_NUMBER) && (InputYawDelta / DeltaTime) < PivotSweepStallRate;
+			PivotSustainTimer = bInputStill ? PivotSustainTimer + DeltaTime : 0.0f;
+
+			bool bForwardDominant = false;
+			if (Controller)
+			{
+				const FVector CamFwd = FRotationMatrix(FRotator(0.0f, Controller->GetControlRotation().Yaw, 0.0f)).GetUnitAxis(EAxis::X);
+				bForwardDominant = FVector::DotProduct(PivotLiveInputDir, CamFwd) >= ForwardDominantCos;
+			}
+
+			if (bForwardDominant && PivotSustainTimer >= PivotSweepStallTime)
+			{
+				UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot RELEASE -> rollout — remaining %.0f deg, progress %.2f, Speed %.0f"),
+					*GetName(), FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - CurrentYaw)), PivotProgress, Speed);
+				ExitPivot(/*bSnapProgress=*/false);   // freeze the clip where it is — blend out from the real pose
+				bPivotRollout = true;
+				FinishPivotIntoRun(TEXT("release"));  // sprint burst hand-off if Shift is held (accelerates along the facing via Move)
+				return;
+			}
+		}
+
+		if (FMath::Abs(FRotator::NormalizeAxis(DesiredYaw - CurrentYaw)) <= PivotExitAngle)
+		{
+			FinishPivotIntoRun(TEXT("angle"));
 			return;
 		}
 
@@ -1177,12 +1285,14 @@ void ACatBase::UpdateMovingPivot()
 
 		SpeedType = ECatMoveType::Turn;   // footwork state; also gates turn-in-place + lean off
 	}
+
 }
 
 void ACatBase::EnterPivot()
 {
 	bIsPivoting        = true;
 	bGoPivot           = true;
+	bPivotRollout      = false;
 	PivotSustainTimer  = 0.0f;
 	PivotSweepAccumDeg = 0.0f;
 
@@ -1222,7 +1332,7 @@ void ACatBase::EnterPivot()
 	UE_LOG(LogCatVentures, Log, TEXT("[%s] Pivot ENTER — Speed %.0f"), *GetName(), Speed);
 }
 
-void ACatBase::ExitPivot()
+void ACatBase::ExitPivot(bool bSnapProgress)
 {
 	if (!bIsPivoting)
 	{
@@ -1232,12 +1342,18 @@ void ACatBase::ExitPivot()
 	bIsPivoting        = false;
 	bGoPivot           = false;
 	PivotCooldownTimer = PivotCooldown;
+	PivotSustainTimer  = 0.0f;   // borrowed as the sweep-stall timer while pivoting
 
-	// Snap the scrub to the end pose for the blend-out.
-	PivotProgress = 1.0f;
-	if (!HasAuthority())
+	// Snap the scrub to the end pose for the blend-out (angle-reached exit). The rolling
+	// exit passes false and leaves the scrub where it is — a snap from ~15% to the coil
+	// frame was the visible pop on release.
+	if (bSnapProgress)
 	{
-		Server_SetPivotProgress(1.0f);
+		PivotProgress = 1.0f;
+		if (!HasAuthority())
+		{
+			Server_SetPivotProgress(1.0f);
+		}
 	}
 
 	ApplyPivotBraking(false);
@@ -2482,6 +2598,7 @@ void ACatBase::RestoreAllCMCOverrides()
 	// consult them — ApplyStopBraking(false) re-asserts the pivot boost if bIsPivoting is
 	// still set, which would leave exactly the override this function exists to clear.
 	bIsPivoting      = false;
+	bPivotRollout    = false;   // no CMC override of its own, but it redirects Move() — never strand it
 	bIsStopping      = false;
 	bIsStartCoiling  = false;
 	bIsStartBursting = false;

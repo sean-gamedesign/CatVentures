@@ -86,6 +86,10 @@ A forward-facing `UBoxComponent` (`PhysicsBumper`) pushes plain physics bodies (
 
 `ImpactResponse` (`UCatImpactResponseComponent`) owns cat-vs-world reactions — Flinch and Stagger shipped, Ragdoll schema-only, frozen at that for Playtest 1. Touch points on `ACatBase`: `HandleSwatHit` routes a cat victim to `ImpactResponse->ReportSwatImpact` (a direct C++ call, deliberately not the damage event); `Multicast_ImpactReaction` (reliable, value-carrying, nobody skips) forwards to the component; `Move()` checks `IsStaggerSuppressing()` **first** in its suppression chain; `RestoreAllCMCOverrides` calls `AbortAllImpactReactions()` **first of all** (impact sits above traversal), under a contract that it touches only impact-owned state. Everything else — classifier, thresholds, tiers, PIE evidence — is in `Docs/impact-response.md`.
 
+### Move() suppression chain (order matters)
+
+`Move()` caches the camera-relative steer direction first (`PivotLiveInputDir`, always live), then suppresses the CMC feed in precedence order: stagger (impact) → pivot plant → start coil → traversal takeover. Below those, the input envelopes (stop re-accel ramp, M4 fresh-input ramp) scale the magnitude, then the **rolling pivot exit** (`bPivotRollout`, 2026-09-13) redirects the vector onto the cat's facing, then the wall-bounce rebound cancels the into-wall component. See `Docs/movement-feel.md` (pivot exit rework) before touching the order.
+
 ### Tick Subsystems (called from `Tick`)
 
 | Function | Runs on |

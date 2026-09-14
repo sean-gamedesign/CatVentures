@@ -305,6 +305,31 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0", ClampMax = "2.0"))
 	float PivotCooldown = 0.3f;
 
+	// ── Sweep-stall release + rolling exit (2026-09-13, Sean: "if I'm only holding W,
+	// cancel the rotation and run"). A plant is for an ACTIVE steer. Once the input
+	// DIRECTION has stopped rotating (the mouse flick is over) and the raw input is
+	// forward-dominant (a W-family hold, within 60° of camera-forward), the plant
+	// releases into a ROLLING EXIT: movement input comes back projected onto the cat's
+	// FACING (it runs out along its nose — never the sideways swing onto the camera
+	// line), the body keeps turning toward the live input at PivotRolloutTurnRate so the
+	// run curves onto the W line, and the pivot clip is left frozen where it was (no snap
+	// to the coil frame). Ends within PivotExitAngle, on release, or airborne. The S-flick
+	// (input pointing backward) still completes the full plant-and-turn.
+
+	/** Input direction rotating slower than this (deg/s) counts as "not steering". */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0"))
+	float PivotSweepStallRate = 45.0f;
+
+	/** How long the input must be still (s) before a forward-held pivot releases. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0"))
+	float PivotSweepStallTime = 0.10f;
+
+	/** Rolling exit: body turn rate (deg/s) toward the live input while the cat runs out
+	 *  along its facing. Faster than the plant's PivotTurnSpeedDegPerSec — it is a running
+	 *  curve, not footwork. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "0.0"))
+	float PivotRolloutTurnRate = 240.0f;
+
 	/** Braking deceleration (cm/s²) while planted — the speed kill. Restored to
 	 *  MovementBrakingDeceleration on exit; mirrored to the server so move replay agrees. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement Tuning|Pivot", meta = (ClampMin = "500.0", ClampMax = "8000.0"))
@@ -858,7 +883,10 @@ protected:
 	void EnterPivot();
 
 	/** Pivot exit: restore braking, arm the cooldown. Safe to call redundantly. */
-	void ExitPivot();
+	/** @param bSnapProgress  true = snap the clip scrub to 1 for the blend-out (the
+	 *  angle-reached exit lands on the coil); false = freeze it where it is (the rolling
+	 *  exit blends out from the actual pose — the start-coil abort rule). */
+	void ExitPivot(bool bSnapProgress = true);
 
 	/** Applies (true) or restores (false) the pivot braking deceleration on the CMC. */
 	void ApplyPivotBraking(bool bApply);
@@ -1742,6 +1770,11 @@ private:
 
 	/** True while a plant-and-turn pivot is running (input suppressed, body rotating to input). */
 	bool bIsPivoting = false;
+
+	/** Rolling exit live (see the Pivot knobs): input projected onto the facing, body
+	 *  still turning toward the live input. Local owner only, never replicated — the
+	 *  server sees ordinary movement input. */
+	bool bPivotRollout = false;
 
 	/** Accumulates time the steering angle has been past PivotAngleThreshold. */
 	float PivotSustainTimer = 0.0f;
