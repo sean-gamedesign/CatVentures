@@ -23,7 +23,7 @@ Known/deferred: `steam_appid.txt` never actually stages into the archive (the `A
 - **Search key**: UE 5.7 OSS Steam routes `FindSessions` to the Steam lobby list only when the **`SEARCH_LOBBIES`** key (`Online/OnlineSessionNames.h`, value `"LOBBYSEARCH"`) is set. The old `SEARCH_PRESENCE` key was removed from the engine; hand-rolled FName strings silently fall through to the internet *server* query and find nothing. Always use the engine macro.
 - Session settings use `bUsesPresence`, `bUseLobbiesIfAvailable`, `bAllowJoinViaPresence` (overlay "Join Game"). Overlay invites route through `HandleSessionUserInviteAccepted` → `JoinFoundSession`.
 - `bForceLANMatch` is a debug-only toggle that forces the LAN path. Single shared session name: `"CatVenturesSession"`.
-- **Session UI** lives in `WBP_MainMenu` (host: `HostSession` → on success → `Open Level TestMap_02?listen`; find: busy-guard + timeout safeguard + throbber → `FindSessions(20)`; rows in `WBP_ServerRow` call `JoinFoundSession`). The **return-to-menu** buttons live in `WBP_RaidScoreboard` and call `LeaveToMainMenu` — see *Session lifecycle*.
+- **Session UI** lives in `WBP_MainMenu` (host: `HostSession` → on success → `Open Level JPN_UrbanCity?listen` — repointed from `TestMap_02` on 2026-09-18; **any map the Host button targets must also be on `DefaultGame.ini`'s explicit `+MapsToCook` list (`bCookAll=False`), or the packaged build hosts a map it never cooked** — `JPN_UrbanCity` was added the same day; find: busy-guard + timeout safeguard + throbber → `FindSessions(20)`; rows in `WBP_ServerRow` call `JoinFoundSession`). The **return-to-menu** buttons live in `WBP_RaidScoreboard` and call `LeaveToMainMenu` — see *Session lifecycle*.
 
 ## Session lifecycle
 
