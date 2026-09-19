@@ -43,6 +43,10 @@ The Blueprint and asset layer is edited live through **VibeUE**, which since **v
 - **The editor's source-control hook stages new files itself** — a fresh `.umap` or external-object package shows up as `A`/`AM` in `git status` without any `git add`. Review the index before committing, and unstage what shouldn't ship.
 - **`unreal.EditorLoadingAndSavingUtils.reload_packages`** is the reload entry point — `PackageTools.reload_packages` does not exist in this build.
 
+## Level blockouts are generated (2026-09-18)
+
+Graybox levels are built by scripts under `Tools/Blockout/` (`jpn_c1_blockout.py` = the C-1 block), not by hand: every number comes from `Docs/world-metrics.md`, so a metric change is a re-run. Run one with the target map **open** — `import unreal; exec(open(r"C:\Projects\CatVentures\Tools\Blockout\jpn_c1_blockout.py").read())` in `execute_python_code` (a 23 KB script goes through fine) — the script asserts the world name and that PIE is stopped, deletes every actor it tagged (`C1Gen`) and rebuilds, keeps the map's own lighting rig, saves. Don't hand-move generated actors; edit the script. `LevelEditorSubsystem.load_level` is the way to switch maps from Python (the current map must be saved first); note that Sean may have switched the open map himself between calls — **assert the world name in every script**, the tag-style read this session silently ran against the wrong map because of that.
+
 ## PawPrint (runtime telemetry)
 
 **PawPrint** (`UPawPrintSubsystem`, v1 core shipped 2026-07-19, commit `31562cf`) is the in-memory runtime telemetry system — it exists so nobody has to live-monitor a PIE session: everything is captured while the session runs and analyzed after. ("CatTrace" was rejected as a name — "trace" already means line traces AND Unreal Insights Trace; the two-Chaos lesson.)
