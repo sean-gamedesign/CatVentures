@@ -34,6 +34,7 @@ The deep knowledge for each system lives in `Docs/`, split out of this file on 2
 | `Docs/impact-response.md` | `UCatImpactResponseComponent` — the impact classifier (mass×speed thresholds), Flinch + Stagger tiers, the reaction multicast, precedence in `Move()`/`RestoreAllCMCOverrides`, PIE evidence; FROZEN at step 2 for Playtest 1 | `CatImpactResponseComponent.h/.cpp`, `CatImpactTypes.h`, `Multicast_ImpactReaction`, the swat's cat-vs-cat branch, or any new CMC takeover that must order against a stagger |
 | `Docs/multiplayer-steam.md` | `UCatGameInstance`, SteamSockets transport config, session UI, packaging + the 2-PC test protocol | session code, net-driver config, or packaging a build for a multiplayer test |
 | `Docs/tooling.md` | VibeUE MCP workflow and its serialization traps; PawPrint runtime telemetry | any Blueprint / AnimBP / widget / asset edit driven through the editor, or adding telemetry |
+| `Docs/world-metrics.md` | World Metrics — the three scale multipliers (assets 2× / plan 3× / ceiling 2.5×), grid, openings, standard heights, the cat's interaction bands, the S/M/L prop bands (C-0 rulings, 2026-09-18) | placing or sizing any level geometry, prop, opening or gap in a production map, or proposing a new height/tier |
 
 **Cross-references.** Italic `see *Section Name*` pointers in this file and inside the docs refer to section titles that may now live in a sibling doc — use the table above to find the owner. `## Common Gotchas` stays in this file because it cuts across every system.
 
