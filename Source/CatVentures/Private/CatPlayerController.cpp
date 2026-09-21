@@ -421,6 +421,40 @@ void ACatPlayerController::RegisterDebrisActor(AActor* DebrisActor)
 {
 	if (!DebrisActor) return;
 
+	// SAFETY NET (2026-09-21): every machine reports a broken prop here from the break event,
+	// whichever path broke it. If a break bypassed ForceShatterGC (a solver-initiated fracture —
+	// the grab-release re-enabling collision damage was one such path), its chunks are still
+	// Pawn=Block and will trap a cat the way debris did before Phase B. Apply the Layer-1 flip
+	// here so no break path can ever leave blocking debris, and say so loudly.
+	TInlineComponentArray<UGeometryCollectionComponent*> GCComps;
+	DebrisActor->GetComponents(GCComps);
+	for (UGeometryCollectionComponent* GCC : GCComps)
+	{
+		if (!GCC || GCC->GetCollisionResponseToChannel(ECC_Pawn) == ECR_Overlap) continue;
+
+		// Only a collection that has ACTUALLY broken: the shrine registers as debris when its
+		// first tier falls and its intact tiers must keep blocking (the first cut of this net
+		// flipped them too — visible, swattable, walk-through, on both machines, 2026-09-21).
+		bool bBroken = false;
+		if (FGeometryDynamicCollection* Dyn = GCC->GetDynamicCollection())
+		{
+			FGeometryCollectionDynamicStateFacade Facade(*Dyn);
+			const int32 Num = GCC->GetComponentSpaceTransforms3f().Num();
+			for (int32 i = 0; i < Num && !bBroken; ++i)
+			{
+				bBroken = !Facade.HasChildren(i) && Facade.HasBrokenOff(i);
+			}
+		}
+		if (!bBroken) continue;
+
+		GCC->SetCollisionResponseToChannel(ECC_Pawn,       ECR_Overlap);
+		GCC->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
+		GCC->SetCollisionResponseToChannel(ECC_Camera,     ECR_Ignore);
+		UE_LOG(LogCatVentures, Warning,
+			TEXT("[Chaos] '%s' broke OUTSIDE ForceShatterGC (component '%s' still blocked pawns) — debris collision flipped here. Find the path that broke it."),
+			*DebrisActor->GetName(), *GCC->GetName());
+	}
+
 	// Skip dupes — BPC_ChaosItem.Native_Shatter is gated by a Do Once on the BP side, but
 	// belt-and-braces in case multiple GC components on the same actor each fire the event.
 	for (const TWeakObjectPtr<AActor>& Existing : ActiveDebrisActors)
@@ -765,7 +799,14 @@ FVector ACatPlayerController::GetChaosTargetLocation(AActor* TargetActor) const
 			if (!StateFacade.HasBrokenOff(i)) continue;
 
 			const FTransform WorldTransform = FTransform(Transforms[i]) * CompToWorld;
-			Sum += WorldTransform.GetLocation();
+			const FVector ChunkLoc = WorldTransform.GetLocation();
+
+			// Abyss filter (2026-09-21): chunks that fell through the floor are still
+			// "broken off" and free-falling; without this the FinalCut tracker chased their
+			// average 2 km under the map. Same floor the Aftermath centroid uses.
+			if (ChunkLoc.Z < AftermathDebrisFloorZ) continue;
+
+			Sum += ChunkLoc;
 			++Count;
 		}
 	}

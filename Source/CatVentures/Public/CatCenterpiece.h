@@ -102,6 +102,26 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Finale|Rules", meta = (ClampMin = "0.0"))
 	float CoopBonusPerCat = 0.5f;
 
+	// ── PRESENCE (round 7 of the 2-player rounds, 2026-09-21): the client brought the shrine
+	// down alone while the host was across the map, and Sean's read since the first
+	// conversation is "everybody is there when it falls". Damage scales with how many of the
+	// MATCH's cats are near the shrine: (near / all)^2 with a floor, so one of three chips at a
+	// tenth, two of three do about half, everyone does full. The count is the player list, so
+	// solo is one of one = full damage, and a disconnect drops the requirement on its own.
+	// Known gap (deliberately not built): a cat that is alive but AFK/lost still counts as
+	// required — a grace timer is the fix if a playtest shows it matters. ──
+
+	UPROPERTY(EditAnywhere, Category = "Finale|Rules")
+	bool bRequirePresence = true;
+
+	/** Horizontal distance from the shrine's centre within which a cat counts as "here". */
+	UPROPERTY(EditAnywhere, Category = "Finale|Rules", meta = (ClampMin = "100.0"))
+	float ConvergenceRadius = 1200.0f;
+
+	/** Damage scale when nobody but the hitter is near — the chip, never zero. */
+	UPROPERTY(EditAnywhere, Category = "Finale|Rules", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float PresenceDamageFloor = 0.1f;
+
 	/** A prop striking a section counts as a hit when its mass x speed (kg x cm/s) is at
 	 *  least this. 50k = a Small placeholder (~245 kg) at ~200 cm/s. */
 	UPROPERTY(EditAnywhere, Category = "Finale|Rules", meta = (ClampMin = "0.0"))
@@ -264,8 +284,11 @@ public:
 	// The shrine bursts its own sections to a target SPEED per chunk, scaled by each
 	// section's estimated chunk mass (asset mass x scale^3 / leaves).
 
+	/** 300, not the 550 first tried: the solver routes several impulses onto the same piece, so
+	 *  the measured mean lands ~2x this and the max ~10x (2-player probe: 550 gave means of
+	 *  ~1000 and maxes of ~6500 cm/s — pieces cleared the backdrop and fell out of the world). */
 	UPROPERTY(EditAnywhere, Category = "Finale|Feel", meta = (ClampMin = "0.0"))
-	float ShrineBurstSpeed = 550.0f;
+	float ShrineBurstSpeed = 300.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Finale|Feel", meta = (ClampMin = "0.0"))
 	float ShrineBurstUpBias = 0.6f;
@@ -361,6 +384,10 @@ private:
 	void  LayoutSections();
 
 	// server-side stage machine
+	/** Counts the match's cats and how many are within ConvergenceRadius; writes
+	 *  State.RequiredCats / CatsNear / PresenceScale. Returns true if anything changed. */
+	bool RecountCats();
+	float PresenceRecountTimer = 0.0f;
 	void OpenWindow();
 	void CloseWindow();
 	void OnWindowExpired();
@@ -373,7 +400,9 @@ private:
 	void ApplyLocalFeedback(ECatFinaleEvent Event, FVector Location, const FString& CatName);
 	void ShakeLocalPlayers(TSubclassOf<UCameraShakeBase> ShakeClass, float Scale, FVector Epicenter, bool bIgnoreFalloff = false);
 	void EruptNearbyProps();
-	void BurstSection(int32 SectionIndex, FVector Origin);
+	/** Bursts a shattered section once its pieces report as broken off on the game thread;
+	 *  re-arms itself for the next tick (Attempt counts) until they do. */
+	void BurstSection(int32 SectionIndex, FVector Origin, int32 Attempt = 0);
 	void StartUnlockReveal();
 	void EndUnlockReveal();
 	void CleanupRevealCameras();

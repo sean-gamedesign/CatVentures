@@ -136,6 +136,16 @@ struct FCatFinaleState
 
 	UPROPERTY(BlueprintReadOnly)
 	bool bLastHitTop = false;
+
+	// ── Presence (2026-09-21, Sean: "all cats needed to be around") ──
+
+	/** Cats of the match currently within the shrine's ConvergenceRadius (RequiredCats = all of them). */
+	UPROPERTY(BlueprintReadOnly)
+	int32 CatsNear = 1;
+
+	/** Damage scale from presence: (CatsNear / RequiredCats)^2, floored — 1 when everyone is here. */
+	UPROPERTY(BlueprintReadOnly)
+	float PresenceScale = 1.0f;
 };
 
 /** DataTable row describing what happens when a given prop type is destroyed.

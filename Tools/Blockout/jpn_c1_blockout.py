@@ -227,7 +227,10 @@ for a in EAS.get_all_level_actors():
 
 # ---------------------------------------------------------------- ground + streets
 F = "Block/Ground"
-box("Ground", F, BLOCK_X0 - 2 * STREET, BLOCK_X1 + 2 * STREET, BLOCK_Y0 - 2 * STREET, BLOCK_Y1 + 2 * STREET, -50, 0)
+# 6 m thick (was 50): a fast heavy chunk resting on a thin slab gets pushed out the BOTTOM by the
+# solver and free-falls forever — the shrine's 2 t pieces did, and the final-cut camera followed
+# their average below the world (2026-09-21, 2-player round). Thick = it always exits upward.
+box("Ground", F, BLOCK_X0 - 2 * STREET, BLOCK_X1 + 2 * STREET, BLOCK_Y0 - 2 * STREET, BLOCK_Y1 + 2 * STREET, -600, 0)
 box("Street_S", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, BLOCK_Y0 - STREET, BLOCK_Y0, 0, 5, mat=GREY)
 box("Street_N", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, BLOCK_Y1, BLOCK_Y1 + STREET, 0, 5, mat=GREY)
 box("Street_W", F, BLOCK_X0 - STREET, BLOCK_X0, BLOCK_Y0, BLOCK_Y1, 0, 5, mat=GREY)

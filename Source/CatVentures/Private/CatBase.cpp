@@ -239,8 +239,16 @@ void ACatBase::Server_BumperHitGC_Implementation(AActor* GCActor, FVector Origin
 
 	// Range check using the server's authoritative pawn position.
 	// 300 cm = bumper reach (60) + shatter radius slack + prediction jitter buffer.
+	// Logged when it rejects (2026-09-21): a client's intact prop that had drifted from the
+	// server's copy (pre-replication drags) failed this silently and read as "can't destroy".
 	constexpr float MaxReachCm = 300.0f;
-	if (FVector::Dist(GetActorLocation(), GCActor->GetActorLocation()) > MaxReachCm) return;
+	const float Dist = FVector::Dist(GetActorLocation(), GCActor->GetActorLocation());
+	if (Dist > MaxReachCm)
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[Chaos] %s charge on '%s' REJECTED — server sees it %.0f cm from the cat (max %.0f); the client's copy has drifted"),
+			*GetName(), *GCActor->GetName(), Dist, MaxReachCm);
+		return;
+	}
 
 	Multicast_BumperHitGC(GCActor, Origin);
 }
@@ -2433,10 +2441,16 @@ void ACatBase::Multicast_ReleaseGrab_Implementation()
 		? GetNameSafe(GrabbedComponent->GetOwner())
 		: TEXT("<already gone>");
 
-	// Re-enable collision strain on THIS machine's Chaos solver.
+	// Restore the prop's DESIGNED collision-strain setting on THIS machine's Chaos solver —
+	// the archetype's value, not a hardcoded true. This used to force it ON, a leftover from
+	// before Phase B when the base prop shipped that way; with the base now OFF, a prop that
+	// had ever been grabbed became the one kind that could shatter on its own in the solver
+	// when dropped, bypassing ForceShatterGC and its Layer-1 collision flip — its chunks kept
+	// BLOCKING pawns and pinned a cat in the pile (2-player round, 2026-09-21).
 	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()))
 	{
-		GCC->SetEnableDamageFromCollision(true);
+		const UGeometryCollectionComponent* Designed = Cast<UGeometryCollectionComponent>(GCC->GetArchetype());
+		GCC->SetEnableDamageFromCollision(Designed ? Designed->bEnableDamageFromCollision : false);
 	}
 	if (GrabConstraint)
 	{

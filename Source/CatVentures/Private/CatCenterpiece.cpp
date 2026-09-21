@@ -19,6 +19,7 @@
 #include "GeometryCollection/GeometryCollection.h"
 #include "GeometryCollection/GeometryCollectionComponent.h"
 #include "GeometryCollection/GeometryCollectionObject.h"
+#include "GeometryCollectionProxyData.h"
 #include "PhysicsProxy/GeometryCollectionPhysicsProxy.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
@@ -424,7 +425,10 @@ void ACatCenterpiece::ReceiveHit(APlayerState* Attacker, ECatFinaleHitKind Kind,
 
 	const int32 Coop = FMath::Max(HitSetThisWindow.Num(), 1);
 	const float Mult = 1.0f + CoopBonusPerCat * (Coop - 1);
-	const float Damage = (bTop ? TopHitDamage : LowHitDamage) * Mult;
+
+	// Presence: who is actually here, out of everyone in the match.
+	RecountCats();
+	const float Damage = (bTop ? TopHitDamage : LowHitDamage) * Mult * State.PresenceScale;
 
 	State.CoopCats       = Coop;
 	State.CoopMultiplier = Mult;
@@ -433,9 +437,9 @@ void ACatCenterpiece::ReceiveHit(APlayerState* Attacker, ECatFinaleHitKind Kind,
 	State.StageDamage    = FMath::Min(State.StageDamage + Damage, StageHP);
 	if (ACatPlayerState* CatPS = Cast<ACatPlayerState>(Attacker)) CatPS->FinaleHits++;
 
-	UE_LOG(LogCatVentures, Log, TEXT("[Finale] %s by %s on section %d (%s) — %.0f dmg x%.1f (%d cat%s) -> tier %d/%d at %.0f/%.0f"),
+	UE_LOG(LogCatVentures, Log, TEXT("[Finale] %s by %s on section %d (%s) — %.1f dmg x%.1f (%d cat%s in window, %d/%d here, presence x%.2f) -> tier %d/%d at %.0f/%.0f"),
 		HitKindName(Kind), *CatName, SectionIndex, bTop ? TEXT("TOP") : TEXT("low"), Damage, Mult, Coop, Coop == 1 ? TEXT("") : TEXT("s"),
-		State.StagesDone + 1, State.NumStages, State.StageDamage, StageHP);
+		State.CatsNear, State.RequiredCats, State.PresenceScale, State.StagesDone + 1, State.NumStages, State.StageDamage, StageHP);
 
 	Multicast_FinaleEvent(bTop ? ECatFinaleEvent::Hit : ECatFinaleEvent::LowHit, HitLocation, CatName);
 
@@ -453,17 +457,40 @@ void ACatCenterpiece::ReceiveHit(APlayerState* Attacker, ECatFinaleHitKind Kind,
 
 // ── Stage machine (server) ──────────────────────────────────────────
 
-void ACatCenterpiece::OpenWindow()
+bool ACatCenterpiece::RecountCats()
 {
-	int32 Cats = 0;
+	int32 Cats = 0, Near = 0;
+	const FVector Centre = GetActorLocation();
 	if (const ACatGameState* GS = GetWorld()->GetGameState<ACatGameState>())
 	{
 		for (const TObjectPtr<APlayerState>& PS : GS->PlayerArray)
 		{
-			if (PS && !PS->IsInactive() && !PS->IsOnlyASpectator()) ++Cats;
+			if (!PS || PS->IsInactive() || PS->IsOnlyASpectator()) continue;
+			++Cats;
+			const APawn* Pawn = PS->GetPawn();
+			if (!Pawn) continue;
+			FVector D = Pawn->GetActorLocation() - Centre; D.Z = 0.0f;
+			if (D.Size() <= ConvergenceRadius) ++Near;
 		}
 	}
-	State.RequiredCats = FMath::Max(Cats, 1);
+	Cats = FMath::Max(Cats, 1);
+	Near = FMath::Clamp(Near, 0, Cats);
+	float Scale = 1.0f;
+	if (bRequirePresence)
+	{
+		const float Frac = static_cast<float>(Near) / Cats;
+		Scale = FMath::Max(Frac * Frac, PresenceDamageFloor);
+	}
+	const bool bChanged = (State.RequiredCats != Cats) || (State.CatsNear != Near) || !FMath::IsNearlyEqual(State.PresenceScale, Scale);
+	State.RequiredCats  = Cats;
+	State.CatsNear      = Near;
+	State.PresenceScale = Scale;
+	return bChanged;
+}
+
+void ACatCenterpiece::OpenWindow()
+{
+	RecountCats();
 	HitSetThisWindow.Reset();
 	State.CatsHitThisWindow.Reset();
 	State.WindowEndsAt = GetWorld()->GetTimeSeconds() + StageWindow;
@@ -526,7 +553,11 @@ void ACatCenterpiece::CompleteStage(FVector HitLocation)
 	else
 	{
 		Multicast_FinaleEvent(ECatFinaleEvent::StageComplete, HitLocation, FString());
-		DoHitStop(HitStopDilation, HitStopDuration);
+		// The hit-stop starts from BurstSection, one tick later, AFTER the impulses are queued:
+		// started here it dilated the physics step the burst landed in to ~2 ms, the pieces were
+		// not released yet, and the impulses hit kinematic bodies and vanished (2-player round,
+		// 2026-09-21: host tiers 2 and 1 crumbled in place at ~150 cm/s while the client, whose
+		// dilation arrives a frame after the RPC, burst at full strength).
 		PushState();
 	}
 }
@@ -643,9 +674,12 @@ void ACatCenterpiece::ApplyLocalFeedback(ECatFinaleEvent Event, FVector Location
 		ShakeLocalPlayers(UCatShrineHitShake::StaticClass(), 1.0f, Location);
 		ReadoutPunch = 0.6f;
 		FlashAmount  = 0.7f;
-		OverrideHead   = (State.CoopCats > 1)
-			? FString::Printf(TEXT("TOP HIT   x%.1f"), State.CoopMultiplier)
-			: TEXT("TOP HIT");
+		if (State.CatsNear < State.RequiredCats)
+			OverrideHead = FString::Printf(TEXT("TOP HIT   x%.1f  (%d / %d HERE)"), State.PresenceScale, State.CatsNear, State.RequiredCats);
+		else if (State.CoopCats > 1)
+			OverrideHead = FString::Printf(TEXT("TOP HIT   x%.1f"), State.CoopMultiplier);
+		else
+			OverrideHead = TEXT("TOP HIT");
 		OverrideDetail.Reset();
 		OverrideColor  = FColor(255, 240, 120);
 		OverrideUntil  = Now + 0.5f;
@@ -784,7 +818,7 @@ void ACatCenterpiece::EruptNearbyProps()
 		Props, Chunks, UnlockEruptionRadius);
 }
 
-void ACatCenterpiece::BurstSection(int32 SectionIndex, FVector Origin)
+void ACatCenterpiece::BurstSection(int32 SectionIndex, FVector Origin, int32 Attempt)
 {
 	if (!Sections.IsValidIndex(SectionIndex)) return;
 	UGeometryCollectionComponent* GCC = Sections[SectionIndex];
@@ -797,13 +831,41 @@ void ACatCenterpiece::BurstSection(int32 SectionIndex, FVector Origin)
 	const TArray<FTransform3f>& ChunkXf = GCC->GetComponentSpaceTransforms3f();
 	const FTransform CompToWorld = GCC->GetComponentTransform();
 
-	int32 Leaves = 0;
+	int32 Leaves = 0, Broken = 0;
+	FGeometryDynamicCollection* Dyn = GCC->GetDynamicCollection();
 	for (int32 i = 0; i < ChunkXf.Num(); ++i)
 	{
 		if (i < NumSim && !Coll->IsRigid(i)) continue;
 		++Leaves;
+		if (Dyn)
+		{
+			FGeometryCollectionDynamicStateFacade Facade(*Dyn);
+			if (Facade.HasBrokenOff(i)) ++Broken;
+		}
 	}
 	if (Leaves == 0) return;
+
+	// READINESS (2-player rounds, 2026-09-21): whether the physics thread has processed the
+	// break by "next tick" depends on where in the frame the shatter was requested — the host,
+	// shattering from inside a swat notify, lost the burst on one tier per run (impulses on
+	// still-kinematic pieces vanish) while the client, whose RPC lands at frame start, never
+	// did. So: only burst once the pieces report as broken off; otherwise re-arm next tick.
+	constexpr int32 MaxAttempts = 12;
+	if (Dyn && Broken < (Leaves + 1) / 2 && Attempt < MaxAttempts)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			const int32 Next = Attempt + 1;
+			World->GetTimerManager().SetTimerForNextTick(
+				FTimerDelegate::CreateWeakLambda(this, [this, SectionIndex, Origin, Next]()
+				{
+					BurstSection(SectionIndex, Origin, Next);
+				}));
+		}
+		UE_LOG(LogCatVentures, Verbose, TEXT("[Finale] section %d not broken yet (%d/%d) — burst re-armed, attempt %d"),
+			SectionIndex, Broken, Leaves, Attempt + 1);
+		return;
+	}
 
 	// Round-4 read ("bits fell but it didn't crumble") with every impulse logged as landing:
 	// the released pieces were still KINEMATIC. ObjectType=Kinematic is the state of EVERY
@@ -851,8 +913,40 @@ void ACatCenterpiece::BurstSection(int32 SectionIndex, FVector Origin)
 		++Hit; ++Leaf;
 	}
 
-	UE_LOG(LogCatVentures, Log, TEXT("[Finale] section %d burst — %d/%d leaves, chunk ~%.0f kg, %.0f cm/s target, impulse %.0f"),
-		SectionIndex, Hit, Leaves, ChunkMass, ShrineBurstSpeed, Impulse);
+	UE_LOG(LogCatVentures, Log, TEXT("[Finale] section %d burst — %d/%d leaves (%d broken off, attempt %d), chunk ~%.0f kg, %.0f cm/s target, impulse %.0f"),
+		SectionIndex, Hit, Leaves, Broken, Attempt, ChunkMass, ShrineBurstSpeed, Impulse);
+
+	// Now the hit-stop (server only; skipped on the final tier, where the match end owns
+	// dilation). The impulses above are already queued for a full-length physics step.
+	if (!State.bDestroyed) DoHitStop(HitStopDilation, HitStopDuration);
+
+	// Diagnostic (2-player parity, 2026-09-21): how fast are the pieces ACTUALLY moving half a
+	// second after the burst on THIS machine? Sean read the client's burst as weaker than the
+	// host's while both logged identical impulses — measure before guessing.
+	if (UWorld* World = GetWorld())
+	{
+		FTimerHandle Probe;
+		const int32 Idx = SectionIndex;
+		World->GetTimerManager().SetTimer(Probe, FTimerDelegate::CreateWeakLambda(GCC, [GCC, Idx]()
+		{
+			const FGeometryCollectionPhysicsProxy* Proxy = GCC->GetPhysicsProxy();
+			const int32 N = GCC->GetComponentSpaceTransforms3f().Num();
+			float Sum = 0.0f, Max = 0.0f;
+			int32 Moving = 0, Counted = 0;
+			for (int32 i = 0; Proxy && i < N; ++i)
+			{
+				const FGeometryCollectionPhysicsProxy::FParticle* P = Proxy->GetParticleByIndex_External(i);
+				if (!P) continue;
+				const float S = FVector(P->GetV()).Size();
+				Sum += S; Max = FMath::Max(Max, S); ++Counted;
+				if (S > 100.0f) ++Moving;
+			}
+			const UWorld* W = GCC->GetWorld();
+			const TCHAR* Tag = !W ? TEXT("?") : (W->GetNetMode() == NM_Client) ? TEXT("CLI") : (W->GetNetMode() == NM_ListenServer) ? TEXT("SRV") : TEXT("SA");
+			UE_LOG(LogCatVentures, Log, TEXT("[Finale] %s section %d +0.5s: %d/%d pieces moving >100 cm/s, mean %.0f, max %.0f cm/s"),
+				Tag, Idx, Moving, Counted, Counted ? Sum / Counted : 0.0f, Max);
+		}), 0.5f, false);
+	}
 }
 
 void ACatCenterpiece::UpdateBeacon(float DeltaTime)
@@ -982,9 +1076,10 @@ FText ACatCenterpiece::GetHudText(float ChaosPercent) const
 	else
 	{
 		const int32 Pct = FMath::RoundToInt(State.StageDamage / FMath::Max(State.StageHP, 1.0f) * 100.0f);
-		Line = FString::Printf(TEXT("%s  [EXPOSED]   tier %d/%d at %d%% — hit the GLOWING tier — %d/%d cats x%.1f"),
+		Line = FString::Printf(TEXT("%s  [EXPOSED]   tier %d/%d at %d%% — hit the GLOWING tier — %d/%d cats here%s"),
 			*DisplayName, State.StagesDone + 1, State.NumStages, Pct,
-			State.CoopCats, State.RequiredCats, State.CoopMultiplier);
+			State.CatsNear, State.RequiredCats,
+			(State.CatsNear < State.RequiredCats) ? TEXT(" — GET EVERYONE HERE") : TEXT(""));
 	}
 	return FText::FromString(Line);
 }
@@ -1020,9 +1115,15 @@ void ACatCenterpiece::RefreshReadout()
 		for (int32 i = 0; i < 10; ++i) Bar += (i < Filled) ? TEXT("#") : TEXT("-");
 		Bar += TEXT("]");
 
-		Head = TEXT("SMASH THE GLOWING TIER");
-		HeadColor = FColor(255, 200, 40);
-		if (State.WindowEndsAt > 0.0f && WindowRemaining() > 0.0f && State.CoopCats > 1)
+		const bool bEveryoneHere = State.CatsNear >= State.RequiredCats;
+		Head = bEveryoneHere ? TEXT("SMASH THE GLOWING TIER") : TEXT("GET EVERYONE HERE");
+		HeadColor = bEveryoneHere ? FColor(255, 200, 40) : FColor(255, 110, 60);
+		if (!bEveryoneHere)
+		{
+			Det = FString::Printf(TEXT("%s %d%%   TIER %d / %d   %d / %d CATS HERE"), *Bar, FMath::RoundToInt(Frac * 100.0f),
+				State.StagesDone + 1, State.NumStages, State.CatsNear, State.RequiredCats);
+		}
+		else if (State.WindowEndsAt > 0.0f && WindowRemaining() > 0.0f && State.CoopCats > 1)
 		{
 			Det = FString::Printf(TEXT("%s %d%%   TIER %d / %d   %d CATS x%.1f"), *Bar, FMath::RoundToInt(Frac * 100.0f),
 				State.StagesDone + 1, State.NumStages, State.CoopCats, State.CoopMultiplier);
@@ -1055,6 +1156,19 @@ void ACatCenterpiece::RefreshReadout()
 void ACatCenterpiece::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	// Server: keep the presence count live between hits so "N / M CATS HERE" tracks the cats
+	// walking up, not just the last swat.
+	if (HasAuthority() && State.bUnlocked && !State.bDestroyed)
+	{
+		PresenceRecountTimer += DeltaTime;
+		if (PresenceRecountTimer >= 0.25f)
+		{
+			PresenceRecountTimer = 0.0f;
+			if (RecountCats()) PushState();
+		}
+	}
+
 	if (GetNetMode() == NM_DedicatedServer) return;
 
 	// Readout sits at cat height on the VIEWER's side of the base, just off its face, and
