@@ -85,3 +85,9 @@ Plan 3× applies to exteriors too: **street 1440**, **alley 540**, **lot 3240 ×
 ## 7. Where these were tested
 
 `/Game/Maps/ScaleCalibration`: round 1 (`Cell_1.0x…2.5x`, uniform) → exterior heights; round 2 (`R2_plan3.0x/3.5x/4.0x`, heights 2×, ceilings 480/600/720) → plan + ceiling; `R2_plan3.0x_furnished` (now at ceiling 600, door/hall 180) → furniture, counter 170/200/220, 17 S/M/L stubs. Keep the map — it is the prop test arena.
+
+## 8. The finale shrine and the ambient layer (branch `feat/convergence-loop`, 2026-09-20/21)
+
+**The Shrine** (`ACatCenterpiece`, placed by `shrine()` in the blockout script) stands in the hero yard at **(4300, 540)**, west end, in view from the gate and over the 360 block wall from the street. Four stacked kinematic cylinders at scales **2.8 / 2.2 / 1.6 / 1.0** → radii **140 / 110 / 80 / 50**, tops at **280 / 500 / 660 / 760**. The taper leaves a **30 cm ring ledge** at every step — inside the balance-assist band — so the shrine is its own stair: ground → base ledge 280 is a held-jump mantle, then +220 (held-jump mantle) and +160 (hop). The **fence spur** (`fence_x`, 240 tall, walkable top) runs from the west block wall (X 3270) to the base face (X 4160) at Y 540 as a second way onto the base ledge; the **engawa roof** (540) is ~215 off the north face at the second ledge's height. Its readout sits at 260 on the viewer's side. Its beacon rises to 3000 on the unlock. Rules and feel numbers live on the actor (`Finale|*`) — see `Docs/match-destruction.md`.
+
+**Ambient breakables** (`BP_Ambient_S/M/L`, blue `M_Ambient`, rows `AmbientSmall/Medium/Large` with `bFeedsMeter` off): the same S/M/L bands and masses as §5, seeded by `aprop()` — 32 across the S/N/W/E streets, S1's driveway and engawa, S3's parking lot, shed and bins, the alley, and the N1/N2/N3 yards (off the kick chimney). They score for the cat and never move the meter. **Orange = fuel, blue = fun.** The meter's total is the hero lot only: 175.

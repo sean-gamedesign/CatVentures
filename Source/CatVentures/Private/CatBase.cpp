@@ -4,6 +4,9 @@
 #include "CatVenturesLog.h"
 #include "CatImpactResponseComponent.h"
 #include "CatTraversalComponent.h"
+#include "CatCenterpiece.h"
+#include "CatGameMode.h"
+#include "GameFramework/PlayerState.h"
 #include "PawPrintSubsystem.h"
 #include "CatAnimationTypes.h"
 #include "Net/UnrealNetwork.h"
@@ -246,6 +249,22 @@ void ACatBase::Multicast_BumperHitGC_Implementation(AActor* GCActor, FVector Ori
 {
 	if (!GCActor) return;
 
+	// FINALE CENTERPIECE (convergence loop, 2026-09-20): a charge into the shrine is a HIT,
+	// not a shatter — the shrine decides what a hit means (locked thud / stage progress) and
+	// only the server decides it. Intercepted BEFORE the Heavy gate so the HeavyProp tag can
+	// stay on the shrine as belt-and-braces for every other path.
+	if (ACatCenterpiece* Shrine = Cast<ACatCenterpiece>(GCActor))
+	{
+		if (HasAuthority()) Shrine->ReceiveHit(GetPlayerState(), ECatFinaleHitKind::Charge, Origin);
+		return;
+	}
+
+	// Attribution: the charging cat is the last to touch this prop (server copy only).
+	if (HasAuthority())
+	{
+		if (ACatGameMode* GM = GetWorld()->GetAuthGameMode<ACatGameMode>()) GM->NoteAttacker(GCActor, GetPlayerState());
+	}
+
 	// HEAVY LOCKOUT (Objective System §3). The bumper's contact shatter is
 	// unconditional by design — no strain or threshold knobs on this path — so it
 	// would otherwise pop the map's finale set piece on a walk-past. Gated HERE
@@ -442,6 +461,7 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 	//  - Replicated physics PROPS (non-GC) are pushed on authority only.
 	const bool bLocal = IsLocallyControlled();
 	const bool bAuth  = HasAuthority();
+	ACatGameMode* GM  = bAuth ? World->GetAuthGameMode<ACatGameMode>() : nullptr;   // attribution registry
 
 	const FVector Center = GetActorLocation();
 
@@ -472,7 +492,27 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 	{
 		UPrimitiveComponent* Comp = O.GetComponent();
 		if (!Comp || Comp == FloorComp || Comp == GrabbedComponent.Get()) continue;
-		if (Done.Contains(Comp) || !Comp->IsSimulatingPhysics()) continue;
+		if (Done.Contains(Comp)) continue;
+
+		// FINALE CENTERPIECE (2026-09-20): its sections are KINEMATIC — immovable until they
+		// shatter — so they never pass the simulating check below and must not be bump-pushed
+		// or bulldozed. A charge into an intact section is a hit (owner-only: it fires the RPC;
+		// rate-limited: the shrine stays intact, so the overlap persists across ticks).
+		if (ACatCenterpiece* Shrine = Cast<ACatCenterpiece>(Comp->GetOwner()))
+		{
+			Done.Add(Comp);
+			const bool bSectionIntact = (Comp->GetCollisionResponseToChannel(ECC_Pawn) != ECR_Overlap);
+			if (bLocal && bSectionIntact && MoveSpeed >= ChargeShatterSpeed
+				&& World->GetTimeSeconds() - LastShrineChargeTime >= 0.5)
+			{
+				LastShrineChargeTime = World->GetTimeSeconds();
+				if (HasAuthority()) Multicast_BumperHitGC(Shrine, GetActorLocation());
+				else                Server_BumperHitGC(Shrine, GetActorLocation());
+			}
+			continue;
+		}
+
+		if (!Comp->IsSimulatingPhysics()) continue;
 		Done.Add(Comp);
 
 		UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(Comp);
@@ -522,6 +562,7 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 						const float BumpImpulse = FMath::Min(Mass, BumpPushRefMass) * BumpPushAccel * DeltaTime;
 						const FVector At(PropLoc.X, PropLoc.Y, Center.Z);
 						GCC->AddImpulseAtLocation(MoveDir * BumpImpulse, At);
+						if (GM) GM->NoteAttacker(Comp->GetOwner(), GetPlayerState());   // the nudge that topples it off the counter
 						UE_LOG(LogCatVentures, Verbose, TEXT("[Chaos] bump-push '%s' mass %.0f impulse %.0f (cat %.0f cm/s)"),
 							*GetNameSafe(Comp->GetOwner()), Mass, BumpImpulse, MoveSpeed);
 					}
@@ -2121,6 +2162,9 @@ void ACatBase::HandleSwatHit(const FHitResult& HitResult)
 		UDamageType::StaticClass()
 	);
 
+	// Attribution (2026-09-20): the swatter is the last cat to touch this prop.
+	if (ACatGameMode* GM = GetWorld()->GetAuthGameMode<ACatGameMode>()) GM->NoteAttacker(HitActor, GetPlayerState());
+
 	// Cat-vs-cat: route to the VICTIM's impact classifier (server-side by construction
 	// — the swat trace only runs on authority). A direct C++ call, deliberately NOT the
 	// damage event above: the swat sweep already hits ECC_Pawn and its ApplyPointDamage
@@ -2294,6 +2338,9 @@ void ACatBase::Server_Grab_Implementation()
 		ConstraintBone = NAME_None;
 	}
 
+	// Attribution (2026-09-20): carrying a prop is touching it.
+	if (ACatGameMode* GM = GetWorld()->GetAuthGameMode<ACatGameMode>()) GM->NoteAttacker(HitComp->GetOwner(), GetPlayerState());
+
 	// Server validated the trace — now multicast so ALL machines create their own
 	// local constraint and modify their own Chaos solver state.
 	Multicast_Grab(HitComp, ConstraintBone);
@@ -2367,6 +2414,14 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 void ACatBase::Server_ReleaseGrab_Implementation()
 {
 	if (!bIsGrabbing) return;
+
+	// Attribution (2026-09-20): the release re-stamps the touch, so a prop carried longer
+	// than the window and then hurled still credits the thrower.
+	if (GrabbedComponent.IsValid())
+	{
+		if (ACatGameMode* GM = GetWorld()->GetAuthGameMode<ACatGameMode>()) GM->NoteAttacker(GrabbedComponent->GetOwner(), GetPlayerState());
+	}
+
 	Multicast_ReleaseGrab();
 }
 

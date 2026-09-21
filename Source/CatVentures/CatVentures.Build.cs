@@ -10,7 +10,8 @@ public class CatVentures : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "OnlineSubsystem", "OnlineSubsystemUtils", "UMG", "Slate", "SlateCore", "GeometryCollectionEngine" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos", "DeveloperSettings" });
+		// EngineCameras: UPerlinNoiseCameraShakePattern for the finale shrine's C++ camera shakes.
+		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos", "DeveloperSettings", "EngineCameras" });
 
 		// PawPrint window (editor-only Slate tab) — see PawPrintWindow.cpp
 		if (Target.bBuildEditor)

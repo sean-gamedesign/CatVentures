@@ -9,6 +9,8 @@
 # Run from the editor (VibeUE execute_python_code) with JPN_UrbanCity OPEN:
 #   import unreal; exec(open(r"C:\Projects\CatVentures\Tools\Blockout\jpn_c1_blockout.py").read())
 #
+# Since 2026-09-20 (feat/convergence-loop) the hero yard also holds the finale SHRINE (ACatCenterpiece).
+#
 # Idempotent: every actor it spawns carries the actor tag C1Gen and is deleted before a rebuild.
 # Everything is engine Cube/Cylinder on WorldGridMaterial (streets grey), labelled + foldered,
 # with TextRender tier tags exactly like the ScaleCalibration cells.  Change a number, re-run.
@@ -32,6 +34,10 @@ BP_S = unreal.load_class(None, "/Game/Blueprints/BP_Destructible_S.BP_Destructib
 BP_M = unreal.load_class(None, "/Game/Blueprints/BP_Destructible_M.BP_Destructible_M_C")
 BP_L = unreal.load_class(None, "/Game/Blueprints/BP_Destructible_L.BP_Destructible_L_C")
 PROP_CLS = {"S": BP_S, "M": BP_M, "L": BP_L}
+SHRINE_CLS = unreal.load_class(None, "/Script/CatVentures.CatCenterpiece")   # the finale centerpiece (convergence loop)
+# AMBIENT breakables (2026-09-20): same placeholders in a different colour whose rows have bFeedsMeter=False —
+# they score for the cat but never move the meter, so only the hero lot unlocks the shrine.
+AMBIENT_CLS = {s: unreal.load_class(None, "/Game/Blueprints/BP_Ambient_%s.BP_Ambient_%s_C" % (s, s)) for s in ("S", "M", "L")}
 PROP_TAG_Z = {"S": 80, "M": 130, "L": 190}
 
 # ---------------------------------------------------------------- metrics
@@ -158,6 +164,14 @@ def prop(size, folder, x, y, z_surface):
         size=18, color=(60, 140, 255))
     return a
 
+_an = {"S": 0, "M": 0, "L": 0}
+def aprop(size, folder, x, y, z_surface):
+    """Ambient breakable: scores, does NOT feed the meter (see AMBIENT_CLS)."""
+    _an[size] += 1
+    a = EAS.spawn_actor_from_class(AMBIENT_CLS[size], unreal.Vector(x, y, z_surface + 1))
+    _common(a, "GCA_%s_%02d" % (size, _an[size]), folder)
+    return a
+
 def furn(name, height, folder, x0, x1, y0, y1, floor_z):
     tbox("%s %d" % (name, height), name + "_%d" % _uid(), folder, x0, x1, y0, y1, floor_z, floor_z + height)
 
@@ -171,6 +185,21 @@ def car(label, folder, cx, cy, along_x=True):
 def pole(label, folder, x, y, h=1800):
     cyl(label, folder, x, y, 0, h, 40, tags=("Scrambleable",))
     tag("Pole (scramble)", folder, x, y, 200, size=18)
+
+def shrine(label, folder, x, y):
+    """The finale centerpiece (feat/convergence-loop, 2026-09-20): a C++ ACatCenterpiece — a tapered
+    stack of kinematic GC sections, LOCKED until the chaos meter reaches its unlock line, then brought
+    down one section per all-cats-together stage; its last section ends the match. Sections, scales
+    and rules are the actor's own defaults (Finale|* in the Details panel)."""
+    a = EAS.spawn_actor_from_class(SHRINE_CLS, unreal.Vector(x, y, 0))
+    _common(a, label, folder)
+    tag("THE SHRINE\nlocked until the meter hits 60%\nany hit counts - the GLOWING tier is the real damage\nhit together for a bonus - mantle the tiers up", folder, x, y + 300, 40,
+        size=26, color=(255, 200, 40))
+    # The shrine's own taper is the stair (30 cm ring ledges: tops 280/500/660/760); this is the "bit of
+    # fencing" (round 6): a walkable 240 fence from the west block wall to the base ledge (+40 step-up).
+    # The engawa roof (540) ~2 m off the north face is the second way up.
+    fence_x(label + "_FenceSpur", folder, COL_X[1] + WALL_T, x - 140, y)
+    return a
 
 # ---------------------------------------------------------------- wipe + stub cleanup
 killed = 0
@@ -309,7 +338,8 @@ FY = F + "/Yard"
 tbox("AC unit 180", "Hero_AC", FY, 6240, 6420, 2300, 2380, 0, 180)          # E setback
 tbox("Bins 180", "Hero_Bin1", FY, 5800, 5890, 60, 150, 0, 180)
 tbox("Bins 180", "Hero_Bin2", FY, 5700, 5790, 60, 150, 0, 180)
-tbox("Rock 120", "Hero_Rock", FY, 4100, 4300, 320, 480, 0, 120)
+tbox("Rock 120", "Hero_Rock", FY, 3620, 3820, 320, 480, 0, 120)
+shrine("Hero_Shrine", FY, 4300, 540)      # the finale centerpiece: west yard, in view from the gate and the street
 
 # ---------------------------------------------------------------- S1 (X 0..3240): 2-story + wing + bulkhead + carport (route)
 F = "Block/Lot_S1"
@@ -378,6 +408,27 @@ for i, x in enumerate((800, 3200, 5600, 8000, 10400)):
 for i, x in enumerate((2000, 6500, 9500)):
     pole("Pole_N_%d" % i, F, x, BLOCK_Y1 + 120)
 
+# ---------------------------------------------------------------- ambient breakables (2026-09-20)
+# Filler across the rest of the block: fun to smash, scores for the cat, never moves the meter.
+# Kept off the hero lot so its 175 stays the only fuel for the shrine.
+F = "Block/Ambient"
+for size, x, y, z in (
+        # S street (cars / vending / bins side)
+        ("S", 2200, -260, 0), ("M", 3400, -700, 0), ("S", 4600, -820, 0), ("M", 7400, -400, 0), ("S", 8400, -900, 0), ("L", 9800, -600, 0),
+        # S1 driveway + engawa
+        ("M", 2400, 250, 0), ("S", 3050, 1350, 0), ("S", 1200, 1035, 90),
+        # S3 coin parking + shed + bins
+        ("M", 7900, 1500, 6), ("S", 8700, 300, 6), ("M", 9600, 1200, 6), ("L", 9800, 1700, 6), ("S", 8600, 2400, 0), ("M", 9650, 3450, 0),
+        # alley
+        ("S", 6750, 1500, 5), ("M", 6750, 4000, 5), ("S", 6600, 6200, 5),
+        # N yards (N1 / N2 / N3), off the kick chimney
+        ("M", 1600, 6900, 0), ("S", 2500, 7100, 0), ("M", 4500, 6800, 0), ("S", 3800, 7000, 0), ("L", 6100, 6800, 0),
+        ("S", 9200, 6900, 0), ("M", 8000, 7000, 0),
+        # N / W / E streets
+        ("M", 5000, 8200, 0), ("S", 3000, 8000, 0), ("L", 7600, 8300, 0), ("S", -700, 2500, 5), ("M", -900, 5500, 5),
+        ("M", 10800, 1500, 5), ("S", 11000, 4500, 5)):
+    aprop(size, F, x, y, z)
+
 # ---------------------------------------------------------------- backdrop ring (beyond the streets)
 F = "Block/Backdrop"
 bd_s0, bd_s1 = BLOCK_Y0 - 2 * STREET, BLOCK_Y0 - STREET        # -2880..-1440
@@ -399,5 +450,5 @@ cnt = Counter()
 for a in EAS.get_all_level_actors():
     if any(str(t) == TAG for t in a.get_editor_property("tags")):
         cnt[str(a.get_folder_path()).split("/")[1] if "/" in str(a.get_folder_path()) else str(a.get_folder_path())] += 1
-print("BUILT:", dict(cnt), "total", sum(cnt.values()), "props S/M/L =", _pn)
+print("BUILT:", dict(cnt), "total", sum(cnt.values()), "props S/M/L =", _pn, "ambient S/M/L =", _an)
 print("SAVED:", LES.save_current_level(), "dirty maps:", len(unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()))

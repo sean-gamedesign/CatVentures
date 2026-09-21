@@ -10,6 +10,8 @@
 
 class UDataTable;
 class UCatObjectiveTargetComponent;
+class ACatCenterpiece;
+class APlayerState;
 
 UCLASS()
 class CATVENTURES_API ACatGameMode : public AGameModeBase
@@ -26,6 +28,44 @@ public:
 	 *  display name, and stinger authoritatively. Triggers match-end if threshold is reached. */
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	void ReportItemDestroyed(AActor* Item, FVector Location, FName ChaosRewardKey);
+
+	// ── Attribution (convergence loop, 2026-09-20) ──────────────────
+	//
+	// The break paths never knew WHO broke a prop — the scoreboard was an even split. Every
+	// path that touches a prop already runs on the server with the cat in hand (swat sweep,
+	// charge RPC, bump-push on the server's copy, grab), so each notes the attacker here and
+	// ReportItemDestroyed credits the last one inside AttributionWindow. A vase swatted off a
+	// counter that breaks on the fall credits the swatter; a prop that tumbles on its own
+	// long after nobody touched it credits nobody.
+
+	/** Records Attacker as the last cat to touch Prop. Null-safe on both. */
+	void NoteAttacker(AActor* Prop, APlayerState* Attacker);
+
+	/** The last cat to touch Prop within AttributionWindow, or null. */
+	APlayerState* ResolveAttacker(AActor* Prop) const;
+
+	/** Seconds a touch stays creditable. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "0.0"))
+	float AttributionWindow = 8.0f;
+
+	// ── Finale centerpiece ──────────────────────────────────────────
+	//
+	// When a map has an ACatCenterpiece, the chaos meter no longer ends the match: it UNLOCKS
+	// the centerpiece at its UnlockChaosPercent, and the centerpiece's final stage ends the
+	// match through BeginMatchEndFromFinale. Maps without one keep the threshold match end.
+
+	void RegisterCenterpiece(ACatCenterpiece* CP);
+	void UnregisterCenterpiece(ACatCenterpiece* CP);
+	ACatCenterpiece* GetCenterpiece() const { return Centerpiece.Get(); }
+
+	/** The centerpiece's last section came down: record it as the biggest break of the match
+	 *  (so the Aftermath hotspot lands on it) and start the match-end chain aimed at it. */
+	void BeginMatchEndFromFinale(ACatCenterpiece* CP, FVector Location);
+
+	/** A centerpiece stage completed — re-push the meter (the shrine fills its last stretch). */
+	void NotifyFinaleStageProgress();
+
+	ECatMatchPhase GetCurrentPhase() const { return CurrentPhase; }
 
 	// ── Heavy tier (§3) ─────────────────────────────────────────────
 
@@ -232,6 +272,28 @@ private:
 	 *  (a streamed objective target) and are warned about rather than silently
 	 *  changing the HUD denominator mid-match. */
 	bool bObjectiveRegistrationClosed = false;
+
+	// ── Attribution + finale ────────────────────────────────────────
+
+	struct FAttackerRecord
+	{
+		TWeakObjectPtr<APlayerState> Attacker;
+		double Time = 0.0;
+	};
+	TMap<TWeakObjectPtr<AActor>, FAttackerRecord> LastAttackers;
+
+	TWeakObjectPtr<ACatCenterpiece> Centerpiece;
+
+	/** Unlocks the centerpiece once the meter reaches its UnlockChaosPercent. */
+	void CheckFinaleUnlock();
+
+	/** THE METER — what the HUD bar shows (GameState.ChaosScore over ChaosThreshold).
+	 *  With a centerpiece (Sean's call, 2026-09-20): the house fills it only up to the
+	 *  unlock line, and the shrine's stages fill the rest, so the bar completes at the WIN
+	 *  as part of the finale rather than at a mid-match unlock. Without one: the raw total.
+	 *  TotalChaosScore stays the raw meter-feeding total; player points live on PlayerState. */
+	float ComputeMeterScore() const;
+	void  PushMeterToGameState();
 
 	// ── State ───────────────────────────────────────────────────────
 

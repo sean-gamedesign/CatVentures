@@ -21,6 +21,22 @@ public:
 	UPROPERTY(ReplicatedUsing = OnRep_WantsRematch, BlueprintReadOnly, Category = "Match")
 	bool bWantsRematch = false;
 
+	// ── Per-cat attribution (convergence loop, 2026-09-20) ──────────
+	// Credited by ACatGameMode::ReportItemDestroyed through the last-attacker registry,
+	// and by ACatCenterpiece::ReceiveHit. Replicated live so a HUD can show them mid-match;
+	// the scoreboard reads them at Aftermath.
+
+	/** Chaos points from props this cat broke (last cat to touch a prop gets the credit). */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match|Score")
+	float ChaosPoints = 0.0f;
+
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match|Score")
+	int32 ItemsDestroyed = 0;
+
+	/** Hits landed on the finale centerpiece. */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match|Score")
+	int32 FinaleHits = 0;
+
 	/** Broadcast on every client (including the setter) when bWantsRematch flips.
 	 *  Scoreboard widgets bind to this to refresh per-row ready indicators. */
 	UPROPERTY(BlueprintAssignable, Category = "Match")

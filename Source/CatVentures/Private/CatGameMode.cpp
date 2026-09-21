@@ -2,6 +2,7 @@
 
 #include "CatGameMode.h"
 #include "CatVenturesLog.h"
+#include "CatCenterpiece.h"
 #include "CatGameState.h"
 #include "CatObjectiveTargetComponent.h"
 #include "CatPlayerController.h"
@@ -9,6 +10,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "Engine/DataTable.h"
 #include "Engine/World.h"
+#include "GameFramework/PlayerState.h"
 #include "GameFramework/WorldSettings.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -29,6 +31,7 @@ void ACatGameMode::BeginPlay()
 	{
 		GS->ChaosThreshold = ChaosThreshold;
 	}
+	PushMeterToGameState();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -458,6 +461,7 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 	// Resolve the reward row — missing row falls back to DefaultChaosValue.
 	float Value = DefaultChaosValue;
 	FString ItemName = ChaosRewardKey.ToString();
+	bool bFeedsMeter = true;
 
 	if (ChaosRewardTable && !ChaosRewardKey.IsNone())
 	{
@@ -465,6 +469,7 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 				ChaosRewardKey, TEXT("ReportItemDestroyed")))
 		{
 			Value = Row->ChaosValue;
+			bFeedsMeter = Row->bFeedsMeter;
 			if (!Row->DisplayName.IsEmpty()) ItemName = Row->DisplayName.ToString();
 		}
 	}
@@ -475,6 +480,20 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 	Record.Value    = Value;
 	Record.ItemName = ItemName;
 	DestroyedItems.Add(Record);
+
+	// Attribution: the last cat to touch it inside the window gets the points.
+	if (ACatPlayerState* Credited = Cast<ACatPlayerState>(ResolveAttacker(Item)))
+	{
+		Credited->ChaosPoints += Value;
+		Credited->ItemsDestroyed += 1;
+		UE_LOG(LogCatVentures, Log, TEXT("[CatMatch] credit %.0f pts for '%s' -> %s (now %.0f pts, %d props)"),
+			Value, *ItemName, *Credited->GetPlayerName(), Credited->ChaosPoints, Credited->ItemsDestroyed);
+	}
+	else
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[CatMatch] '%s' broke with no creditable attacker (window %.1fs)"),
+			*ItemName, AttributionWindow);
+	}
 
 	// Objective routing. Every objective target today is also a chaos prop, so the
 	// existing break path is a free, zero-Blueprint-edit report. Targets that are
@@ -488,14 +507,24 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 		}
 	}
 
-	// Accumulate score and push to GameState for HUD replication.
-	TotalChaosScore += Value;
-
-	if (ACatGameState* GS = GetGameState<ACatGameState>())
+	// Accumulate the METER (ambient rows score the cat but leave it alone) and push it.
+	if (bFeedsMeter)
 	{
-		GS->ChaosScore = TotalChaosScore;
+		TotalChaosScore += Value;
 	}
+	else
+	{
+		UE_LOG(LogCatVentures, Verbose, TEXT("[CatMatch] '%s' is ambient — meter unchanged at %.0f"), *ItemName, TotalChaosScore);
+	}
+	PushMeterToGameState();
 
+	// With a centerpiece in the map the meter is FUEL, not the match-ender: it unlocks the
+	// shrine and the shrine's last stage ends the match. Without one, the old rule stands.
+	if (Centerpiece.IsValid())
+	{
+		CheckFinaleUnlock();
+		return;
+	}
 
 	// Threshold check.
 	if (TotalChaosScore >= ChaosThreshold)
@@ -504,6 +533,122 @@ void ACatGameMode::ReportItemDestroyed(AActor* Item, FVector Location, FName Cha
 		FinalBreakActor = Item;
 		BeginMatchEnd();
 	}
+}
+
+// ── Attribution ─────────────────────────────────────────────────────
+
+void ACatGameMode::NoteAttacker(AActor* Prop, APlayerState* Attacker)
+{
+	if (!Prop || !Attacker || !GetWorld()) return;
+	FAttackerRecord& Rec = LastAttackers.FindOrAdd(Prop);
+	Rec.Attacker = Attacker;
+	Rec.Time     = GetWorld()->GetTimeSeconds();
+}
+
+APlayerState* ACatGameMode::ResolveAttacker(AActor* Prop) const
+{
+	if (!Prop || !GetWorld()) return nullptr;
+	const FAttackerRecord* Rec = LastAttackers.Find(Prop);
+	if (!Rec || !Rec->Attacker.IsValid()) return nullptr;
+	if (GetWorld()->GetTimeSeconds() - Rec->Time > AttributionWindow) return nullptr;
+	return Rec->Attacker.Get();
+}
+
+// ── Finale centerpiece ──────────────────────────────────────────────
+
+void ACatGameMode::RegisterCenterpiece(ACatCenterpiece* CP)
+{
+	if (!CP) return;
+	if (Centerpiece.IsValid() && Centerpiece.Get() != CP)
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[Finale] A second centerpiece '%s' registered — '%s' already owns the finale. Ignoring."),
+			*CP->GetName(), *Centerpiece->GetName());
+		return;
+	}
+	Centerpiece = CP;
+	if (ACatGameState* GS = GetGameState<ACatGameState>())
+	{
+		GS->Centerpiece = CP;
+	}
+	UE_LOG(LogCatVentures, Log, TEXT("[Finale] Centerpiece '%s' registered — the meter now unlocks it at %.0f%% of %.0f; the match ends when it falls."),
+		*CP->GetName(), CP->UnlockChaosPercent * 100.0f, ChaosThreshold);
+	PushMeterToGameState();
+	CheckFinaleUnlock();   // UnlockChaosPercent 0 = exposed from the start
+}
+
+float ACatGameMode::ComputeMeterScore() const
+{
+	const ACatCenterpiece* CP = Centerpiece.Get();
+	if (!CP) return TotalChaosScore;
+
+	const float UnlockScore = ChaosThreshold * FMath::Clamp(CP->UnlockChaosPercent, 0.0f, 1.0f);
+	const float House       = FMath::Min(TotalChaosScore, UnlockScore);
+	const int32 Stages      = FMath::Max(CP->State.NumStages, 1);
+	// Continuous (round 6): completed tiers plus the damage banked on the current one.
+	const float TierFrac    = CP->State.bDestroyed ? 0.0f : FMath::Clamp(CP->State.StageDamage / FMath::Max(CP->State.StageHP, 1.0f), 0.0f, 1.0f);
+	const float ShrineFrac  = FMath::Clamp((static_cast<float>(CP->State.StagesDone) + TierFrac) / Stages, 0.0f, 1.0f);
+	return House + (ChaosThreshold - UnlockScore) * ShrineFrac;
+}
+
+void ACatGameMode::PushMeterToGameState()
+{
+	if (ACatGameState* GS = GetGameState<ACatGameState>())
+	{
+		GS->ChaosScore = ComputeMeterScore();
+	}
+}
+
+void ACatGameMode::NotifyFinaleStageProgress()
+{
+	PushMeterToGameState();
+	if (const ACatCenterpiece* CP = Centerpiece.Get())
+	{
+		UE_LOG(LogCatVentures, Verbose, TEXT("[Finale] meter -> %.0f / %.0f (tiers done %d/%d, current at %.0f)"),
+			ComputeMeterScore(), ChaosThreshold, CP->State.StagesDone, CP->State.NumStages, CP->State.StageDamage);
+	}
+}
+
+void ACatGameMode::UnregisterCenterpiece(ACatCenterpiece* CP)
+{
+	if (Centerpiece.Get() == CP)
+	{
+		Centerpiece = nullptr;
+		if (ACatGameState* GS = GetGameState<ACatGameState>()) GS->Centerpiece = nullptr;
+	}
+}
+
+void ACatGameMode::CheckFinaleUnlock()
+{
+	ACatCenterpiece* CP = Centerpiece.Get();
+	if (!CP || CP->IsUnlocked() || CP->IsDestroyed() || ChaosThreshold <= 0.0f) return;
+
+	const float Percent = TotalChaosScore / ChaosThreshold;
+	if (Percent >= CP->UnlockChaosPercent)
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[Finale] meter %.0f%% >= %.0f%% — unlocking '%s'"),
+			Percent * 100.0f, CP->UnlockChaosPercent * 100.0f, *CP->GetName());
+		CP->SetUnlocked(true);
+	}
+}
+
+void ACatGameMode::BeginMatchEndFromFinale(ACatCenterpiece* CP, FVector Location)
+{
+	if (CurrentPhase != ECatMatchPhase::Playing || !CP) return;
+
+	// The biggest break of the match, so the Aftermath hotspot and lead shot land here.
+	FDestroyedItemRecord Record;
+	Record.Location = Location;
+	Record.Value    = CP->FinaleChaosValue;
+	Record.ItemName = CP->DisplayName;
+	DestroyedItems.Add(Record);
+
+	FinalBreakLocation = Location;
+	FinalBreakActor    = CP;
+
+	UE_LOG(LogCatVentures, Log, TEXT("[Finale] === '%s' has fallen at (%.0f,%.0f,%.0f) — match end begins ==="),
+		*CP->DisplayName, Location.X, Location.Y, Location.Z);
+
+	BeginMatchEnd();
 }
 
 // ── Phase 1: The Warning ────────────────────────────────────────────
@@ -643,22 +788,34 @@ void ACatGameMode::TransitionToAftermath()
 			GS->TopDestroyedLocations.Add(DestroyedItems[i].Location);
 		}
 
-		// MVP even-split scoreboard — every connected player credited an equal slice of the total.
+		// Real per-cat scoreboard (convergence loop, 2026-09-20) — replaces the even split.
+		// Points and prop counts come from the attribution registry, finale hits from the
+		// shrine. Sorted, top scorer marked.
 		GS->PlayerScores.Reset();
-		const int32 NumPlayers = GS->PlayerArray.Num();
-		if (NumPlayers > 0)
+		for (const TObjectPtr<APlayerState>& PS : GS->PlayerArray)
 		{
-			const int32 SharePerPlayer = FMath::RoundToInt(TotalChaosScore / static_cast<float>(NumPlayers));
-			const int32 ItemsShare = FMath::RoundToInt(static_cast<float>(DestroyedItems.Num()) / static_cast<float>(NumPlayers));
-			for (const TObjectPtr<APlayerState>& PS : GS->PlayerArray)
-			{
-				if (!PS) continue;
-				FCatPlayerScore Entry;
-				Entry.PlayerName     = PS->GetPlayerName();
-				Entry.Score          = SharePerPlayer;
-				Entry.ItemsDestroyed = ItemsShare;
-				GS->PlayerScores.Add(Entry);
-			}
+			if (!PS) continue;
+			const ACatPlayerState* CatPS = Cast<ACatPlayerState>(PS);
+			FCatPlayerScore Entry;
+			Entry.PlayerName     = PS->GetPlayerName();
+			Entry.Score          = CatPS ? FMath::RoundToInt(CatPS->ChaosPoints) : 0;
+			Entry.ItemsDestroyed = CatPS ? CatPS->ItemsDestroyed : 0;
+			Entry.FinaleHits     = CatPS ? CatPS->FinaleHits : 0;
+			GS->PlayerScores.Add(Entry);
+		}
+		GS->PlayerScores.Sort([](const FCatPlayerScore& A, const FCatPlayerScore& B)
+		{
+			if (A.Score != B.Score) return A.Score > B.Score;
+			return A.FinaleHits > B.FinaleHits;
+		});
+		if (GS->PlayerScores.Num() > 0 && (GS->PlayerScores[0].Score > 0 || GS->PlayerScores[0].FinaleHits > 0))
+		{
+			GS->PlayerScores[0].bMVP = true;
+		}
+		for (const FCatPlayerScore& E : GS->PlayerScores)
+		{
+			UE_LOG(LogCatVentures, Log, TEXT("[CatMatch] scoreboard: %s%s — %d pts, %d props, %d finale hits"),
+				E.bMVP ? TEXT("MVP ") : TEXT(""), *E.PlayerName, E.Score, E.ItemsDestroyed, E.FinaleHits);
 		}
 
 		GS->AftermathHotspot = Hotspot;

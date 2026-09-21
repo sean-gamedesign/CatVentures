@@ -71,7 +71,7 @@ Config lives on `DT_ChaosRewards` rows (Sean's call): `bHeavyTier`, `ImpactVeloc
 - `DT_MapObjectives` — two rows: `PileOfShame` (Destroy `ArenaProp`, `CountRequired = 3`) and `TheCenterpiece` (Destroy `FinaleProp`, finale).
 - `ObjectiveTarget` component on **`BP_Destructible_Base`** — so ALL destructibles register (32 in TestMap_02). Tagging is inherited, not opt-in; if that gets noisy, make it opt-in.
 - 24 debris props on the terrain east of the platform in TestMap_02 (`SpikeDebris_01`–`24`), 23 tagged `ArenaProp`, `_24` tagged `FinaleProp`.
-- **`GM_CatVentures` `ChaosThreshold` is raised 100 → 1000000** so match-end does not fire during objective testing. **Revert to 100 to restore the chaos-meter loop.**
+- **`GM_CatVentures` `ChaosThreshold` is raised 100 → 1000000** so match-end does not fire during objective testing. **Revert to 100 to restore the chaos-meter loop.** (On `feat/convergence-loop` it is 175 and `MapObjectiveTable` is **unassigned** — the checklist HUD is off there and the Shrine ends the match; `FChaosRewardData` gained `bFeedsMeter` on that branch. See `Docs/match-destruction.md` → *The convergence loop*.)
 
 ## The finale gate does not exist yet
 

@@ -11,6 +11,8 @@
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchPhaseChanged, ECatMatchPhase, NewPhase);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnObjectiveStatesChanged);
 
+class ACatCenterpiece;
+
 UCLASS()
 class CATVENTURES_API ACatGameState : public AGameStateBase
 {
@@ -57,6 +59,12 @@ public:
 	 *  immediate read-availability — this field is the durable copy. */
 	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Match")
 	FVector AftermathHotspot = FVector::ZeroVector;
+
+	/** The map's finale centerpiece, if one exists (set by the GameMode on registration).
+	 *  Replicated so clients can render its HUD line from the actor's own replicated state.
+	 *  Null on maps without one — those keep the meter-threshold match end. */
+	UPROPERTY(Replicated, BlueprintReadOnly, Category = "Finale")
+	TObjectPtr<ACatCenterpiece> Centerpiece;
 
 	// ── Delegates ───────────────────────────────────────────────────
 

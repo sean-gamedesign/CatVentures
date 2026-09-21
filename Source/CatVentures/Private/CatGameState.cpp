@@ -1,6 +1,7 @@
 // CatGameState.cpp
 
 #include "CatGameState.h"
+#include "CatCenterpiece.h"
 #include "CatPlayerState.h"
 #include "Net/UnrealNetwork.h"
 
@@ -16,6 +17,7 @@ void ACatGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLif
 	DOREPLIFETIME(ACatGameState, PlayerScores);
 	DOREPLIFETIME(ACatGameState, AftermathHotspot);
 	DOREPLIFETIME(ACatGameState, ObjectiveStates);
+	DOREPLIFETIME(ACatGameState, Centerpiece);
 }
 
 bool ACatGameState::AllPlayersReadyForRematch() const
@@ -70,14 +72,24 @@ bool ACatGameState::AreNonFinaleObjectivesComplete() const
 
 FText ACatGameState::GetObjectiveChecklistText() const
 {
+	TArray<FString> Lines;
+
+	// Finale centerpiece first (convergence loop, 2026-09-20): the HUD already polls this
+	// function every tick, so the shrine's line rides the same text block with zero widget
+	// edits — the debug-HUD doctrine (one SetText, formatting in C++, delete when real UI lands).
+	if (Centerpiece)
+	{
+		Lines.Add(Centerpiece->GetHudText(GetChaosPercent()).ToString());
+	}
+
 	if (ObjectiveStates.Num() == 0)
 	{
-		return FText::FromString(TEXT("OBJECTIVES\n  (none — no MapObjectiveTable assigned)"));
+		if (!Centerpiece) Lines.Add(TEXT("OBJECTIVES\n  (none — no MapObjectiveTable assigned)"));
+		return FText::FromString(FString::Join(Lines, TEXT("\n")));
 	}
 
 	const bool bFinaleUnlocked = AreNonFinaleObjectivesComplete();
 
-	TArray<FString> Lines;
 	Lines.Add(TEXT("OBJECTIVES"));
 
 	for (const FObjectiveState& S : ObjectiveStates)

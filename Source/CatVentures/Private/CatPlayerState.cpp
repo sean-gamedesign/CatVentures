@@ -8,6 +8,9 @@ void ACatPlayerState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(ACatPlayerState, bWantsRematch);
+	DOREPLIFETIME(ACatPlayerState, ChaosPoints);
+	DOREPLIFETIME(ACatPlayerState, ItemsDestroyed);
+	DOREPLIFETIME(ACatPlayerState, FinaleHits);
 }
 
 void ACatPlayerState::OnRep_WantsRematch()

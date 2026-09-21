@@ -46,6 +46,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Match")
 	FVector GetChaosTargetLocation(AActor* TargetActor) const;
 
+	/** Camera offset the FinalCut tracker adds to GetChaosTargetLocation for this target —
+	 *  CinematicOffset for a prop, FinaleCinematicOffset for the finale centerpiece (its
+	 *  debris field is several times a prop's; Sean 2026-09-20: "pull back farther"). The
+	 *  Blueprint tracker feeds this into its vector-add instead of a literal. */
+	UFUNCTION(BlueprintPure, Category = "Match")
+	FVector GetCinematicCameraOffset(AActor* TargetActor) const;
+
 	/** Filtered Center of Mass — averages every broken chunk that survives the abyss
 	 *  filter (chunk Z >= AftermathPivotMinZ). If the surviving chunk count is below
 	 *  AftermathMinChunkCount, OutActiveCount is reported as zero so the director
@@ -105,6 +112,19 @@ public:
 	 *  of debris chunks, not a single point. Raise for wider establishing sweeps. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "50.0"))
 	float AftermathOrbitRadius = 500.0f;
+
+	/** Orbit radius AND height multiplier while the shot's target is the finale centerpiece. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "1.0"))
+	float FinaleOrbitScale = 2.4f;
+
+	/** FinalCut tracker offset from the debris centroid for an ordinary prop (was a literal
+	 *  in BP_CatPlayerController) and for the finale centerpiece. World-space: -X is the
+	 *  hero yard's open side. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning")
+	FVector CinematicOffset = FVector(-300.0f, 0.0f, 150.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning")
+	FVector FinaleCinematicOffset = FVector(-1000.0f, 0.0f, 480.0f);
 
 	/** Vertical offset (uu) above the hotspot. Clamped non-negative so the camera can't
 	 *  drop under the floor by accident. */

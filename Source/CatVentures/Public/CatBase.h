@@ -641,6 +641,11 @@ public:
 	/** Per-tick: shove nearby fractured debris aside and charge-shatter intact props. */
 	void UpdateBulldozerPush(float DeltaTime);
 
+	/** Last time this cat's charge registered on the finale centerpiece (world seconds). The
+	 *  shrine stays intact after a hit, so without a cooldown a cat pressed against it would
+	 *  fire the bumper RPC every tick. */
+	double LastShrineChargeTime = -100.0;
+
 	// ── Mouth Grab ───────────────────────────────────────────────────────
 
 	/** Dynamically created physics constraint linking the mouth socket anchor to the
@@ -1057,8 +1062,10 @@ protected:
 	 *  Also flips the fractured chunks off the cat's channels (Layer 1) and, on the prop's
 	 *  FIRST shatter, schedules a next-tick radial scatter burst from HitLocation so every
 	 *  machine sees "destroyed", not "cracked in place" (see the .cpp). */
+public:   // a static utility — BPC_ChaosItem and ACatCenterpiece call it (2026-09-20)
 	UFUNCTION(BlueprintCallable, Category = "Chaos")
 	static void ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation);
+protected:
 
 	// ── Networked Turn State ───────────────────────────────────────────
 

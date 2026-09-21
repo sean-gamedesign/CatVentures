@@ -3,6 +3,7 @@
 #include "CatPlayerController.h"
 #include "CatVenturesLog.h"
 #include "CatBase.h"
+#include "CatCenterpiece.h"
 #include "CatGameState.h"
 #include "CatPlayerState.h"
 #include "EnhancedInputComponent.h"
@@ -310,11 +311,13 @@ void ACatPlayerController::TickAftermathOrbit()
 		DrawDebugSphere(GetWorld(), AftermathOrbitPivot, 25.f, 12, FColor::Red, false, -1.f, 0, 2.f);
 	}
 
+	// The finale centerpiece's debris field is several times a prop's — pull the orbit back.
+	const float OrbitScale = (CurrentTarget && CurrentTarget->IsA<ACatCenterpiece>()) ? FinaleOrbitScale : 1.0f;
 	const float AngleRad = FMath::DegreesToRadians(AftermathPanRateDeg * AftermathOrbitElapsed);
 	const FVector OrbitOffset(
-		FMath::Cos(AngleRad) * AftermathOrbitRadius,
-		FMath::Sin(AngleRad) * AftermathOrbitRadius,
-		AftermathOrbitHeight);
+		FMath::Cos(AngleRad) * AftermathOrbitRadius * OrbitScale,
+		FMath::Sin(AngleRad) * AftermathOrbitRadius * OrbitScale,
+		AftermathOrbitHeight * OrbitScale);
 	const FVector  CamLocation = AftermathOrbitPivot + OrbitOffset;
 	const FRotator CamRotation = UKismetMathLibrary::FindLookAtRotation(CamLocation, AftermathOrbitPivot);
 
@@ -371,13 +374,17 @@ void ACatPlayerController::PopulateScoreboard(UObject* WorldContextObject,
 		if (!Row) continue;
 
 		// Bind by widget-name convention. WBP_ScoreRow exposes these two TextBlocks as variables.
+		// Per-cat attribution (2026-09-20): the score cell carries props + finale hits too, so
+		// the "who did the work" argument has numbers without a wider row widget.
 		if (UTextBlock* NameText = Cast<UTextBlock>(Row->GetWidgetFromName(TEXT("TxtPlayerName"))))
 		{
-			NameText->SetText(FText::FromString(Entry.PlayerName));
+			NameText->SetText(FText::FromString(FString::Printf(TEXT("%s%s"),
+				Entry.bMVP ? TEXT("MVP  ") : TEXT(""), *Entry.PlayerName)));
 		}
 		if (UTextBlock* ScoreText = Cast<UTextBlock>(Row->GetWidgetFromName(TEXT("TxtScore"))))
 		{
-			ScoreText->SetText(FText::AsNumber(Entry.Score));
+			ScoreText->SetText(FText::FromString(FString::Printf(TEXT("%d pts   |   %d props   |   %d shrine hits"),
+				Entry.Score, Entry.ItemsDestroyed, Entry.FinaleHits)));
 		}
 
 		Container->AddChild(Row);
@@ -555,7 +562,8 @@ void ACatPlayerController::SwapToCurrentTargetCameraAndFadeIn()
 	UWorld* World = GetWorld();
 	if (World)
 	{
-		const FVector  InitialOffset(AftermathOrbitRadius, 0.f, AftermathOrbitHeight);
+		const float    OrbitScale = (NewTarget && NewTarget->IsA<ACatCenterpiece>()) ? FinaleOrbitScale : 1.0f;
+		const FVector  InitialOffset(AftermathOrbitRadius * OrbitScale, 0.f, AftermathOrbitHeight * OrbitScale);
 		const FVector  CamLocation = NewPivot + InitialOffset;
 		const FRotator CamRotation = UKismetMathLibrary::FindLookAtRotation(CamLocation, NewPivot);
 
@@ -672,33 +680,40 @@ FVector ACatPlayerController::GetChaosActiveChunkCentroid(AActor* TargetActor, i
 	OutActiveCount = 0;
 	if (!TargetActor) return FVector::ZeroVector;
 
-	UGeometryCollectionComponent* GCComp = TargetActor->FindComponentByClass<UGeometryCollectionComponent>();
-	if (!GCComp) return TargetActor->GetActorLocation();
-
-	FGeometryDynamicCollection* DynCollection = GCComp->GetDynamicCollection();
-	if (!DynCollection) return TargetActor->GetActorLocation();
-
-	FGeometryCollectionDynamicStateFacade StateFacade(*DynCollection);
-	const TArray<FTransform3f>& Transforms = GCComp->GetComponentSpaceTransforms3f();
-	const FTransform CompToWorld = GCComp->GetComponentTransform();
+	// Every GC component on the actor (2026-09-20): the finale centerpiece is a stack of
+	// sections, and a single-component read would frame only the first one's debris.
+	TInlineComponentArray<UGeometryCollectionComponent*> GCComps;
+	TargetActor->GetComponents(GCComps);
+	if (GCComps.Num() == 0) return TargetActor->GetActorLocation();
 
 	FVector Sum       = FVector::ZeroVector;
 	int32   PassCount = 0;
 
-	for (int32 i = 0; i < Transforms.Num(); ++i)
+	for (UGeometryCollectionComponent* GCComp : GCComps)
 	{
-		// Skip cluster parents and fragments still attached to the cluster.
-		if (StateFacade.HasChildren(i))   continue;
-		if (!StateFacade.HasBrokenOff(i)) continue;
+		if (!GCComp) continue;
+		FGeometryDynamicCollection* DynCollection = GCComp->GetDynamicCollection();
+		if (!DynCollection) continue;
 
-		const FTransform WorldTransform = FTransform(Transforms[i]) * CompToWorld;
-		const FVector ChunkLoc = WorldTransform.GetLocation();
+		FGeometryCollectionDynamicStateFacade StateFacade(*DynCollection);
+		const TArray<FTransform3f>& Transforms = GCComp->GetComponentSpaceTransforms3f();
+		const FTransform CompToWorld = GCComp->GetComponentTransform();
 
-		// Filter 1 — abyss: chunks below the pivot floor are dead to us.
-		if (ChunkLoc.Z < AftermathPivotMinZ) continue;
+		for (int32 i = 0; i < Transforms.Num(); ++i)
+		{
+			// Skip cluster parents and fragments still attached to the cluster.
+			if (StateFacade.HasChildren(i))   continue;
+			if (!StateFacade.HasBrokenOff(i)) continue;
 
-		Sum += ChunkLoc;
-		++PassCount;
+			const FTransform WorldTransform = FTransform(Transforms[i]) * CompToWorld;
+			const FVector ChunkLoc = WorldTransform.GetLocation();
+
+			// Filter 1 — abyss: chunks below the pivot floor are dead to us.
+			if (ChunkLoc.Z < AftermathPivotMinZ) continue;
+
+			Sum += ChunkLoc;
+			++PassCount;
+		}
 	}
 
 	// Mass threshold — too few fragments means the prop barely shattered (or most
@@ -713,35 +728,46 @@ FVector ACatPlayerController::GetChaosActiveChunkCentroid(AActor* TargetActor, i
 	return Sum / static_cast<float>(PassCount);
 }
 
+FVector ACatPlayerController::GetCinematicCameraOffset(AActor* TargetActor) const
+{
+	return (TargetActor && TargetActor->IsA<ACatCenterpiece>()) ? FinaleCinematicOffset : CinematicOffset;
+}
+
 // ── Chaos Debris Centroid ───────────────────────────────────────────
 
 FVector ACatPlayerController::GetChaosTargetLocation(AActor* TargetActor) const
 {
 	if (!TargetActor) return FVector::ZeroVector;
 
-	UGeometryCollectionComponent* GCComp = TargetActor->FindComponentByClass<UGeometryCollectionComponent>();
-	if (!GCComp) return TargetActor->GetActorLocation();
-
-	FGeometryDynamicCollection* DynCollection = GCComp->GetDynamicCollection();
-	if (!DynCollection) return TargetActor->GetActorLocation();
-
-	FGeometryCollectionDynamicStateFacade StateFacade(*DynCollection);
-	const TArray<FTransform3f>& Transforms = GCComp->GetComponentSpaceTransforms3f();
-	const FTransform CompToWorld = GCComp->GetComponentTransform();
+	// Every GC component on the actor (2026-09-20) — the finale centerpiece is a stack.
+	TInlineComponentArray<UGeometryCollectionComponent*> GCComps;
+	TargetActor->GetComponents(GCComps);
+	if (GCComps.Num() == 0) return TargetActor->GetActorLocation();
 
 	FVector Sum = FVector::ZeroVector;
 	int32 Count = 0;
 
-	for (int32 i = 0; i < Transforms.Num(); ++i)
+	for (UGeometryCollectionComponent* GCComp : GCComps)
 	{
-		// Skip cluster parents — they aren't visible leaf fragments.
-		if (StateFacade.HasChildren(i)) continue;
-		// Only count fragments that have actually separated from the cluster.
-		if (!StateFacade.HasBrokenOff(i)) continue;
+		if (!GCComp) continue;
+		FGeometryDynamicCollection* DynCollection = GCComp->GetDynamicCollection();
+		if (!DynCollection) continue;
 
-		const FTransform WorldTransform = FTransform(Transforms[i]) * CompToWorld;
-		Sum += WorldTransform.GetLocation();
-		++Count;
+		FGeometryCollectionDynamicStateFacade StateFacade(*DynCollection);
+		const TArray<FTransform3f>& Transforms = GCComp->GetComponentSpaceTransforms3f();
+		const FTransform CompToWorld = GCComp->GetComponentTransform();
+
+		for (int32 i = 0; i < Transforms.Num(); ++i)
+		{
+			// Skip cluster parents — they aren't visible leaf fragments.
+			if (StateFacade.HasChildren(i)) continue;
+			// Only count fragments that have actually separated from the cluster.
+			if (!StateFacade.HasBrokenOff(i)) continue;
+
+			const FTransform WorldTransform = FTransform(Transforms[i]) * CompToWorld;
+			Sum += WorldTransform.GetLocation();
+			++Count;
+		}
 	}
 
 	return (Count > 0) ? (Sum / Count) : TargetActor->GetActorLocation();

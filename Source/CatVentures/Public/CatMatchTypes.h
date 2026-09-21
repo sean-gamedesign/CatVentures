@@ -47,6 +47,95 @@ struct FCatPlayerScore
 
 	UPROPERTY(BlueprintReadOnly)
 	int32 ItemsDestroyed = 0;
+
+	/** Hits this player landed on the finale centerpiece (convergence loop, 2026-09-20). */
+	UPROPERTY(BlueprintReadOnly)
+	int32 FinaleHits = 0;
+
+	/** True on the top scorer — the scoreboard marks them. */
+	UPROPERTY(BlueprintReadOnly)
+	bool bMVP = false;
+};
+
+// ── Finale centerpiece (convergence loop, 2026-09-20) ───────────────────────────
+
+/** How a hit reached the centerpiece. */
+UENUM(BlueprintType)
+enum class ECatFinaleHitKind : uint8
+{
+	Swat,
+	Charge,
+	Impact      // a hurled / knocked prop striking it
+};
+
+/** Feedback beats the centerpiece multicasts to every machine. */
+UENUM(BlueprintType)
+enum class ECatFinaleEvent : uint8
+{
+	LockedHit,      // a hit bounced off while locked
+	WrongSection,   // legacy top-only mode: the hit landed below the top section and was rejected
+	LowHit,         // counted, but on a lower tier — small damage ("the glowing tier hits harder")
+	Hit,            // a counted hit on the glowing top tier
+	Unlocked,       // the meter crossed the unlock line
+	WindowExpired,  // not every cat hit in time — reset
+	StageComplete,  // a section came down
+	Destroyed       // the base came down — match end follows
+};
+
+/** Replicated state of the finale centerpiece — owned by ACatCenterpiece, read by the HUD. */
+USTRUCT(BlueprintType)
+struct FCatFinaleState
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly)
+	bool bUnlocked = false;
+
+	UPROPERTY(BlueprintReadOnly)
+	bool bDestroyed = false;
+
+	UPROPERTY(BlueprintReadOnly)
+	int32 StagesDone = 0;
+
+	UPROPERTY(BlueprintReadOnly)
+	int32 NumStages = 0;
+
+	UPROPERTY(BlueprintReadOnly)
+	int32 RequiredCats = 1;
+
+	/** Names of the cats that have landed a hit in the current co-op window. */
+	UPROPERTY(BlueprintReadOnly)
+	TArray<FString> CatsHitThisWindow;
+
+	/** Server world time the current co-op window closes; <= 0 = no window open. */
+	UPROPERTY(BlueprintReadOnly)
+	float WindowEndsAt = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly)
+	float UnlockPercent = 0.6f;
+
+	// ── Tier health (round 6, 2026-09-21: "any damage counts, top to bottom is the real dealer") ──
+
+	/** Damage dealt to the current top tier so far; the tier falls at StageHP. */
+	UPROPERTY(BlueprintReadOnly)
+	float StageDamage = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly)
+	float StageHP = 100.0f;
+
+	/** Distinct cats that hit inside the current window, and the damage multiplier that earns. */
+	UPROPERTY(BlueprintReadOnly)
+	int32 CoopCats = 1;
+
+	UPROPERTY(BlueprintReadOnly)
+	float CoopMultiplier = 1.0f;
+
+	/** Damage of the last counted hit, for the readout. */
+	UPROPERTY(BlueprintReadOnly)
+	float LastHitDamage = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly)
+	bool bLastHitTop = false;
 };
 
 /** DataTable row describing what happens when a given prop type is destroyed.
@@ -111,4 +200,10 @@ struct FChaosRewardData : public FTableRowBase
 	 *  used to hardcode 4, which made a vase as stubborn as a fridge. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Break", meta = (ClampMin = "0"))
 	int32 SwatsToBreak = 0;
+
+	/** False = AMBIENT: breaking it scores points for the cat but does NOT move the chaos
+	 *  meter, so it can never unlock the finale. The block-wide filler props (convergence
+	 *  loop, 2026-09-20 — Sean: "seeded with destructibles that don't count toward the shrine"). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Break")
+	bool bFeedsMeter = true;
 };
