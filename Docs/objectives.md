@@ -76,3 +76,11 @@ Config lives on `DT_ChaosRewards` rows (Sean's call): `bHeavyTier`, `ImpactVeloc
 ## The finale gate does not exist yet
 
 `bIsFinaleSetPiece` is a flag the HUD reads and *nothing else*. The set piece is breakable whenever — observed in play, where the centerpiece was completed before the ordinary checklist. Making it mechanically unbreakable until unlocked is step 4, and it depends on the Heavy tier landing first.
+
+## Open findings — 2026-09-22 project review (NOT fixed)
+
+From the full code + Blueprint review on `feat/convergence-loop` (`1bceac2`). IDs are **PR-xx** in `Saved/.Aura/plans/project-review-2026-09-22.md` (file:line, evidence tag, fix sketch). Nothing below has been fixed yet — check that file for status before re-deriving.
+
+- **PR-27** `WBP_ChaosHUD`'s Tick rebuilds `GetObjectiveChecklistText()` every frame even on `feat/convergence-loop`, where `MapObjectiveTable` is unassigned; it also hardcodes the 0.6 meter-warning threshold. Cheap to event-drive off `OnObjectiveStatesChanged` when objectives come back.
+- `OnMatchPhaseChanged` only broadcasts from the OnRep, never on the listen host (`OnObjectiveStatesChanged` does broadcast manually) — a trap for any future binder.
+- `UCatObjectiveTargetComponent`: reviewed, no defects (`ReportDestroyed` latches; registration is server-only).

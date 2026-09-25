@@ -30,6 +30,7 @@ Server-only classification, **value-carrying reliable multicast** execution: `AC
 ## Precedence and the restore contract
 
 - **`Move()`:** `IsStaggerSuppressing()` is consulted **FIRST** in the input-suppression chain — impact outranks pivot / coil / traversal. The steering cache stays live, same contract as every other suppression.
+- **Traversal:** the same window also gates traversal *re-engaging* — `UCatTraversalComponent` skips detection and refuses wall bounces while `IsStaggerSuppressing()` (PR-02, fixed 2026-09-24; the gate lives on the traversal side, so this component's step-2 freeze is untouched). Found because the 09-12 tripwire round had no held input and only checked the abort; the 09-24 re-test held W into the wall on the client's cat — see `Docs/traversal.md`.
 - **`RestoreAllCMCOverrides`:** `AbortAllImpactReactions()` runs **first of all**, above `AbortAllTraversal`. **CONTRACT (plan §2, v1.2):** it touches ONLY impact-owned state and must not clear or write any flag the traversal or grounded restores consult — the chain's ordering is deliberate, and an early write here would re-introduce the BB-16 stranded-override class. That is why the abort path does **not** arm the M4 input ramp the gameplay exit uses.
 
 ## Content
@@ -48,3 +49,9 @@ Seven pack clips retargeted to `/Game/Drafts/Impact` (stubs by the M5 doctrine):
 - **Geometry-Collection debris never reaches the classifier — by construction since Phase B.** Fractured chunks are `ECC_Pawn = Overlap` (Layer 1 in `ForceShatterGC`, see `Docs/match-destruction.md`), so they cannot generate a capsule `OnComponentHit`. The 09-12 "GC chunks fire ZERO impacts" finding was observed *before* Phase B (then it was the capsule↔chunk defect; Sean's "super stuck" moment was that, not a stagger bug — proven: no impact fired, so stagger was never active). The thresholds are therefore anchored to controlled prop hurls of intact physics bodies, not romp. If debris is ever meant to stagger cats, that is a deliberate policy change on the collision flip, not a threshold retune.
 - **`GetMass()` on a Geometry Collection may report the whole collection, not the chunk** — read the `[Impact]` log lines rather than trusting the number.
 - Every meaningful report logs one `[Impact]` line with its inputs and verdict, and a reaction that DIDN'T fire says why (the `ETraversalReject` doctrine). Filter PawPrint on `[Impact]` for a round.
+
+## Open findings — 2026-09-22 project review (NOT fixed)
+
+From the full code + Blueprint review on `feat/convergence-loop` (`1bceac2`). IDs are **PR-xx** in `Saved/.Aura/plans/project-review-2026-09-22.md` (file:line, evidence tag, fix sketch). Nothing below has been fixed yet — check that file for status before re-deriving.
+
+- `CatImpactTypes.h` still says "v1 implements Flinch only" (Stagger shipped).

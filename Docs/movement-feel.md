@@ -35,3 +35,11 @@ The bullets below document the **current state** of the movement/camera/turn/jum
 
 All movement tuning UPROPERTYs are re-applied to the CMC in `ACatBase::BeginPlay` (the constructor bakes C++ defaults into the CMC *before* Blueprint serialization, so BeginPlay re-application is what makes PrimeCatBase overrides work — keep new tuning knobs on that list).
 
+## Open findings — 2026-09-22 project review (NOT fixed)
+
+From the full code + Blueprint review on `feat/convergence-loop` (`1bceac2`). IDs are **PR-xx** in `Saved/.Aura/plans/project-review-2026-09-22.md` (file:line, evidence tag, fix sketch). Nothing below has been fixed yet — check that file for status before re-deriving.
+
+- **PR-13** after a grab the cat can trot at 400 turning at the 150°/s sprint rate until sprint is toggled.
+- **PR-17 / PR-18 (PLAUSIBLE, proxy-side feel):** remote cats may run crabwise 10–30° after a turn (server yaw chase), and a quick Shift tap can flip gait back + fire a false start coil (`bIsSprinting` replicating back to the owner).
+- **PR-19 (architectural):** braking/accel/jump-gravity changes aren't in saved moves → expect net corrections at pivot/stop/burst edges on clients. The long-term fix is custom saved-move flags.
+- `MovementBrakingFriction` does nothing outside stops (`bUseSeparateBrakingFriction` is only on during a stop) — the header presents it as a live knob.
