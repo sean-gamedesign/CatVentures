@@ -309,6 +309,11 @@ public:
 	/** Called by the GameMode when the meter crosses UnlockChaosPercent. */
 	void SetUnlocked(bool bNewUnlocked);
 
+	/** Distance from Point to the shrine's centre line, base to the top of the intact stack.
+	 *  The server's charge reach check measures this (PR-05) — the actor origin sits on the
+	 *  ground, so measuring to it rejected every client charge from a ledge. */
+	float DistanceToStackAxis(const FVector& Point) const;
+
 	bool IsUnlocked()  const { return State.bUnlocked; }
 	bool IsDestroyed() const { return State.bDestroyed; }
 

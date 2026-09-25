@@ -1,6 +1,7 @@
 #include "CatTraversalComponent.h"
 
 #include "CatBase.h"
+#include "CatImpactResponseComponent.h"
 #include "CatVenturesLog.h"
 #include "PawPrintSubsystem.h"
 #include "Components/CapsuleComponent.h"
@@ -357,7 +358,12 @@ void UCatTraversalComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	// Detection runs only for the locally controlled cat (the server and proxies get
 	// the takeover via the pawn RPC + replication, never their own detection).
 	ACatBase* Cat = GetCat();
-	if (Cat && Cat->IsLocallyControlled())
+	// Impact outranks traversal (PR-02, 2026-09-24): StartStagger aborts the live verb once,
+	// but detection must also stay dark for the stagger's control-loss window — otherwise a
+	// cat launched into a wall re-clings after WallAttachCooldown (the cling zeroes XY and
+	// cancels the knock-off), and a rising stagger can arm a mantle.
+	const bool bStaggered = Cat && Cat->ImpactResponse && Cat->ImpactResponse->IsStaggerSuppressing();
+	if (Cat && Cat->IsLocallyControlled() && !bStaggered)
 	{
 		// Precedence, highest first. A reachable ledge beats climbing the wall under it;
 		// a climbable wall run at speed beats merely hanging on it. Each starts a
@@ -1084,6 +1090,21 @@ void UCatTraversalComponent::AbortAllTraversal()
 	default: break;
 	}
 
+	// Timers that outlive the state (PR-02/PR-10, 2026-09-24): a cling-kick still loading
+	// after its attach timed out, and the post-mantle step-out. Left armed they fire AFTER
+	// the abort — a kick that overrides the stagger launch that caused the abort.
+	if (PendingKickTimer > 0.0f)
+	{
+		PendingKickTimer = 0.0f;
+		if (ACatBase* KickCat = GetCat())
+		{
+			KickCat->bGoWallKick       = false;
+			KickCat->bWallKickArcPhase = false;
+			KickCat->WallKickAnimTimer = 0.0f;
+		}
+	}
+	MantleExitBoostTimer = 0.0f;
+
 	// Then the two overrides that outlive any state: the bounce's lateral-friction
 	// window and the kick's orient-to-movement hold. Both are timer-driven, so both
 	// can be live with TraversalState already None.
@@ -1119,6 +1140,12 @@ bool UCatTraversalComponent::TryWallBounce()
 		return true;   // a kick is already loading — consume the press, don't double-arm
 	}
 	if (WallBounceCooldownTimer > 0.0f || IsMantling() || Cat->IsGrabbing())
+	{
+		return false;
+	}
+	// A staggered cat can't kick off a wall (PR-02) — the press falls through to the normal
+	// jump path, which is equally dead while airborne.
+	if (Cat->ImpactResponse && Cat->ImpactResponse->IsStaggerSuppressing())
 	{
 		return false;
 	}

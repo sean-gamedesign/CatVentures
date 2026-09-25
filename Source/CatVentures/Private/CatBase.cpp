@@ -237,6 +237,25 @@ void ACatBase::Server_BumperHitGC_Implementation(AActor* GCActor, FVector Origin
 {
 	if (!GCActor) return;
 
+	// THE SHRINE (PR-05, 2026-09-24): reach is measured to the stack's centre line, not the
+	// actor origin — that sits on the ground at the base's centre, so a cat charging from a
+	// ledge (z ≈ 330) read ~350 cm away and every client ledge charge was rejected while the
+	// host (which skips this RPC) landed them. And the hit goes straight to the shrine:
+	// the multicast only ever acted on authority, so routing through it was traffic for nothing.
+	if (ACatCenterpiece* Shrine = Cast<ACatCenterpiece>(GCActor))
+	{
+		constexpr float ShrineReachCm = 300.0f;
+		const float AxisDist = Shrine->DistanceToStackAxis(GetActorLocation());
+		if (AxisDist > ShrineReachCm)
+		{
+			UE_LOG(LogCatVentures, Log, TEXT("[Finale] %s charge REJECTED — server sees the cat %.0f cm from the shrine's axis (max %.0f)"),
+				*GetName(), AxisDist, ShrineReachCm);
+			return;
+		}
+		Shrine->ReceiveHit(GetPlayerState(), ECatFinaleHitKind::Charge, Origin);
+		return;
+	}
+
 	// Range check using the server's authoritative pawn position.
 	// 300 cm = bumper reach (60) + shatter radius slack + prediction jitter buffer.
 	// Logged when it rejects (2026-09-21): a client's intact prop that had drifted from the
@@ -514,7 +533,9 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 				&& World->GetTimeSeconds() - LastShrineChargeTime >= 0.5)
 			{
 				LastShrineChargeTime = World->GetTimeSeconds();
-				if (HasAuthority()) Multicast_BumperHitGC(Shrine, GetActorLocation());
+				// Host: straight to the shrine (the server decides; nothing to multicast).
+				// Client: the RPC, which range-checks against the stack axis (PR-05).
+				if (HasAuthority()) Shrine->ReceiveHit(GetPlayerState(), ECatFinaleHitKind::Charge, GetActorLocation());
 				else                Server_BumperHitGC(Shrine, GetActorLocation());
 			}
 			continue;
@@ -892,7 +913,7 @@ void ACatBase::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 		// Jump — Started records the buffer + jumps; Completed for variable-height release
 		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Started,   this, &ACatBase::OnJumpInputPressed);
-		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Completed, this, &ACharacter::StopJumping);
+		EnhancedInput->BindAction(JumpAction,   ETriggerEvent::Completed, this, &ACatBase::OnJumpInputReleased);
 
 		// Meow
 		EnhancedInput->BindAction(MeowAction,   ETriggerEvent::Started,   this, &ACatBase::Server_Meow);
@@ -4043,6 +4064,10 @@ void ACatBase::OnJumpInputPressed()
 	// Arm the jump buffer, then forward to the standard jump. If the jump can't fire
 	// right now (airborne beyond the coyote window), the buffer lets Landed() re-fire it.
 	JumpBufferTimer = JumpBufferTime;
+	bJumpInputHeld  = true;
+	// A fresh press owns its own hold — a tap release armed by the previous press is void.
+	bTapReleasePending  = false;
+	bTapReleaseLaunched = false;
 
 	// A jump press while airborne next to a wall is a WALL BOUNCE, not a dead input.
 	// Checked before the coyote/anticipation paths: airborne-and-at-a-wall is
@@ -4066,8 +4091,33 @@ void ACatBase::OnJumpInputPressed()
 	Jump();
 }
 
+void ACatBase::OnJumpInputReleased()
+{
+	bJumpInputHeld = false;
+	StopJumping();
+}
+
+void ACatBase::FireDeferredJump()
+{
+	Jump();
+	// The button came up before this launch (a tap inside the standstill coil, or a tap just
+	// before landing picked up by the buffer retry). The release's StopJumping already ran and
+	// this Jump() re-set bPressedJump, which the engine would hold to JumpMaxHoldTime — so arm
+	// the release for this launch instead (PR-01).
+	if (!bJumpInputHeld)
+	{
+		bTapReleasePending  = true;
+		bTapReleaseLaunched = false;
+		TapReleaseTimeout   = 0.1f;
+	}
+}
+
 void ACatBase::OnJumped_Implementation()
 {
+	if (bTapReleasePending)
+	{
+		bTapReleaseLaunched = true;   // UpdateJumpPhase releases on the next tick
+	}
 	bFallPending = false;
 	FallTransitionHoldTimer = 0.0f;
 	// A jump fired: consume the buffer and suppress coyote-time for this airborne span.
@@ -4232,6 +4282,22 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		JumpBufferTimer -= DeltaTime;
 	}
 
+	// Tap release for a deferred launch (PR-01): one tick after the launch, end the hold the
+	// way a real tap would have. The timeout covers a Jump() that never became a launch, so
+	// a stale bPressedJump can't fire a held jump later.
+	if (bTapReleasePending)
+	{
+		TapReleaseTimeout -= DeltaTime;
+		if (bTapReleaseLaunched || TapReleaseTimeout <= 0.0f)
+		{
+			UE_LOG(LogCatVentures, Log, TEXT("[Jump] %s tap released before its deferred launch — %s"),
+				*GetName(), bTapReleaseLaunched ? TEXT("tap height") : TEXT("launch never fired, hold cleared"));
+			bTapReleasePending  = false;
+			bTapReleaseLaunched = false;
+			StopJumping();
+		}
+	}
+
 	// Standstill-anticipation countdown: the coil plays while this runs; the launch fires
 	// the moment it expires. Runs BEFORE the buffer retry so the retry can't preempt it.
 	if (JumpAnticipationTimer > 0.0f)
@@ -4240,7 +4306,7 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		if (JumpAnticipationTimer <= 0.0f)
 		{
 			JumpAnticipationTimer = 0.0f;
-			Jump();
+			FireDeferredJump();
 		}
 	}
 
@@ -4259,7 +4325,7 @@ void ACatBase::UpdateJumpPhase(float DeltaTime)
 		}
 		else if (CanJump())
 		{
-			Jump();
+			FireDeferredJump();
 		}
 	}
 

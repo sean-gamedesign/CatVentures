@@ -962,6 +962,11 @@ protected:
 	 *  The buffer lets a press made just before landing still fire on touchdown (see Landed). */
 	void OnJumpInputPressed();
 
+	/** Fires on IA_Jump Completed — records the release, then StopJumping. A release that
+	 *  lands before a DEFERRED launch (the standstill coil, or the buffered retry) arms a tap
+	 *  release for that launch, so variable height survives the deferral (PR-01). */
+	void OnJumpInputReleased();
+
 	/** Fires on IA_Sprint Started/Completed — owner-predicted gait switch (see SetSprinting). */
 	void OnSprintPressed();
 	void OnSprintReleased();
@@ -1993,4 +1998,19 @@ private:
 
 	/** Counts down the standstill-jump coil; the actual Jump() fires when it expires. */
 	float JumpAnticipationTimer = 0.0f;
+
+	/** The jump button is physically down (Started → Completed). Owner-local. */
+	bool bJumpInputHeld = false;
+
+	/** PR-01 (2026-09-24): a deferred Jump() fired after the button was already released.
+	 *  Without this the engine holds that jump to JumpMaxHoldTime — a tap became the full
+	 *  ~240 cm held jump. Armed at the deferred Jump(); UpdateJumpPhase calls StopJumping on
+	 *  the tick after OnJumped (one frame of hold, like a real tap), or on the timeout if the
+	 *  jump never fired. */
+	bool  bTapReleasePending   = false;
+	bool  bTapReleaseLaunched  = false;
+	float TapReleaseTimeout    = 0.0f;
+
+	/** Jump() for the deferred paths — arms the tap release when the button is already up. */
+	void FireDeferredJump();
 };

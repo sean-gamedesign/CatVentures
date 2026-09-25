@@ -132,6 +132,20 @@ bool ACatGameMode::ShouldImpactShatter(UObject* WorldContextObject,
 // ── Objectives ───────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════════
 
+void ACatGameMode::PreLogin(const FString& Options, const FString& Address,
+	const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage)
+{
+	Super::PreLogin(Options, Address, UniqueId, ErrorMessage);
+	if (!ErrorMessage.IsEmpty()) return;
+
+	if (CurrentPhase != ECatMatchPhase::Playing)
+	{
+		ErrorMessage = TEXT("The match is ending. Try again when the next round starts.");
+		UE_LOG(LogCatVentures, Warning, TEXT("[CatMatch] Join REFUSED from %s — match phase is %s, not Playing (PR-03 late-join gate)"),
+			*Address, *UEnum::GetValueAsString(CurrentPhase));
+	}
+}
+
 void ACatGameMode::StartPlay()
 {
 	// Super dispatches BeginPlay to every spawned actor (via WorldSettings->

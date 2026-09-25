@@ -192,6 +192,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Match|Tuning", meta = (ClampMin = "100.0"))
 	float AftermathCellSize = 800.0f;
 
+	/** Late-join gate (PR-03, 2026-09-24): a connection arriving after the Playing phase is
+	 *  refused. Joining the running match is the normal flow (the host opens the map with
+	 *  ?listen and friends join it), but a joiner during Warning → Aftermath gets no phase
+	 *  RPC, no scoreboard and no Play Again UI, and its bWantsRematch=false would block the
+	 *  host's rematch gate forever. The session-level bAllowJoinInProgress can't do this —
+	 *  nothing calls StartSession, so the session never leaves Pending. */
+	virtual void PreLogin(const FString& Options, const FString& Address,
+		const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage) override;
+
 protected:
 	virtual void BeginPlay() override;
 

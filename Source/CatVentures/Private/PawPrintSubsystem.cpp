@@ -138,6 +138,16 @@ bool UPawPrintSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 	// Game/PIE worlds only — editor-preview worlds would register phantom taps.
 	if (const UWorld* World = Cast<UWorld>(Outer))
 	{
+#if !WITH_EDITOR
+		// Packaged builds (PR-04, 2026-09-24): off unless launched with -PawPrint. Otherwise a
+		// friend's build taps every log line into 50k-line buffers and writes a CSV pair to
+		// Saved/PawPrint on every map travel, never pruned. The flag keeps it available for
+		// diagnosing a packaged session on purpose.
+		if (!FParse::Param(FCommandLine::Get(), TEXT("PawPrint")))
+		{
+			return false;
+		}
+#endif
 		return World->WorldType == EWorldType::PIE || World->WorldType == EWorldType::Game;
 	}
 	return false;
@@ -315,8 +325,10 @@ FString UPawPrintSubsystem::DumpToCSV()
 
 	const FString ChannelPath = Dir / FString::Printf(TEXT("%s_%s_channels.csv"), *Stamp, Role);
 	const FString LogFilePath = Dir / FString::Printf(TEXT("%s_%s_log.csv"), *Stamp, Role);
-	FFileHelper::SaveStringToFile(ChannelCsv, *ChannelPath);
-	FFileHelper::SaveStringToFile(LogCsv, *LogFilePath);
+	// Forced UTF-8: auto-detect wrote the log file as UTF-16 whenever a line held a non-ANSI
+	// character (em-dashes are everywhere in our logs) — the old "two files, two encodings".
+	FFileHelper::SaveStringToFile(ChannelCsv, *ChannelPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	FFileHelper::SaveStringToFile(LogCsv, *LogFilePath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
 	bDumped = true;
 
 	UE_LOG(LogCatVentures, Log, TEXT("PawPrint dumped %d channels / %s"),

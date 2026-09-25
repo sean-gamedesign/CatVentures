@@ -176,6 +176,13 @@ float ACatCenterpiece::StackTopZ(int32 IntactSections) const
 	return Z;
 }
 
+float ACatCenterpiece::DistanceToStackAxis(const FVector& Point) const
+{
+	const FVector Base = GetActorLocation();
+	const FVector Top  = Base + FVector(0.0f, 0.0f, StackTopZ(FMath::Max(TopIntactSection() + 1, 1)));
+	return FMath::PointDistToSegment(Point, Base, Top);
+}
+
 void ACatCenterpiece::LayoutSections()
 {
 	const int32 Num = NumActiveSections();
@@ -398,6 +405,25 @@ void ACatCenterpiece::ReceiveHit(APlayerState* Attacker, ECatFinaleHitKind Kind,
 	// Which tier: the glowing top one is the real dealer, anything lower still counts.
 	if (SectionIndex == INDEX_NONE) SectionIndex = SectionIndexAtHeight(HitLocation.Z);
 	const int32 Top  = TopIntactSection();
+
+	// A fallen tier is rubble, not shrine (PR-06, 2026-09-24). Its pieces are still that
+	// section's component, so the swat sweep (ECC_Destructible) finds them and a swat on the
+	// pile used to land as a low hit on the live tier. A charge is different: the owner only
+	// sends one after overlapping an INTACT section, and its tier comes from the cat's height,
+	// which can read one band high when the cat stands on the top tier's ledge — clamp it.
+	if (SectionIndex > Top)
+	{
+		if (Kind == ECatFinaleHitKind::Charge)
+		{
+			SectionIndex = Top;
+		}
+		else
+		{
+			UE_LOG(LogCatVentures, Log, TEXT("[Finale] %s by %s on fallen section %d REJECTED — rubble, top intact is %d"),
+				HitKindName(Kind), *CatName, SectionIndex, Top);
+			return;
+		}
+	}
 	const bool  bTop = (SectionIndex == Top);
 	if (bRequireTopSectionHit && !bTop)
 	{
