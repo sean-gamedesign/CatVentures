@@ -3,7 +3,13 @@
 #include "CatGameState.h"
 #include "CatCenterpiece.h"
 #include "CatPlayerState.h"
+#include "CatPropSyncComponent.h"
 #include "Net/UnrealNetwork.h"
+
+ACatGameState::ACatGameState()
+{
+	PropSync = CreateDefaultSubobject<UCatPropSyncComponent>(TEXT("PropSync"));
+}
 
 void ACatGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {

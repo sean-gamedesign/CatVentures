@@ -13,6 +13,10 @@ public class CatVentures : ModuleRules
 		// EngineCameras: UPerlinNoiseCameraShakePattern for the finale shrine's C++ camera shakes.
 		PrivateDependencyModuleNames.AddRange(new string[] { "Chaos", "DeveloperSettings", "EngineCameras" });
 
+		// FieldSystemEngine: UUniformInteger dynamic-state fields — UCatPropSyncComponent flips
+		// client prop copies kinematic/dynamic with them (SetSimulatePhysics can't, on a GC).
+		PrivateDependencyModuleNames.Add("FieldSystemEngine");
+
 		// PawPrint window (editor-only Slate tab) — see PawPrintWindow.cpp
 		if (Target.bBuildEditor)
 		{

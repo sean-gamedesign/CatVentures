@@ -6,6 +6,7 @@
 #include "CatTraversalComponent.h"
 #include "CatCenterpiece.h"
 #include "CatGameMode.h"
+#include "CatPropSyncComponent.h"
 #include "GameFramework/PlayerState.h"
 #include "PawPrintSubsystem.h"
 #include "CatAnimationTypes.h"
@@ -260,8 +261,12 @@ void ACatBase::Server_BumperHitGC_Implementation(AActor* GCActor, FVector Origin
 	// 300 cm = bumper reach (60) + shatter radius slack + prediction jitter buffer.
 	// Logged when it rejects (2026-09-21): a client's intact prop that had drifted from the
 	// server's copy (pre-replication drags) failed this silently and read as "can't destroy".
+	// Measured to where the prop IS (2026-09-24): the actor never leaves the spot it was placed,
+	// so a prop moved ~3 m had every client charge rejected as "drifted" — the host skips this.
 	constexpr float MaxReachCm = 300.0f;
-	const float Dist = FVector::Dist(GetActorLocation(), GCActor->GetActorLocation());
+	const UGeometryCollectionComponent* TargetGCC = GCActor->FindComponentByClass<UGeometryCollectionComponent>();
+	const FVector PropLoc = TargetGCC ? GetPropWorldLocation(TargetGCC) : GCActor->GetActorLocation();
+	const float Dist = FVector::Dist(GetActorLocation(), PropLoc);
 	if (Dist > MaxReachCm)
 	{
 		UE_LOG(LogCatVentures, Log, TEXT("[Chaos] %s charge on '%s' REJECTED — server sees it %.0f cm from the cat (max %.0f); the client's copy has drifted"),
@@ -408,6 +413,19 @@ namespace CatShatter
 	}
 }
 
+FVector ACatBase::GetPropWorldLocation(const UPrimitiveComponent* Comp)
+{
+	if (!Comp) return FVector::ZeroVector;
+	if (const UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(Comp))
+	{
+		// Intact: the root cluster IS the prop, and its world transform follows the physics.
+		// Broken: the root no longer means anything; the bounds are built from the live
+		// piece transforms, so their centre tracks the pile.
+		return GCC->IsRootBroken() ? GCC->Bounds.Origin : GCC->GetRootCurrentTransform().GetLocation();
+	}
+	return Comp->GetComponentLocation();
+}
+
 void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation)
 {
 	if (!GCC) return;
@@ -421,6 +439,11 @@ void ACatBase::ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLoca
 	// so reading it BEFORE the flip is an exact intact bit. Break paths can fire more than
 	// once per prop (BB-17) — the burst must not.
 	const bool bWasIntact = (GCC->GetCollisionResponseToChannel(ECC_Pawn) != ECR_Overlap);
+
+	// Prop sync (2026-09-24): on a client an intact prop is a KINEMATIC follower of the server's
+	// copy — hand it back to local physics first, or its released pieces hang where they broke.
+	// No-op on the server and for anything the sync doesn't follow (the shrine, debris).
+	UCatPropSyncComponent::ReleaseFollower(GCC);
 
 	GCC->ApplyKinematicField(ShatterRadius, HitLocation);
 	GCC->ApplyExternalStrain(
@@ -541,10 +564,13 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 			continue;
 		}
 
-		if (!Comp->IsSimulatingPhysics()) continue;
-		Done.Add(Comp);
-
+		// Geometry Collections skip the simulating check (2026-09-24): on a client an intact prop
+		// is a KINEMATIC follower of the server's copy (UCatPropSyncComponent) and reports
+		// IsSimulatingPhysics() == false, which silently disabled every client charge — the cat
+		// just ran into a solid prop. The only other kinematic GC is the shrine, handled above.
 		UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(Comp);
+		if (!GCC && !Comp->IsSimulatingPhysics()) continue;
+		Done.Add(Comp);
 		if (!GCC && !bAuth) continue;   // props: authority only; GC: every role (see above)
 
 		if (GCC)
@@ -574,12 +600,15 @@ void ACatBase::UpdateBulldozerPush(float DeltaTime)
 				// close enough for the capsule to be touching (prop radius + capsule + slack).
 				// Intact GC = one rigid cluster, so one impulse moves the whole prop; applied
 				// at the prop's centre at the cat's height so a top-heavy prop topples rather
-				// than slides. Every role runs it — an intact GC lives in each machine's own
-				// solver just like debris — but a prop is a LEVEL actor, not a replicated
-				// physics body, so each machine's copy is pushed by that machine's copy of the
-				// cat and the remote view is approximate (same contract as the debris plow).
+				// than slides. Every role runs it, but since the prop sync (2026-09-24) only the
+				// SERVER's push moves anything: a client's intact props are kinematic followers
+				// (the impulse is a no-op on them) and the server's copy of each cat does the
+				// nudging, which reaches clients through UCatPropSyncComponent.
 				{
-					const FVector PropLoc = Comp->GetComponentLocation();
+					// Where the prop IS, not where it was placed (the component never follows
+					// the physics — see GetPropWorldLocation). The server does all the pushing
+					// now, and measured to the spawn spot it nudged moved props wrong or never.
+					const FVector PropLoc = GetPropWorldLocation(Comp);
 					FVector ToProp = PropLoc - Center; ToProp.Z = 0.0f;
 					const float Dist = ToProp.Size();
 					const float PropRadius = Comp->Bounds.SphereRadius * 0.75f;   // sphere over-reads a cylinder
@@ -2400,10 +2429,14 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 	GrabConstraint->SetupAttachment(GrabTargetLocation);
 	GrabConstraint->RegisterComponent();
 
-	// Linear: limited slack + position/velocity drive toward anchor.
-	GrabConstraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Limited, GrabLinearLimit);
-	GrabConstraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Limited, GrabLinearLimit);
-	GrabConstraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Limited, GrabLinearLimit);
+	// Linear: position/velocity drive toward the anchor. The hard limit is OFF by default
+	// (GrabLinearLimit 0, 2026-09-24) — a limited joint to the kinematic capsule outranks
+	// collision, so the old 30 cm tether pulled props straight through walls. With the spring
+	// alone, walls win and a snagged prop drops through the MaxGrabDistance auto-release.
+	const ELinearConstraintMotion LinearMotion = (GrabLinearLimit > 0.0f) ? LCM_Limited : LCM_Free;
+	GrabConstraint->SetLinearXLimit(LinearMotion, GrabLinearLimit);
+	GrabConstraint->SetLinearYLimit(LinearMotion, GrabLinearLimit);
+	GrabConstraint->SetLinearZLimit(LinearMotion, GrabLinearLimit);
 	GrabConstraint->SetLinearPositionDrive(true, true, true);
 	GrabConstraint->SetLinearVelocityDrive(true, true, true);
 	GrabConstraint->SetLinearDriveParams(GrabConstraintStiffness, GrabConstraintDamping, GrabConstraintMaxForce);
@@ -2536,12 +2569,15 @@ void ACatBase::UpdateGrab(float DeltaTime)
 	}
 
 	// Server-authoritative auto-release: if the object drifted too far, the server
-	// multicasts the release to all machines.
+	// multicasts the release to all machines. Measured to the prop's REAL position — the GC
+	// component stays where the prop was placed, so this used to fire the moment the cat was
+	// MaxGrabDistance from the SPAWN spot, and every re-grab after that died in its first frame
+	// (each one-frame grab yanked the two machines' copies differently: 25 cm → 284 cm gap).
 	if (HasAuthority())
 	{
 		const float Dist = FVector::Dist(
 			GrabTargetLocation->GetComponentLocation(),
-			GrabbedComponent->GetComponentLocation());
+			GetPropWorldLocation(GrabbedComponent.Get()));
 
 		if (Dist > MaxGrabDistance)
 		{

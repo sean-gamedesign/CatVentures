@@ -676,8 +676,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "10.0"))
 	float GrabTraceLength = 175.0f;
 
-	/** Auto-release distance (cm). If the grabbed object's centre drifts further
-	 *  than this from GrabTargetLocation, the grab is dropped. */
+	/** Auto-release distance (cm). If the grabbed object drifts further than this from
+	 *  GrabTargetLocation, the grab is dropped — measured to the prop's REAL position
+	 *  (GetPropWorldLocation), which is what makes a prop snagged behind a doorframe let go. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0"))
 	float MaxGrabDistance = 250.0f;
 
@@ -685,10 +686,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "50.0", ClampMax = "400.0"))
 	float DragWalkSpeed = 150.0f;
 
-	/** Linear slack (cm) — how far the grabbed object can drift from the mouth anchor
-	 *  before the constraint limits kick in. Lower = tighter tow cable. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "1.0", ClampMax = "200.0"))
-	float GrabLinearLimit = 30.0f;
+	/** Hard tether length (cm) — 0 (the default since 2026-09-24) = NO hard limit: the drive
+	 *  spring alone tows the prop, so walls win and a snag scrapes or drops it
+	 *  (MaxGrabDistance). > 0 restores the old rigid tow cable: the prop can never be further
+	 *  than this from the anchor, and because the other end is the kinematic capsule the joint
+	 *  beats collision — that is what dragged props THROUGH walls (and each machine then
+	 *  depenetrated its copy its own way). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mouth Grab", meta = (ClampMin = "0.0", ClampMax = "200.0"))
+	float GrabLinearLimit = 0.0f;
 
 	/** Drive spring stiffness — how hard the constraint pulls the object toward the anchor.
 	 *  Higher = snappier tracking. */
@@ -1070,6 +1075,14 @@ protected:
 public:   // a static utility — BPC_ChaosItem and ACatCenterpiece call it (2026-09-20)
 	UFUNCTION(BlueprintCallable, Category = "Chaos")
 	static void ForceShatterGC(UGeometryCollectionComponent* GCC, FVector HitLocation);
+
+	/** Where a prop actually IS. Our props' Geometry Collection is a child of a scene root
+	 *  with bUpdateComponentTransformToRootBone off, so the actor AND the GC component stay
+	 *  where the prop was placed while its physics moves — measured 1566 cm apart after a
+	 *  carry (2026-09-24). For an intact GC this reads the root cluster's world transform;
+	 *  for a broken one the component bounds (which follow the pieces); anything else, its
+	 *  component location. Use it for every distance check against a prop. */
+	static FVector GetPropWorldLocation(const UPrimitiveComponent* Comp);
 protected:
 
 	// ── Networked Turn State ───────────────────────────────────────────

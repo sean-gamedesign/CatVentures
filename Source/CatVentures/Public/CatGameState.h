@@ -12,6 +12,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMatchPhaseChanged, ECatMatchPhase
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnObjectiveStatesChanged);
 
 class ACatCenterpiece;
+class UCatPropSyncComponent;
 
 UCLASS()
 class CATVENTURES_API ACatGameState : public AGameStateBase
@@ -19,7 +20,15 @@ class CATVENTURES_API ACatGameState : public AGameStateBase
 	GENERATED_BODY()
 
 public:
+	ACatGameState();
+
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	/** Server-authoritative intact-prop motion: clients' prop copies follow the server's
+	 *  (2026-09-24 — see CatPropSyncComponent.h). Lives here because the GameState reaches
+	 *  every client. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Props")
+	TObjectPtr<UCatPropSyncComponent> PropSync;
 
 	// ── Replicated Match State ──────────────────────────────────────
 

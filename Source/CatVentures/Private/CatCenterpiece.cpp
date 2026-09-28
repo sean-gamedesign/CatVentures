@@ -806,7 +806,8 @@ void ACatCenterpiece::EruptNearbyProps()
 			GCC->WakeAllRigidBodies();
 			if (bIntact)
 			{
-				const FVector Loc = GCC->GetComponentLocation();
+				// The prop's real position — its component stays where it was placed (2026-09-24).
+				const FVector Loc = ACatBase::GetPropWorldLocation(GCC);
 				FVector Dir = Loc - Centre; Dir.Z = 0.0f;
 				if (!Dir.Normalize()) Dir = FVector::ForwardVector;
 				Dir += FVector::UpVector * UpBias;
