@@ -9,6 +9,13 @@
 ACatGameState::ACatGameState()
 {
 	PropSync = CreateDefaultSubobject<UCatPropSyncComponent>(TEXT("PropSync"));
+
+	// PropSync's pose batches are unreliable multicasts on THIS actor, and the engine queues those
+	// until the actor's next net update and drops any past net.MaxRPCPerNetUpdate (2) per update
+	// (FObjectReplicator::QueueRemoteFunctionBunch). At the GameState's stock rate a 30 Hz stream
+	// lost about a third of its batches and the rest landed in pairs up to 100 ms late (2P PIE,
+	// 2026-09-27). 60 Hz lifts the cap to 120 batches/s; the GameState replicates little else.
+	SetNetUpdateFrequency(60.0f);
 }
 
 void ACatGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const

@@ -1083,6 +1083,10 @@ public:   // a static utility — BPC_ChaosItem and ACatCenterpiece call it (202
 	 *  for a broken one the component bounds (which follow the pieces); anything else, its
 	 *  component location. Use it for every distance check against a prop. */
 	static FVector GetPropWorldLocation(const UPrimitiveComponent* Comp);
+
+	/** Public for the traversal component's detection gates and UCatPropSyncComponent's
+	 *  local-carry self-heal (2026-09-27). */
+	bool IsGrabbing() const { return bIsGrabbing; }
 protected:
 
 	// ── Networked Turn State ───────────────────────────────────────────
@@ -1177,8 +1181,7 @@ protected:
 	 *  the real landing clears it — see MantleAnimHoldTimer. Called from EndMantle. */
 	void BeginMantleAnimHold();
 
-	/** Accessors for the traversal component's detection gates. */
-	bool IsGrabbing() const { return bIsGrabbing; }
+	/** Accessor for the traversal component's detection gates (IsGrabbing is public, above). */
 	bool HasMovementInput() const { return bHasMovementInput; }
 
 	/** Client → Server: throttled start-step scrub position. Unreliable — loss holds a frame. */

@@ -2422,6 +2422,13 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 {
 	if (!GrabbedComp) return;
 
+	// A client carrying a prop simulates it itself (2026-09-27) — it must be dynamic BEFORE the
+	// constraint binds, or the tow would pull on a kinematic follower. See SetLocalCarry.
+	if (!HasAuthority() && IsLocallyControlled())
+	{
+		UCatPropSyncComponent::SetLocalCarry(Cast<UGeometryCollectionComponent>(GrabbedComp), this, true);
+	}
+
 	// Create the constraint dynamically on this machine's physics solver.
 	// No explicit name: a fixed name can collide with a previous, still-pending-kill
 	// constraint during a fast release→re-grab.
@@ -2463,6 +2470,13 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 	{
 		GCC->SetEnableDamageFromCollision(false);
 	}
+
+	// The capsule's movement sweep ignores the held prop (2026-09-27). SetDisableCollision above
+	// only covers solver contacts, not the CMC sweep — the carrier's sweep stalled on its own carry
+	// (on a client, while its copy was still a kinematic follower of the server's, a near-deadlock:
+	// a stalled cat never towed the server's copy). Every machine, so the server's copy of the cat
+	// matches. Undone in Multicast_ReleaseGrab; a destroyed component is pruned by the engine.
+	GetCapsuleComponent()->IgnoreComponentWhenMoving(GrabbedComp, true);
 
 	GrabbedComponent = GrabbedComp;
 	bIsGrabbing      = true;
@@ -2510,6 +2524,16 @@ void ACatBase::Multicast_ReleaseGrab_Implementation()
 	{
 		GrabConstraint->DestroyComponent();
 		GrabConstraint = nullptr;
+	}
+	if (GrabbedComponent.IsValid())
+	{
+		GetCapsuleComponent()->IgnoreComponentWhenMoving(GrabbedComponent.Get(), false);
+		// The carrier's copy goes back to following the server (after the constraint is gone,
+		// so the kinematic switch isn't fighting the tow).
+		if (!HasAuthority() && IsLocallyControlled())
+		{
+			UCatPropSyncComponent::SetLocalCarry(Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()), this, false);
+		}
 	}
 	GrabbedComponent.Reset();
 	bIsGrabbing = false;

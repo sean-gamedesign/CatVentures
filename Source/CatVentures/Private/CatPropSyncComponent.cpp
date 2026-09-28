@@ -1,6 +1,7 @@
 // CatPropSyncComponent.cpp — see the header for the model and why it exists.
 
 #include "CatPropSyncComponent.h"
+#include "CatBase.h"
 #include "CatCenterpiece.h"
 #include "CatVenturesLog.h"
 #include "EngineUtils.h"
@@ -16,6 +17,13 @@ namespace
 	// jitter would keep it on the wire forever.
 	constexpr float MoveEpsilonCm  = 0.5f;
 	constexpr float MoveEpsilonRad = 0.0087f;   // 0.5 deg
+
+	// Server velocity estimate: per-tick samples, exponentially smoothed (2026-09-27). A carried
+	// prop is towed by the server's copy of its cat, which on a listen server moves only when a
+	// client move packet lands — the raw per-frame speed alternates ~70/220 cm/s around a steady
+	// 150, and a two-sample estimate taken at a send tick carried that noise into every client's
+	// extrapolation.
+	constexpr float VelocitySmoothTime = 0.08f;
 
 	bool PoseMoved(const FTransform& A, const FTransform& B)
 	{
@@ -146,6 +154,45 @@ void UCatPropSyncComponent::ReleaseTracked(FTracked& T, const AActor* Prop)
 	UE_LOG(LogCatVentures, Log, TEXT("[PropSync] CLI released '%s' to local physics for its break"), *GetNameSafe(Prop));
 }
 
+void UCatPropSyncComponent::SetLocalCarry(UGeometryCollectionComponent* GCC, const ACatBase* Carrier, bool bCarrying)
+{
+	if (!GCC) return;
+	UCatPropSyncComponent* Sync = Get(GCC->GetWorld());
+	if (!Sync || !Sync->IsClient()) return;
+	FTracked* T = Sync->Props.Find(GCC->GetOwner());
+	if (!T || !T->bFollower || T->bReleased) return;
+
+	if (bCarrying)
+	{
+		if (T->bLocalCarry) return;
+		T->bLocalCarry = true;
+		T->Carrier     = Carrier;
+		SetDynamicState(GCC, /*bKinematic=*/false);
+		UE_LOG(LogCatVentures, Log, TEXT("[PropSync] CLI local carry START '%s' — simulated here until release"),
+			*GetNameSafe(GCC->GetOwner()));
+	}
+	else if (T->bLocalCarry)
+	{
+		Sync->EndLocalCarry(*T, GCC->GetOwner());
+	}
+}
+
+void UCatPropSyncComponent::EndLocalCarry(FTracked& T, const AActor* Prop)
+{
+	T.bLocalCarry = false;
+	T.Carrier.Reset();
+	UGeometryCollectionComponent* GCC = T.GCC.Get();
+	if (!GCC || T.bReleased) return;   // broke while carried — its debris is local now
+
+	SetDynamicState(GCC, /*bKinematic=*/true);
+	// Poses kept arriving through the carry, so the target is current: ease onto it.
+	T.bHasTarget = T.TargetTime > 0.0;
+	const float Gap = T.bHasTarget
+		? FVector::Dist(GCC->GetRootCurrentTransform().GetLocation(), T.Target.GetLocation()) : -1.0f;
+	UE_LOG(LogCatVentures, Log, TEXT("[PropSync] CLI local carry END '%s' — back to following, gap to server %.0f cm"),
+		*GetNameSafe(Prop), Gap);
+}
+
 // ── Tick ────────────────────────────────────────────────────────────
 
 void UCatPropSyncComponent::TickComponent(float DeltaTime, ELevelTick TickType,
@@ -180,12 +227,36 @@ void UCatPropSyncComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 
 void UCatPropSyncComponent::ServerTick(float DeltaTime)
 {
+	const double Now = GetWorld()->GetTimeSeconds();
+
+	// Velocity every tick, smoothed (see VelocitySmoothTime) — the GC's own component velocity is
+	// not the prop's (the component never moves on the server).
+	for (auto It = Props.CreateIterator(); It; ++It)
+	{
+		FTracked& T = It.Value();
+		UGeometryCollectionComponent* GCC = T.GCC.Get();
+		// Broken props leave the registry: from the break on, every machine owns its debris.
+		if (!It.Key().Get() || !GCC || GCC->IsRootBroken()) { It.RemoveCurrent(); continue; }
+
+		const FVector Loc = GCC->GetRootCurrentTransform().GetLocation();
+		if (T.PrevSampleTime >= 0.0 && Now > T.PrevSampleTime)
+		{
+			const float Dt = static_cast<float>(Now - T.PrevSampleTime);
+			const FVector Raw = (Loc - T.PrevSampleLoc) / Dt;
+			T.SmoothedVelocity = FMath::Lerp(T.SmoothedVelocity, Raw, 1.0f - FMath::Exp(-Dt / VelocitySmoothTime));
+		}
+		T.PrevSampleLoc  = Loc;
+		T.PrevSampleTime = Now;
+	}
+
 	SendAccum     += DeltaTime;
 	KeyframeAccum += DeltaTime;
-	if (SendAccum < 1.0f / SendRate) return;
-	SendAccum = 0.0f;
+	const float SendInterval = 1.0f / SendRate;
+	if (SendAccum < SendInterval) return;
+	// Carry the remainder: a reset to 0 turned the 30 Hz cadence into an irregular one (at
+	// 120 fps, 4 frames fell a hair short of the interval, so it sent every 5th = 24 Hz).
+	SendAccum = FMath::Fmod(SendAccum, SendInterval);
 
-	const double Now = GetWorld()->GetTimeSeconds();
 	const bool bKeyframe = KeyframeAccum >= KeyframeInterval;
 	if (bKeyframe) KeyframeAccum = 0.0f;
 
@@ -195,20 +266,10 @@ void UCatPropSyncComponent::ServerTick(float DeltaTime)
 		AActor* Prop = It.Key().Get();
 		FTracked& T  = It.Value();
 		UGeometryCollectionComponent* GCC = T.GCC.Get();
-		// Broken props leave the registry: from the break on, every machine owns its debris.
-		if (!Prop || !GCC || GCC->IsRootBroken()) { It.RemoveCurrent(); continue; }
+		if (!Prop || !GCC) continue;
 
 		const FTransform Pose = GCC->GetRootCurrentTransform();
-
-		// Velocity from consecutive samples (every send tick, sent or not) — the GC's own
-		// component velocity is not the prop's (the component never moves on the server).
-		FVector Velocity = FVector::ZeroVector;
-		if (T.PrevSampleTime >= 0.0 && Now > T.PrevSampleTime)
-		{
-			Velocity = (Pose.GetLocation() - T.PrevSampleLoc) / static_cast<float>(Now - T.PrevSampleTime);
-		}
-		T.PrevSampleLoc  = Pose.GetLocation();
-		T.PrevSampleTime = Now;
+		const FVector Velocity = T.SmoothedVelocity;
 
 		bool bSend = false;
 		if (PoseMoved(Pose, T.LastSent))
@@ -265,6 +326,14 @@ void UCatPropSyncComponent::ClientTick(float DeltaTime)
 	for (auto It = Props.CreateIterator(); It; ++It)
 	{
 		FTracked& T = It.Value();
+		if (T.bLocalCarry)
+		{
+			// Simulated here while the local cat carries it. Self-heal: however the carry ended
+			// (release, drift drop, stagger drop, the pawn going away), stop simulating it here.
+			const ACatBase* Carrier = T.Carrier.Get();
+			if (!Carrier || !Carrier->IsGrabbing()) EndLocalCarry(T, It.Key().Get());
+			continue;
+		}
 		if (!T.bFollower || T.bReleased || !T.bHasTarget) continue;
 		UGeometryCollectionComponent* GCC = T.GCC.Get();
 		if (!GCC) { It.RemoveCurrent(); continue; }

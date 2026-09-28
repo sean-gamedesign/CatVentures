@@ -21,6 +21,7 @@
 #include "CatPropSyncComponent.generated.h"
 
 class UGeometryCollectionComponent;
+class ACatBase;
 
 /** One prop's root pose, as the server's solver has it. */
 USTRUCT()
@@ -58,6 +59,15 @@ public:
 	 *  now and again next tick — released pieces otherwise keep the kinematic state, the shrine
 	 *  lesson). No-op on the server and for anything that isn't a tracked follower. */
 	static void ReleaseFollower(UGeometryCollectionComponent* GCC);
+
+	/** Client only: the LOCAL cat's carry of a prop is simulated here, not followed (2026-09-27).
+	 *  Following the server made the carrier's own prop hitch — the server tows it with its copy
+	 *  of the client cat, which moves only when a move packet lands (measured 0/300/0/300 cm/s at
+	 *  120 fps), and every pose then corrected the client's extrapolation by a few cm. On start the
+	 *  prop goes dynamic and the grab constraint tows it exactly as the host's does; on end it goes
+	 *  kinematic again and eases to the latest server pose (the poses keep arriving throughout).
+	 *  Self-heals if the carrier stops grabbing by any path. No-op on the server / for untracked props. */
+	static void SetLocalCarry(UGeometryCollectionComponent* GCC, const ACatBase* Carrier, bool bCarrying);
 
 	/** Master switch. Off = every machine simulates its own props again (the pre-09-24 model). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Prop Sync")
@@ -108,11 +118,14 @@ private:
 		bool bFollower = false;   // client: kinematic, driven by this component
 		bool bReleased = false;   // client: handed back to local physics for its break
 		bool bHasTarget = false;
+		bool bLocalCarry = false; // client: the local cat is carrying it — simulated here, not followed
+		TWeakObjectPtr<const ACatBase> Carrier;
 		FTransform Target;
 		FVector TargetVelocity = FVector::ZeroVector;
 		double TargetTime = 0.0;          // client: world time the target arrived
 		FVector PrevSampleLoc = FVector::ZeroVector;   // server: for the velocity estimate
 		double PrevSampleTime = -1.0;
+		FVector SmoothedVelocity = FVector::ZeroVector; // server: per-tick samples, exponentially smoothed
 	};
 
 	TMap<TWeakObjectPtr<AActor>, FTracked> Props;
@@ -130,6 +143,7 @@ private:
 	void ClientTick(float DeltaTime);
 	void SendBatched(const TArray<FCatPropPose>& Poses);
 	void ReleaseTracked(FTracked& T, const AActor* Prop);
+	void EndLocalCarry(FTracked& T, const AActor* Prop);
 
 	static void SetDynamicState(UGeometryCollectionComponent* GCC, bool bKinematic);
 	static void PlaceRootAt(UGeometryCollectionComponent* GCC, const FTransform& RootPose);
