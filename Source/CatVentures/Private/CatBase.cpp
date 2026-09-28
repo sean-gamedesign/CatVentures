@@ -28,6 +28,7 @@
 #include "TimerManager.h"
 #include "Engine/OverlapResult.h"
 #include "Components/BoxComponent.h"
+#include "Components/SphereComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "PhysicsEngine/PhysicsConstraintComponent.h"
 #include "Kismet/GameplayStatics.h"
@@ -72,6 +73,20 @@ ACatBase::ACatBase()
 	// Push the hold point 80 cm forward in mouth-socket space so the held object sits
 	// in front of the cat's capsule rather than pressing against it.
 	GrabTargetLocation->SetRelativeLocation(FVector(80.0f, 0.0f, 0.0f));
+
+	// Smoothed tow point for a remote client's carry, server-side (see GrabAnchor). Placed in
+	// world space every tick, so absolute; a kinematic physics body so the constraint can bind
+	// to it, colliding with nothing.
+	GrabAnchor = CreateDefaultSubobject<USphereComponent>(TEXT("GrabAnchor"));
+	GrabAnchor->SetupAttachment(RootComponent);
+	GrabAnchor->SetUsingAbsoluteLocation(true);
+	GrabAnchor->SetUsingAbsoluteRotation(true);
+	GrabAnchor->InitSphereRadius(2.0f);
+	GrabAnchor->SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
+	GrabAnchor->SetCollisionResponseToAllChannels(ECR_Ignore);
+	GrabAnchor->SetGenerateOverlapEvents(false);
+	GrabAnchor->SetCanEverAffectNavigation(false);
+	GrabAnchor->SetSimulatePhysics(false);
 
 	// ── Rotation settings ────────────────────────────────────────
 	bUseControllerRotationPitch = false;
@@ -2330,7 +2345,13 @@ void ACatBase::TriggerRelease()
 	// Client-side prediction: restore settings before the RPC so input feels instant.
 	RestoreNormalMovementSettings();
 
-	Server_ReleaseGrab();
+	// A client simulating its own carry freezes the prop where it let go and tells the server,
+	// which adopts that pose — otherwise the two copies' carry drift (up to ~1 m on a snaggy
+	// carry, 2026-09-27) showed as a pop the moment the client went back to following.
+	FTransform ReleasePose;
+	const bool bHasClientPose = !HasAuthority()
+		&& UCatPropSyncComponent::BeginPredictedRelease(Cast<UGeometryCollectionComponent>(GrabbedComponent.Get()), ReleasePose);
+	Server_ReleaseGrab(bHasClientPose, ReleasePose.GetLocation(), ReleasePose.GetRotation());
 }
 
 void ACatBase::Server_Grab_Implementation()
@@ -2462,8 +2483,19 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 	// Wake the target body on THIS machine's solver before binding the constraint.
 	GrabbedComp->WakeRigidBody(BoneName);
 
-	// Anchor to this machine's local capsule physics body → grabbed component.
-	GrabConstraint->SetConstrainedComponents(GetCapsuleComponent(), NAME_None, GrabbedComp, BoneName);
+	// Anchor to this machine's local capsule physics body → grabbed component. On the server, a
+	// REMOTE client's cat binds to the smoothed GrabAnchor instead — started exactly on the capsule,
+	// so the constraint frames come out identical (see GrabAnchor).
+	bGrabOnAnchor = HasAuthority() && !IsLocallyControlled() && IsPlayerControlled() && GrabAnchor;
+	UPrimitiveComponent* TowBody = GetCapsuleComponent();
+	if (bGrabOnAnchor)
+	{
+		GrabAnchorLoc = GetCapsuleComponent()->GetComponentLocation();
+		GrabAnchorRot = GetCapsuleComponent()->GetComponentQuat();
+		GrabAnchor->SetWorldLocationAndRotation(GrabAnchorLoc, GrabAnchorRot, false, nullptr, ETeleportType::TeleportPhysics);
+		TowBody = GrabAnchor;
+	}
+	GrabConstraint->SetConstrainedComponents(TowBody, NAME_None, GrabbedComp, BoneName);
 
 	// Suppress collision-based strain on THIS machine's Chaos solver while dragging.
 	if (UGeometryCollectionComponent* GCC = Cast<UGeometryCollectionComponent>(GrabbedComp))
@@ -2487,7 +2519,7 @@ void ACatBase::Multicast_Grab_Implementation(UPrimitiveComponent* GrabbedComp, F
 		*GrabbedComp->GetName(), *BoneName.ToString());
 }
 
-void ACatBase::Server_ReleaseGrab_Implementation()
+void ACatBase::Server_ReleaseGrab_Implementation(bool bHasClientPose, FVector_NetQuantize10 ClientPropLocation, FQuat ClientPropRotation)
 {
 	if (!bIsGrabbing) return;
 
@@ -2498,7 +2530,15 @@ void ACatBase::Server_ReleaseGrab_Implementation()
 		if (ACatGameMode* GM = GetWorld()->GetAuthGameMode<ACatGameMode>()) GM->NoteAttacker(GrabbedComponent->GetOwner(), GetPlayerState());
 	}
 
+	// Captured before the multicast resets it. The pose is adopted AFTER the constraint is gone.
+	UGeometryCollectionComponent* HeldGC = Cast<UGeometryCollectionComponent>(GrabbedComponent.Get());
+
 	Multicast_ReleaseGrab();
+
+	if (bHasClientPose && HeldGC)
+	{
+		UCatPropSyncComponent::AdoptClientReleasePose(HeldGC, FTransform(ClientPropRotation, ClientPropLocation));
+	}
 }
 
 void ACatBase::Multicast_ReleaseGrab_Implementation()
@@ -2525,6 +2565,7 @@ void ACatBase::Multicast_ReleaseGrab_Implementation()
 		GrabConstraint->DestroyComponent();
 		GrabConstraint = nullptr;
 	}
+	bGrabOnAnchor = false;
 	if (GrabbedComponent.IsValid())
 	{
 		GetCapsuleComponent()->IgnoreComponentWhenMoving(GrabbedComponent.Get(), false);
@@ -2557,6 +2598,7 @@ void ACatBase::UpdateGrab(float DeltaTime)
 		// branch re-enters every tick until then. The constraint only exists on the
 		// FIRST of those ticks, which makes it the natural once-per-machine log gate.
 		const bool bToreDownConstraint = (GrabConstraint != nullptr);
+		bGrabOnAnchor = false;
 
 		if (GrabConstraint)
 		{
@@ -2611,6 +2653,41 @@ void ACatBase::UpdateGrab(float DeltaTime)
 			return;
 		}
 	}
+
+	if (bGrabOnAnchor)
+	{
+		UpdateGrabAnchor(DeltaTime);
+	}
+}
+
+void ACatBase::UpdateGrabAnchor(float DeltaTime)
+{
+	// Knobs are constexpr — a smoothing filter, not feel. Correction 0.08 s: long enough to
+	// span a move-packet gap, short enough that turns don't visibly lag the cat.
+	constexpr float CorrectTime = 0.08f;
+	constexpr float SnapDistance = 100.0f;   // teleports, a mantle, a respawn
+
+	if (!GrabAnchor || DeltaTime <= 0.0f) return;
+	const FVector CapLoc = GetCapsuleComponent()->GetComponentLocation();
+	const FQuat   CapRot = GetCapsuleComponent()->GetComponentQuat();
+
+	// Predict along the cat's velocity (steady between packets — it's the client's reported
+	// move velocity), then ease onto the stepping capsule.
+	const FVector Predicted = GrabAnchorLoc + GetVelocity() * DeltaTime;
+	const float Alpha = 1.0f - FMath::Exp(-DeltaTime / CorrectTime);
+	if (FVector::DistSquared(Predicted, CapLoc) > SnapDistance * SnapDistance)
+	{
+		GrabAnchorLoc = CapLoc;
+		GrabAnchorRot = CapRot;
+	}
+	else
+	{
+		GrabAnchorLoc = FMath::Lerp(Predicted, CapLoc, Alpha);
+		GrabAnchorRot = FQuat::Slerp(GrabAnchorRot, CapRot, Alpha);
+	}
+	// No teleport flag: a kinematic target, so the solver sees the anchor MOVE and the joint's
+	// velocity drive stays continuous.
+	GrabAnchor->SetWorldLocationAndRotation(GrabAnchorLoc, GrabAnchorRot);
 }
 
 // ══════════════════════════════════════════════════════════════════════════

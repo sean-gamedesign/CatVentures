@@ -69,6 +69,16 @@ public:
 	 *  Self-heals if the carrier stops grabbing by any path. No-op on the server / for untracked props. */
 	static void SetLocalCarry(UGeometryCollectionComponent* GCC, const ACatBase* Carrier, bool bCarrying);
 
+	/** Client, on the release PRESS: if this prop is the local carry, freeze it where it is
+	 *  (kinematic), hold it there until the server's copy has caught up, and return that pose so
+	 *  the release RPC can carry it. False = not a local carry (nothing to send). 2026-09-27. */
+	static bool BeginPredictedRelease(UGeometryCollectionComponent* GCC, FTransform& OutPose);
+
+	/** Server, after the release: move the server's copy to where the carrier let go, if within a
+	 *  sanity range — the copies drift during a carry (up to ~1 m measured), and this makes the
+	 *  carrier's view the one that stands, so the release doesn't pop for them. */
+	static void AdoptClientReleasePose(UGeometryCollectionComponent* GCC, const FTransform& Pose);
+
 	/** Master switch. Off = every machine simulates its own props again (the pre-09-24 model). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Prop Sync")
 	bool bEnablePropSync = true;
@@ -120,6 +130,9 @@ private:
 		bool bHasTarget = false;
 		bool bLocalCarry = false; // client: the local cat is carrying it — simulated here, not followed
 		TWeakObjectPtr<const ACatBase> Carrier;
+		double ReleaseHoldUntil = 0.0;    // client: ignore stale server poses until then (predicted release)
+		FVector ReleaseHoldLoc = FVector::ZeroVector;
+		int32 HoldSkipped = 0;
 		FTransform Target;
 		FVector TargetVelocity = FVector::ZeroVector;
 		double TargetTime = 0.0;          // client: world time the target arrived

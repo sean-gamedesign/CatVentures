@@ -25,6 +25,13 @@ namespace
 	// extrapolation.
 	constexpr float VelocitySmoothTime = 0.08f;
 
+	// Predicted release (2026-09-27). The server adopts the carrier's release pose within
+	// MaxAdoptCm; meanwhile the client holds the prop there and drops server poses more than
+	// HoldAcceptCm from it (in flight from before the adopt) for up to HoldTime.
+	constexpr float MaxAdoptCm   = 150.0f;
+	constexpr float HoldAcceptCm = 25.0f;
+	constexpr float HoldTime     = 0.5f;
+
 	bool PoseMoved(const FTransform& A, const FTransform& B)
 	{
 		return FVector::DistSquared(A.GetLocation(), B.GetLocation()) > MoveEpsilonCm * MoveEpsilonCm
@@ -177,6 +184,66 @@ void UCatPropSyncComponent::SetLocalCarry(UGeometryCollectionComponent* GCC, con
 	}
 }
 
+bool UCatPropSyncComponent::BeginPredictedRelease(UGeometryCollectionComponent* GCC, FTransform& OutPose)
+{
+	if (!GCC) return false;
+	UCatPropSyncComponent* Sync = Get(GCC->GetWorld());
+	if (!Sync || !Sync->IsClient()) return false;
+	FTracked* T = Sync->Props.Find(GCC->GetOwner());
+	if (!T || !T->bLocalCarry || T->bReleased) return false;
+
+	OutPose = GCC->GetRootCurrentTransform();
+	Sync->EndLocalCarry(*T, GCC->GetOwner());   // kinematic now; logs what the pop would have been
+
+	// Hold here rather than easing to the pre-release server pose EndLocalCarry just targeted.
+	const double Now = Sync->GetWorld()->GetTimeSeconds();
+	T->Target           = FTransform(OutPose.GetRotation(), OutPose.GetLocation(), FVector::OneVector);
+	T->TargetVelocity   = FVector::ZeroVector;
+	T->TargetTime       = Now;
+	T->bHasTarget       = true;
+	T->ReleaseHoldUntil = Now + HoldTime;
+	T->ReleaseHoldLoc   = OutPose.GetLocation();
+	T->HoldSkipped      = 0;
+	return true;
+}
+
+void UCatPropSyncComponent::AdoptClientReleasePose(UGeometryCollectionComponent* GCC, const FTransform& Pose)
+{
+	if (!GCC || GCC->IsRootBroken()) return;
+	UCatPropSyncComponent* Sync = Get(GCC->GetWorld());
+	if (!Sync || Sync->IsClient() || !Sync->bEnablePropSync) return;
+
+	const FTransform Root = GCC->GetRootCurrentTransform();
+	const float Dist = FVector::Dist(Root.GetLocation(), Pose.GetLocation());
+	if (Dist > MaxAdoptCm)
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV release pose REJECTED for '%s' — %.0f cm from the server's copy (> %.0f)"),
+			*GetNameSafe(GCC->GetOwner()), Dist, MaxAdoptCm);
+		return;
+	}
+
+	// The documented way to move a simulating GC: kinematic, place the ROOT, dynamic again. The
+	// dynamic switch runs next tick so the placement has landed on the physics thread first.
+	SetDynamicState(GCC, /*bKinematic=*/true);
+	FTransform Target(Pose.GetRotation(), Pose.GetLocation(), Root.GetScale3D());
+	PlaceRootAt(GCC, Target);
+	TWeakObjectPtr<UGeometryCollectionComponent> WeakGCC = GCC;
+	Sync->GetWorld()->GetTimerManager().SetTimerForNextTick([WeakGCC]()
+	{
+		if (UGeometryCollectionComponent* G = WeakGCC.Get()) SetDynamicState(G, /*bKinematic=*/false);
+	});
+
+	if (FTracked* T = Sync->Props.Find(GCC->GetOwner()))
+	{
+		// No velocity spike from the teleport, and send the new pose promptly.
+		T->PrevSampleLoc    = Pose.GetLocation();
+		T->SmoothedVelocity = FVector::ZeroVector;
+		T->LastMovedTime    = Sync->GetWorld()->GetTimeSeconds();
+	}
+	UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV adopted the carrier's release pose for '%s' (moved %.0f cm)"),
+		*GetNameSafe(GCC->GetOwner()), Dist);
+}
+
 void UCatPropSyncComponent::EndLocalCarry(FTracked& T, const AActor* Prop)
 {
 	T.bLocalCarry = false;
@@ -312,6 +379,22 @@ void UCatPropSyncComponent::Multicast_PropPoses_Implementation(const TArray<FCat
 	{
 		FTracked* T = P.Prop ? Props.Find(P.Prop.Get()) : nullptr;
 		if (!T || !T->bFollower || T->bReleased) continue;
+		if (T->ReleaseHoldUntil > 0.0)
+		{
+			// Predicted release: poses sent before the server adopted our release pose would
+			// flick the prop back toward the old server copy — drop them until one agrees.
+			const float Dist = FVector::Dist(FVector(P.Location), T->ReleaseHoldLoc);
+			const bool bAgrees = Dist <= HoldAcceptCm;
+			if (!bAgrees && GetWorld()->GetTimeSeconds() < T->ReleaseHoldUntil)
+			{
+				++T->HoldSkipped;
+				continue;
+			}
+			UE_LOG(LogCatVentures, Log, TEXT("[PropSync] CLI release hold on '%s' ended — %s (%d stale pose(s) dropped, %.0f cm)"),
+				*GetNameSafe(P.Prop.Get()), bAgrees ? TEXT("server agrees") : TEXT("timed out, easing"), T->HoldSkipped, Dist);
+			T->ReleaseHoldUntil = 0.0;
+			T->HoldSkipped      = 0;
+		}
 		T->Target         = FTransform(P.Rotation, P.Location, FVector::OneVector);
 		T->TargetVelocity = P.Velocity;
 		T->TargetTime     = GetWorld()->GetTimeSeconds();

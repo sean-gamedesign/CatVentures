@@ -15,6 +15,7 @@ class USpringArmComponent;
 class UCameraComponent;
 class UAnimMontage;
 class UBoxComponent;
+class USphereComponent;
 class UPhysicsConstraintComponent;
 class UGeometryCollectionComponent;
 class UPawPrintSubsystem;
@@ -658,6 +659,15 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
 	TObjectPtr<USceneComponent> GrabTargetLocation;
 
+	/** Server-only smoothed tow point for a REMOTE client's carry (2026-09-27). The server's copy
+	 *  of a client cat moves only when a move packet lands (measured 0/300/0/300 cm/s at 120 fps),
+	 *  so a grab spring bound to its capsule towed the prop in steps — the host saw it hitch.
+	 *  This kinematic, collide-with-nothing body rides a velocity-predicted, eased copy of the
+	 *  capsule transform (UpdateGrabAnchor) and the constraint binds to it instead. Unused on
+	 *  every other machine / carrier. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Mouth Grab")
+	TObjectPtr<USphereComponent> GrabAnchor;
+
 	/** Traversal verbs (mantle first; wall bounce/scramble/fence trot/curtain climb later).
 	 *  Owns its verbs' movement takeovers — the one CMC apply/restore point for traversal. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Traversal")
@@ -1034,9 +1044,11 @@ protected:
 	UFUNCTION(Server, Reliable)
 	void Server_Grab();
 
-	/** Client → Server: release the currently grabbed component. */
+	/** Client → Server: release the currently grabbed component. A client that was simulating its
+	 *  own carry (UCatPropSyncComponent local carry) sends where it let go, and the server adopts
+	 *  that pose within a sanity range so the carrier sees no release pop (2026-09-27). */
 	UFUNCTION(Server, Reliable)
-	void Server_ReleaseGrab();
+	void Server_ReleaseGrab(bool bHasClientPose, FVector_NetQuantize10 ClientPropLocation, FQuat ClientPropRotation);
 
 	/** Server → owning client: the grab trace missed or failed validation.
 	 *  Rolls back the client-side drag-settings prediction applied in TriggerGrab,
@@ -1946,6 +1958,10 @@ private:
 	 *  die before the server does — BB-17). The drift auto-release inside is authority-only. */
 	void UpdateGrab(float DeltaTime);
 
+	/** Server, remote carrier only: advance GrabAnchor along the cat's velocity and ease it onto
+	 *  the capsule (see GrabAnchor). */
+	void UpdateGrabAnchor(float DeltaTime);
+
 	/** Sets CMC to drag-movement state: reduced MaxWalkSpeed, bOrientRotationToMovement disabled. */
 	void ApplyDragMovementSettings();
 
@@ -1991,6 +2007,11 @@ private:
 
 	/** The physics component currently held. Valid only on authority while bIsGrabbing. */
 	TWeakObjectPtr<UPrimitiveComponent> GrabbedComponent;
+
+	/** Server: the live constraint is bound to GrabAnchor (a remote client's carry), not the capsule. */
+	bool   bGrabOnAnchor = false;
+	FVector GrabAnchorLoc = FVector::ZeroVector;
+	FQuat   GrabAnchorRot = FQuat::Identity;
 
 	/** Previous-frame horizontal speed, for the accel-lean velocity derivative. */
 	float PreviousLeanSpeed = 0.0f;
