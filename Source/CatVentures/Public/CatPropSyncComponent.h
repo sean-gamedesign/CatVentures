@@ -76,7 +76,8 @@ public:
 
 	/** Server, after the release: move the server's copy to where the carrier let go, if within a
 	 *  sanity range — the copies drift during a carry (up to ~1 m measured), and this makes the
-	 *  carrier's view the one that stands, so the release doesn't pop for them. */
+	 *  carrier's view the one that stands, so the release doesn't pop for them. Runs over three
+	 *  frames (kinematic → place → verify + dynamic) from ServerTick — see StepAdopt. */
 	static void AdoptClientReleasePose(UGeometryCollectionComponent* GCC, const FTransform& Pose);
 
 	/** Master switch. Off = every machine simulates its own props again (the pre-09-24 model). */
@@ -139,6 +140,12 @@ private:
 		FVector PrevSampleLoc = FVector::ZeroVector;   // server: for the velocity estimate
 		double PrevSampleTime = -1.0;
 		FVector SmoothedVelocity = FVector::ZeroVector; // server: per-tick samples, exponentially smoothed
+		// Server: a release-pose adopt in flight, one step per frame (see AdoptClientReleasePose).
+		uint8  AdoptStep = 0;             // 0 none · 1 kinematic requested, place next · 2 placed, verify next
+		uint64 AdoptFrame = 0;            // GFrameCounter of the last step — the next runs on a LATER frame
+		int32  AdoptPlaces = 0;
+		FTransform AdoptTarget;
+		float  AdoptFromCm = 0.0f;
 	};
 
 	TMap<TWeakObjectPtr<AActor>, FTracked> Props;
@@ -157,6 +164,7 @@ private:
 	void SendBatched(const TArray<FCatPropPose>& Poses);
 	void ReleaseTracked(FTracked& T, const AActor* Prop);
 	void EndLocalCarry(FTracked& T, const AActor* Prop);
+	void StepAdopt(FTracked& T, const AActor* Prop);
 
 	static void SetDynamicState(UGeometryCollectionComponent* GCC, bool bKinematic);
 	static void PlaceRootAt(UGeometryCollectionComponent* GCC, const FTransform& RootPose);

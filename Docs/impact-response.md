@@ -35,7 +35,7 @@ Server-only classification, **value-carrying reliable multicast** execution: `AC
 
 ## Content
 
-Seven pack clips retargeted to `/Game/Drafts/Impact` (stubs by the M5 doctrine): `A_Cat_Damage_Front_Left_C`, `_Front_Right_C`, `_Back_Left_IP`, `_Back_Right_IP`, `_Left_IP`, `_Right_IP`, `A_Cat_Stun_C` (4.03 s). Still in the pack for later tiers: `Cat_Death_Recovery_L/R` 1.73 s (the get-up), `Cat_Rolling_C` / `Cat_Shake_Water_C` flourishes. **Measure `_RM` variants before judging content** — the `_IP` clips flatten the root track (the wall-kick lesson). `PA_CatMnq` exists (36 bodies / 35 constraints, full skeleton incl. tail chain + ears + a sphere on Root) — the ragdoll tier is not an asset gap, it needs the step-3 validation spike.
+Seven pack clips retargeted to `/Game/Drafts/Impact` (stubs by the M5 doctrine; **the directory is in `DirectoriesToAlwaysCook` since 2026-10-03** — the component's defaults are soft paths set in its constructor, so the cook never reached them and every package before then played no flinch/stun at all): `A_Cat_Damage_Front_Left_C`, `_Front_Right_C`, `_Back_Left_IP`, `_Back_Right_IP`, `_Left_IP`, `_Right_IP`, `A_Cat_Stun_C` (4.03 s). Still in the pack for later tiers: `Cat_Death_Recovery_L/R` 1.73 s (the get-up), `Cat_Rolling_C` / `Cat_Shake_Water_C` flourishes. **Measure `_RM` variants before judging content** — the `_IP` clips flatten the root track (the wall-kick lesson). `PA_CatMnq` exists (36 bodies / 35 constraints, full skeleton incl. tail chain + ears + a sphere on Root) — the ragdoll tier is not an asset gap, it needs the step-3 validation spike.
 
 ## What the PIE rounds established (don't re-verify)
 

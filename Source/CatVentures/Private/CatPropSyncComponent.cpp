@@ -32,6 +32,11 @@ namespace
 	constexpr float HoldAcceptCm = 25.0f;
 	constexpr float HoldTime     = 0.5f;
 
+	// The adopt counts as landed when the root, read a frame after the placement, is this close
+	// to the target; otherwise it is re-placed, up to AdoptMaxPlaces times before going dynamic anyway.
+	constexpr float AdoptLandedCm  = 5.0f;
+	constexpr int32 AdoptMaxPlaces = 3;
+
 	bool PoseMoved(const FTransform& A, const FTransform& B)
 	{
 		return FVector::DistSquared(A.GetLocation(), B.GetLocation()) > MoveEpsilonCm * MoveEpsilonCm
@@ -222,26 +227,75 @@ void UCatPropSyncComponent::AdoptClientReleasePose(UGeometryCollectionComponent*
 		return;
 	}
 
-	// The documented way to move a simulating GC: kinematic, place the ROOT, dynamic again. The
-	// dynamic switch runs next tick so the placement has landed on the physics thread first.
-	SetDynamicState(GCC, /*bKinematic=*/true);
-	FTransform Target(Pose.GetRotation(), Pose.GetLocation(), Root.GetScale3D());
-	PlaceRootAt(GCC, Target);
-	TWeakObjectPtr<UGeometryCollectionComponent> WeakGCC = GCC;
-	Sync->GetWorld()->GetTimerManager().SetTimerForNextTick([WeakGCC]()
+	FTracked* T = Sync->Props.Find(GCC->GetOwner());
+	if (!T)
 	{
-		if (UGeometryCollectionComponent* G = WeakGCC.Get()) SetDynamicState(G, /*bKinematic=*/false);
-	});
-
-	if (FTracked* T = Sync->Props.Find(GCC->GetOwner()))
-	{
-		// No velocity spike from the teleport, and send the new pose promptly.
-		T->PrevSampleLoc    = Pose.GetLocation();
-		T->SmoothedVelocity = FVector::ZeroVector;
-		T->LastMovedTime    = Sync->GetWorld()->GetTimeSeconds();
+		UE_LOG(LogCatVentures, Warning, TEXT("[PropSync] SRV release pose for '%s' not adopted — prop is not tracked"),
+			*GetNameSafe(GCC->GetOwner()));
+		return;
 	}
-	UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV adopted the carrier's release pose for '%s' (moved %.0f cm)"),
+
+	// The documented way to move a simulating GC — kinematic, place the ROOT, dynamic again — but
+	// ONE STEP PER FRAME (2026-10-03). Done in one frame on the server's DYNAMIC copy, the placement
+	// could land before the kinematic field did (the proxy moves kinematic roots only) and the copy
+	// stayed put: 2 of 6 releases on 09-27 logged "adopted" while the server stayed 82 / 104 cm away.
+	// The 09-24 recipe was only ever verified on client copies that were ALREADY kinematic.
+	// This frame: the field. ServerTick → StepAdopt does the rest on later frames.
+	SetDynamicState(GCC, /*bKinematic=*/true);
+	T->AdoptStep   = 1;
+	T->AdoptFrame  = GFrameCounter;
+	T->AdoptPlaces = 0;
+	T->AdoptTarget = FTransform(Pose.GetRotation(), Pose.GetLocation(), Root.GetScale3D());
+	T->AdoptFromCm = Dist;
+	UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV adopting the carrier's release pose for '%s' (%.0f cm away) — kinematic now, placing next frame"),
 		*GetNameSafe(GCC->GetOwner()), Dist);
+}
+
+void UCatPropSyncComponent::StepAdopt(FTracked& T, const AActor* Prop)
+{
+	// Each step needs a physics step + results sync since the previous one. The release RPC can
+	// arrive before this component ticks in the same frame, so gate on the frame counter.
+	if (GFrameCounter <= T.AdoptFrame) return;
+	UGeometryCollectionComponent* GCC = T.GCC.Get();
+	if (!GCC) { T.AdoptStep = 0; return; }
+	T.AdoptFrame = GFrameCounter;
+
+	if (T.AdoptStep == 1)
+	{
+		PlaceRootAt(GCC, T.AdoptTarget);
+		++T.AdoptPlaces;
+		T.AdoptStep = 2;
+		return;
+	}
+
+	// Step 2: read the root a frame AFTER the placement. GetRootCurrentTransform() is the
+	// physics-synced component-space root × the CURRENT component transform, so read in the same
+	// frame as PlaceRootAt it always reports the target; only after a sync does it show whether
+	// the physics body actually moved.
+	const float Miss = FVector::Dist(GCC->GetRootCurrentTransform().GetLocation(), T.AdoptTarget.GetLocation());
+	if (Miss > AdoptLandedCm && T.AdoptPlaces < AdoptMaxPlaces)
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV adopt on '%s' — root still %.0f cm off after place %d, placing again"),
+			*GetNameSafe(Prop), Miss, T.AdoptPlaces);
+		PlaceRootAt(GCC, T.AdoptTarget);
+		++T.AdoptPlaces;
+		return;
+	}
+
+	SetDynamicState(GCC, /*bKinematic=*/false);
+	T.AdoptStep        = 0;
+	T.SmoothedVelocity = FVector::ZeroVector;
+	T.LastMovedTime    = GetWorld()->GetTimeSeconds();   // settle-resend covers a landing under the send epsilon
+	if (Miss <= AdoptLandedCm)
+	{
+		UE_LOG(LogCatVentures, Log, TEXT("[PropSync] SRV adopted the carrier's release pose for '%s' (moved %.0f cm) — landed %.1f cm from target after %d place(s), dynamic again"),
+			*GetNameSafe(Prop), T.AdoptFromCm, Miss, T.AdoptPlaces);
+	}
+	else
+	{
+		UE_LOG(LogCatVentures, Warning, TEXT("[PropSync] SRV adopt on '%s' DID NOT LAND — root %.0f cm from target after %d place(s); dynamic again where it is"),
+			*GetNameSafe(Prop), Miss, T.AdoptPlaces);
+	}
 }
 
 void UCatPropSyncComponent::EndLocalCarry(FTracked& T, const AActor* Prop)
@@ -305,6 +359,16 @@ void UCatPropSyncComponent::ServerTick(float DeltaTime)
 		// Broken props leave the registry: from the break on, every machine owns its debris.
 		if (!It.Key().Get() || !GCC || GCC->IsRootBroken()) { It.RemoveCurrent(); continue; }
 
+		if (T.AdoptStep != 0)
+		{
+			// Mid-adopt the root jumps by the adopt distance: keep that out of the velocity
+			// estimate, and resume sampling from wherever the adopt leaves it.
+			StepAdopt(T, It.Key().Get());
+			T.PrevSampleLoc  = GCC->GetRootCurrentTransform().GetLocation();
+			T.PrevSampleTime = Now;
+			continue;
+		}
+
 		const FVector Loc = GCC->GetRootCurrentTransform().GetLocation();
 		if (T.PrevSampleTime >= 0.0 && Now > T.PrevSampleTime)
 		{
@@ -333,7 +397,9 @@ void UCatPropSyncComponent::ServerTick(float DeltaTime)
 		AActor* Prop = It.Key().Get();
 		FTracked& T  = It.Value();
 		UGeometryCollectionComponent* GCC = T.GCC.Get();
-		if (!Prop || !GCC) continue;
+		// Mid-adopt the pose isn't authoritative yet (the old spot, or a placement not yet proven);
+		// the landed pose goes out once StepAdopt finishes (it moved, or the settle-resend window).
+		if (!Prop || !GCC || T.AdoptStep != 0) continue;
 
 		const FTransform Pose = GCC->GetRootCurrentTransform();
 		const FVector Velocity = T.SmoothedVelocity;
