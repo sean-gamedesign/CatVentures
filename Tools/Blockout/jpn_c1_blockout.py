@@ -139,15 +139,18 @@ def wall_y(label, folder, x0, x1, y0, y1, z0, z1, openings=(), **kw):
     if cur < y1:
         box("%s_%d" % (label, n), folder, x0, x1, cur, y1, z0, z1, **kw)
 
-def block_wall_x(label, folder, x0, x1, y, gates=()):
-    """block wall 360 along X, centred on y; gates = (gx0, gx1) full-height openings."""
+SCRAMBLE = ("Scrambleable",)       # world-metrics: block wall + vending 360 = sprint-scramble + top-out
+
+def block_wall_x(label, folder, x0, x1, y, gates=(), scramble=True):
+    """block wall 360 along X, centred on y; gates = (gx0, gx1) full-height openings.
+    scramble=False for the backdrop ring: the map edge must not be climbable."""
     wall_x(label, folder, x0, x1, y - WALL_T / 2.0, y + WALL_T / 2.0, 0, WALL_H,
-           [(g0, g1, 0, WALL_H) for (g0, g1) in gates])
+           [(g0, g1, 0, WALL_H) for (g0, g1) in gates], tags=SCRAMBLE if scramble else ())
     tag("Wall 360", folder, (x0 + x1) / 2.0, y, WALL_H + 15)
 
-def block_wall_y(label, folder, x, y0, y1, gates=()):
+def block_wall_y(label, folder, x, y0, y1, gates=(), scramble=True):
     wall_y(label, folder, x - WALL_T / 2.0, x + WALL_T / 2.0, y0, y1, 0, WALL_H,
-           [(g0, g1, 0, WALL_H) for (g0, g1) in gates])
+           [(g0, g1, 0, WALL_H) for (g0, g1) in gates], tags=SCRAMBLE if scramble else ())
     tag("Wall 360", folder, x, (y0 + y1) / 2.0, WALL_H + 15)
 
 def fence_x(label, folder, x0, x1, y, gates=()):
@@ -400,8 +403,8 @@ tbox("AC unit 180", "N3_AC", F, 10050, 10230, 5200, 5280, 0, 180)
 F = "Block/Street"
 tbox("Bicycle 100", "Alley_Bike", F, 6520, 6580, 3000, 3180, 0, 100)
 tbox("Bins 180", "Alley_Bin", F, 6930, 7020, 5000, 5090, 0, 180)
-tbox("Vending 360", "Vend_S", F, 1900, 2100, -320, -180, 0, 360)
-tbox("Vending 360", "Vend_N", F, 8700, 8900, BLOCK_Y1 + 180, BLOCK_Y1 + 320, 0, 360)
+tbox("Vending 360", "Vend_S", F, 1900, 2100, -320, -180, 0, 360, tags=SCRAMBLE)
+tbox("Vending 360", "Vend_N", F, 8700, 8900, BLOCK_Y1 + 180, BLOCK_Y1 + 320, 0, 360, tags=SCRAMBLE)
 car("Street_Car", F, 4000, -900, along_x=True)
 tbox("Bench 90", "Bench", F, -700, -520, 3600, 3660, 0, 90)
 tbox("Shrine 540", "Shrine", F, -1100, -860, 3900, 4140, 0, LOW_ROOF)
@@ -436,10 +439,10 @@ for size, x, y, z in (
 F = "Block/Backdrop"
 bd_s0, bd_s1 = BLOCK_Y0 - 2 * STREET, BLOCK_Y0 - STREET        # -2880..-1440
 bd_n0, bd_n1 = BLOCK_Y1 + STREET, BLOCK_Y1 + 2 * STREET        # 8880..10320
-block_wall_x("Backdrop_WallS", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, bd_s1 - WALL_T / 2.0)
-block_wall_x("Backdrop_WallN", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, bd_n0 + WALL_T / 2.0)
-block_wall_y("Backdrop_WallW", F, BLOCK_X0 - STREET - WALL_T / 2.0, BLOCK_Y0, BLOCK_Y1)
-block_wall_y("Backdrop_WallE", F, BLOCK_X1 + STREET + WALL_T / 2.0, BLOCK_Y0, BLOCK_Y1)
+block_wall_x("Backdrop_WallS", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, bd_s1 - WALL_T / 2.0, scramble=False)
+block_wall_x("Backdrop_WallN", F, BLOCK_X0 - STREET, BLOCK_X1 + STREET, bd_n0 + WALL_T / 2.0, scramble=False)
+block_wall_y("Backdrop_WallW", F, BLOCK_X0 - STREET - WALL_T / 2.0, BLOCK_Y0, BLOCK_Y1, scramble=False)
+block_wall_y("Backdrop_WallE", F, BLOCK_X1 + STREET + WALL_T / 2.0, BLOCK_Y0, BLOCK_Y1, scramble=False)
 for i, (x0, h) in enumerate(((180, TWO_ST), (3690, EAVE), (7200, TWO_ST))):
     box("Backdrop_S_%d" % i, F, x0, x0 + 2880, bd_s0, bd_s0 + 1200, 0, h)
     box("Backdrop_N_%d" % i, F, x0, x0 + 2880, bd_n1 - 1200, bd_n1, 0, h)
